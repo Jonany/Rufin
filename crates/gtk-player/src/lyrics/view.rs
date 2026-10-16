@@ -274,7 +274,7 @@ impl LyricsPane {
         };
         // A new playback run of the same queue item keeps the same lyrics and scroll extent.
         let matches_current =
-            current_media.map(|media| &media.occurrence) == media_id.map(|media| &media.occurrence);
+            current_media.map(|media| &media.media_uri) == media_id.map(|media| &media.media_uri);
         let (document, pronunciation) = match content {
             Some(CurrentLyricsContent::Document {
                 document,
@@ -285,7 +285,7 @@ impl LyricsPane {
         let instrumental =
             matches_current && matches!(content, Some(CurrentLyricsContent::Instrumental));
         let available = document.is_some();
-        let (search_label, search_enabled) = if settings.private_mode {
+        let (search_label, search_enabled) = if settings.application.private_mode {
             (tr("Private mode is on"), false)
         } else if current_media.is_some() {
             (tr("Search lyrics"), true)
@@ -299,7 +299,7 @@ impl LyricsPane {
             &tr("Clear fetched lyrics for this track"),
             current_track.is_some_and(|track| {
                 settings.lyrics.can_suppress_auto_lyrics(
-                    settings.private_mode,
+                    settings.application.private_mode,
                     track,
                     if matches_current { origin } else { None },
                 )
@@ -321,9 +321,9 @@ impl LyricsPane {
             LyricsPaneContent::Document {
                 lyrics,
                 pronunciation,
-                show_furigana: settings.lyrics.show_furigana,
-                show_romanization: settings.lyrics.show_romanization,
-                word_by_word_highlighting: settings.lyrics.karaoke_mode,
+                show_furigana: settings.lyrics.preferences.show_furigana,
+                show_romanization: settings.lyrics.preferences.show_romanization,
+                word_by_word_highlighting: settings.lyrics.preferences.karaoke_mode,
                 dictionary,
             }
         } else if instrumental {
@@ -331,9 +331,9 @@ impl LyricsPane {
         } else if loading && matches_current {
             LyricsPaneContent::Loading
         } else {
-            LyricsPaneContent::Empty(if settings.private_mode {
+            LyricsPaneContent::Empty(if settings.application.private_mode {
                 tr("Server lyrics are off in private mode")
-            } else if !settings.lyrics.external_lyrics_enabled {
+            } else if !settings.lyrics.preferences.external_lyrics_enabled {
                 tr("External lyric lookup is off")
             } else {
                 tr("No lyrics")

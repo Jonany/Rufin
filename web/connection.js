@@ -4,7 +4,7 @@ import {
   applyAppearance,
   initialAppearance,
   applyColors,
-  coverUrls,
+  covers,
   $,
   notice,
   run,
@@ -116,10 +116,10 @@ function disconnect() {
   session = null;
   resetPins();
   token = "";
-  for (const url of coverUrls.values()) URL.revokeObjectURL(url);
-  coverUrls.clear();
+  for (const entry of covers.values()) entry.dispose();
   state.playback = null;
-  state.currentId = null;
+  state.currentMediaUri = null;
+  state.currentRun = null;
   showQueue(null);
   for (const id of ["content", "queue", "lyrics"]) $(id).replaceChildren();
   $("app").inert = true;
@@ -162,6 +162,11 @@ async function connect() {
       if (value.lyrics) showLyrics(value.lyrics);
       if (value.appearance) applyColors(value.appearance);
       if (value.pins_changed) run(refreshPins);
+      if (value.catalog_acquired) run(async () => {
+        updateSources(await api("/sources"));
+        await loadView();
+      });
+      else if (value.activity_changed && $("content").querySelector('[data-activity-sensitive="true"]')) run(loadView);
     },
     session.signal,
   );
@@ -301,7 +306,8 @@ const state = {
   visibleItems: [],
   source: "",
   playback: null,
-  currentId: null,
+  currentMediaUri: null,
+  currentRun: null,
   selectedLibrary: null,
   randomSource: null,
 };

@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::SourceId;
+use crate::{SourceEntityKind, SourceId};
+use localization::msgid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum MetadataFieldKind {
     Text,
     Number,
@@ -13,6 +15,7 @@ pub enum MetadataFieldKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct MetadataField {
     pub key: String,
     pub label: String,
@@ -20,245 +23,95 @@ pub struct MetadataField {
     pub value: String,
     pub writable: bool,
     pub mixed: bool,
+    pub suggestion: Option<String>,
 }
 
 pub type MetadataChanges = std::collections::BTreeMap<String, String>;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct TrackMetadataValues {
-    pub title: String,
-    pub sort_title: Option<String>,
-    pub artist: Option<String>,
-    pub album: Option<String>,
-    pub album_artist: Option<String>,
-    pub track_number: Option<u16>,
-    pub disc_number: Option<u16>,
-    pub year: Option<u16>,
-    pub genre: Option<String>,
-    pub comment: Option<String>,
-    pub bpm: Option<u16>,
-    pub locked: Option<bool>,
-    pub musicbrainz_recording_id: Option<String>,
-    pub musicbrainz_release_track_id: Option<String>,
-    pub musicbrainz_album_id: Option<String>,
-    pub musicbrainz_release_group_id: Option<String>,
-    pub musicbrainz_artist_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct TrackMetadataWritable {
-    pub title: bool,
-    pub sort_title: bool,
-    pub artist: bool,
-    pub album: bool,
-    pub album_artist: bool,
-    pub track_number: bool,
-    pub disc_number: bool,
-    pub year: bool,
-    pub genre: bool,
-    pub comment: bool,
-    pub bpm: bool,
-    pub locked: bool,
-    pub musicbrainz_recording_id: bool,
-    pub musicbrainz_release_track_id: bool,
-    pub musicbrainz_album_id: bool,
-    pub musicbrainz_release_group_id: bool,
-    pub musicbrainz_artist_id: bool,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TrackMetadataEdit {
-    pub extra: MetadataChanges,
-    pub values: TrackMetadataValues,
-    pub changed: TrackMetadataWritable,
-    pub artwork: Option<ArtworkEdit>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TrackMetadata {
-    pub extra: Vec<MetadataField>,
+pub struct MetadataDraft {
+    pub kind: SourceEntityKind,
+    pub fields: Vec<MetadataField>,
     pub artwork: ArtworkEditing,
-    pub writable: TrackMetadataWritable,
     pub source_search: bool,
     pub revision: Option<String>,
-    pub source_values: TrackMetadataValues,
-    pub values: TrackMetadataValues,
-    pub rufin_filled: TrackMetadataWritable,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct AlbumMetadataValues {
-    pub title: String,
-    pub sort_title: Option<String>,
-    pub artist: Option<String>,
-    pub album_artist: Option<String>,
-    pub year: Option<u16>,
-    pub genre: Option<String>,
-    pub comment: Option<String>,
-    pub locked: Option<bool>,
-    pub musicbrainz_album_id: Option<String>,
-    pub musicbrainz_release_group_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct AlbumMetadataWritable {
-    pub title: bool,
-    pub sort_title: bool,
-    pub artist: bool,
-    pub album_artist: bool,
-    pub year: bool,
-    pub genre: bool,
-    pub comment: bool,
-    pub locked: bool,
-    pub musicbrainz_album_id: bool,
-    pub musicbrainz_release_group_id: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AlbumMetadataEdit {
-    pub extra: MetadataChanges,
-    pub values: AlbumMetadataValues,
-    pub changed: AlbumMetadataWritable,
-    pub artwork: Option<ArtworkEdit>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AlbumMetadata {
-    pub extra: Vec<MetadataField>,
-    pub artwork: ArtworkEditing,
-    pub writable: AlbumMetadataWritable,
-    pub source_search: bool,
-    pub revision: Option<String>,
-    pub source_values: AlbumMetadataValues,
-    pub values: AlbumMetadataValues,
-    pub rufin_filled: AlbumMetadataWritable,
     pub track_count: usize,
-    pub mixed: AlbumMetadataMixed,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct AlbumMetadataMixed {
-    pub title: bool,
-    pub sort_title: bool,
-    pub artist: bool,
-    pub album_artist: bool,
-    pub year: bool,
-    pub genre: bool,
-    pub comment: bool,
-    pub musicbrainz_album_id: bool,
-    pub musicbrainz_release_group_id: bool,
-}
+impl MetadataDraft {
+    pub fn new(kind: SourceEntityKind, mut fields: Vec<MetadataField>) -> Self {
+        if kind != SourceEntityKind::Track
+            && let Some(field) = fields.iter_mut().find(|field| field.key == "comment")
+        {
+            field.label = msgid("Overview").into();
+        }
+        Self {
+            kind,
+            fields,
+            artwork: ArtworkEditing::default(),
+            source_search: false,
+            revision: None,
+            track_count: 0,
+        }
+    }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ArtistMetadataValues {
-    pub name: String,
-    pub sort_name: Option<String>,
-    pub genre: Option<String>,
-    pub comment: Option<String>,
-    pub locked: Option<bool>,
-    pub musicbrainz_artist_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ArtistMetadataWritable {
-    pub name: bool,
-    pub sort_name: bool,
-    pub genre: bool,
-    pub comment: bool,
-    pub locked: bool,
-    pub musicbrainz_artist_id: bool,
+    pub(crate) fn suggest(&mut self, key: &str, value: Option<String>) {
+        if let Some(field) = self.fields.iter_mut().find(|field| field.key == key)
+            && field.value.is_empty()
+        {
+            field.suggestion = value.filter(|value| !value.is_empty());
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArtistMetadataEdit {
-    pub extra: MetadataChanges,
-    pub values: ArtistMetadataValues,
-    pub changed: ArtistMetadataWritable,
+pub struct MetadataEdit {
+    pub kind: SourceEntityKind,
+    pub changes: MetadataChanges,
     pub artwork: Option<ArtworkEdit>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArtistMetadata {
-    pub extra: Vec<MetadataField>,
-    pub artwork: ArtworkEditing,
-    pub writable: ArtistMetadataWritable,
-    pub source_search: bool,
-    pub revision: Option<String>,
-    pub source_values: ArtistMetadataValues,
-    pub values: ArtistMetadataValues,
-    pub rufin_filled: ArtistMetadataWritable,
-    pub track_count: usize,
-    pub mixed: ArtistMetadataMixed,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ArtistMetadataMixed {
-    pub name: bool,
-    pub sort_name: bool,
-    pub genre: bool,
-    pub comment: bool,
-    pub musicbrainz_artist_id: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MetadataEdit {
-    Track(TrackMetadataEdit),
-    Album(AlbumMetadataEdit),
-    Artist(ArtistMetadataEdit),
-}
-
-impl MetadataEdit {
-    pub(crate) fn kind(&self) -> &'static str {
-        match self {
-            Self::Track(_) => "track",
-            Self::Album(_) => "album",
-            Self::Artist(_) => "artist",
-        }
-    }
-
-    pub fn artwork(&self) -> Option<&ArtworkEdit> {
-        match self {
-            Self::Track(edit) => edit.artwork.as_ref(),
-            Self::Album(edit) => edit.artwork.as_ref(),
-            Self::Artist(edit) => edit.artwork.as_ref(),
-        }
-    }
-
-    pub(crate) fn artwork_mut(&mut self) -> &mut Option<ArtworkEdit> {
-        match self {
-            Self::Track(edit) => &mut edit.artwork,
-            Self::Album(edit) => &mut edit.artwork,
-            Self::Artist(edit) => &mut edit.artwork,
-        }
-    }
-
-    pub(crate) fn tags_changed(&self) -> bool {
-        !self.extra().is_empty()
-            || match self {
-                Self::Track(edit) => edit.changed != Default::default(),
-                Self::Album(edit) => edit.changed != Default::default(),
-                Self::Artist(edit) => edit.changed != Default::default(),
-            }
-    }
-
-    pub(crate) fn extra(&self) -> &MetadataChanges {
-        match self {
-            Self::Track(edit) => &edit.extra,
-            Self::Album(edit) => &edit.extra,
-            Self::Artist(edit) => &edit.extra,
-        }
-    }
-
-    pub(crate) fn artist_name(&self) -> Option<&str> {
-        match self {
-            Self::Artist(edit) => Some(&edit.values.name),
-            _ => None,
+impl MetadataField {
+    pub fn new(key: &str, value: impl Into<String>, writable: bool) -> Self {
+        use MetadataFieldKind::*;
+        let (label, kind) = match key {
+            "title" => (msgid("Title"), Text),
+            "sort_title" => (msgid("Sort title"), Text),
+            "artist" => (msgid("Artists"), List),
+            "album" => (msgid("Album"), Text),
+            "album_artist" => (msgid("Album artists"), List),
+            "track_number" => (msgid("Track number"), Number),
+            "disc_number" => (msgid("Disc number"), Number),
+            "year" => (msgid("Year"), Number),
+            "recording_date" => (msgid("Date"), Date),
+            "genre" => (msgid("Genres"), List),
+            "comment" => (msgid("Comment"), Text),
+            "bpm" => (msgid("BPM"), Number),
+            "locked" => (msgid("Lock metadata"), Boolean),
+            "musicbrainz_recording_id" => (msgid("MusicBrainz recording ID"), Text),
+            "musicbrainz_release_track_id" => (msgid("MusicBrainz release track ID"), Text),
+            "musicbrainz_album_id" => (msgid("MusicBrainz release ID"), Text),
+            "musicbrainz_release_group_id" => (msgid("MusicBrainz release group ID"), Text),
+            "musicbrainz_artist_id" => (msgid("MusicBrainz artist ID"), Text),
+            _ => (key, Text),
+        };
+        Self {
+            key: key.into(),
+            label: label.into(),
+            kind,
+            value: value.into(),
+            writable,
+            mixed: false,
+            suggestion: None,
         }
     }
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Error))]
 pub enum SourceMetadataError {
+    #[error("{0}")]
+    InvalidInput(String),
     #[error("metadata editing is unavailable")]
     Unavailable,
     #[error("metadata changed before it was saved")]
@@ -270,22 +123,38 @@ pub enum SourceMetadataError {
     },
     #[error("metadata was saved but its source refresh failed: {0}")]
     SavedRefreshFailed(String),
-    #[error("some changes were saved: {message}")]
-    PartiallySaved {
-        message: String,
-        outcome: Option<library::ScanOutcome>,
-    },
+    #[error("some changes were saved: {reason}")]
+    PartiallySaved { reason: String },
     #[error("metadata failed: {0}")]
     Write(String),
 }
 
+impl From<crate::SourceError> for SourceMetadataError {
+    fn from(error: crate::SourceError) -> Self {
+        Self::Write(error.to_string())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Object))]
 pub struct ImageBytes {
     pub bytes: Vec<u8>,
     pub content_type: Option<String>,
 }
 
+#[cfg_attr(feature = "bindings", uniffi::export)]
+impl ImageBytes {
+    pub fn bytes(&self) -> Vec<u8> {
+        self.bytes.clone()
+    }
+
+    pub fn content_type(&self) -> Option<String> {
+        self.content_type.clone()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum ArtworkStorage {
     Embedded,
     #[default]
@@ -300,6 +169,7 @@ pub struct ArtworkEdit {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum ArtworkChange {
     Replace(std::sync::Arc<ImageBytes>),
     Remove,
@@ -313,20 +183,21 @@ pub struct ArtworkEditing {
 }
 
 impl ArtworkEditing {
-    pub(crate) fn with_binding(mut self, binding: Option<Vec<u8>>, server: bool) -> Self {
-        let source = binding
+    pub fn with_binding(mut self, binding: Option<Vec<u8>>, server: bool) -> Self {
+        let image = binding
             .as_deref()
-            .and_then(|bytes| serde_json::from_slice::<library::ArtistArtworkBinding>(bytes).ok());
-        let image = source
-            .as_ref()
-            .map_or(binding.as_deref(), |artist| artist.source.as_deref());
+            .and_then(|bytes| serde_json::from_slice::<Vec<library::ArtworkCandidate>>(bytes).ok())
+            .and_then(|images| images.into_iter().next());
         self.storage = if server {
             ArtworkStorage::Server
         } else if self.can_embed
-            && image.is_some_and(|bytes| {
+            && image.is_some_and(|image| {
                 matches!(
-                    serde_json::from_slice::<crate::LocalImageRef>(bytes),
-                    Ok(crate::LocalImageRef::Embedded { .. })
+                    image.image,
+                    library::ArtworkImage::Local {
+                        picture_index: Some(_),
+                        ..
+                    }
                 )
             })
         {
@@ -339,39 +210,41 @@ impl ArtworkEditing {
     }
 }
 
-pub(crate) fn finish_metadata_save(
+pub fn finish_metadata_save(
     result: Result<(), SourceMetadataError>,
-    refresh: Result<library::ScanOutcome, SourceMetadataError>,
+    refresh: Result<(), SourceMetadataError>,
     saved: bool,
-) -> Result<library::ScanOutcome, SourceMetadataError> {
+) -> Result<(), SourceMetadataError> {
     let message = match result {
         Ok(()) => {
             return refresh.map_err(|error| match error {
-                SourceMetadataError::SavedRefreshFailed(_) => error,
+                SourceMetadataError::SavedRefreshFailed(_)
+                | SourceMetadataError::PartiallySaved { .. } => error,
                 error => SourceMetadataError::SavedRefreshFailed(error.to_string()),
             });
         }
-        Err(SourceMetadataError::PartiallySaved { message, .. }) => message,
+        Err(SourceMetadataError::PartiallySaved { reason }) => reason,
         Err(error) if saved => error.to_string(),
         Err(error) => return Err(error),
     };
-    let (message, outcome) = match refresh {
-        Ok(outcome) => (message, Some(outcome)),
-        Err(error) => (
-            format!("{message}. Source refresh also failed: {error}"),
-            None,
-        ),
+    let message = match refresh {
+        Ok(()) => message,
+        Err(error) => format!("{message}. Source refresh also failed: {error}"),
     };
-    Err(SourceMetadataError::PartiallySaved { message, outcome })
+    Err(SourceMetadataError::PartiallySaved { reason: message })
 }
 
-pub(crate) fn artwork_file(binding: Option<&[u8]>) -> Option<String> {
-    let binding = binding?;
-    if let Ok(artist) = serde_json::from_slice::<library::ArtistArtworkBinding>(binding) {
-        return artwork_file(artist.source.as_deref());
-    }
-    match serde_json::from_slice::<crate::LocalImageRef>(binding).ok()? {
-        crate::LocalImageRef::File { path, .. } => Some(path),
-        crate::LocalImageRef::Embedded { .. } => None,
+pub fn artwork_file(binding: Option<&[u8]>) -> Option<String> {
+    let image = serde_json::from_slice::<Vec<library::ArtworkCandidate>>(binding?)
+        .ok()?
+        .into_iter()
+        .next()?;
+    match image.image {
+        library::ArtworkImage::Local {
+            path,
+            picture_index: None,
+            ..
+        } => Some(path),
+        _ => None,
     }
 }

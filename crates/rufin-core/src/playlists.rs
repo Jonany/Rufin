@@ -3,10 +3,9 @@ use crate::runtime::source::PlaylistExport;
 use crate::runtime::{CatalogChange, CatalogPublication, SourceEvent};
 use crate::source::{SourceOwner, string_error};
 use async_channel::Receiver;
-use library::{
-    Database, FolderKey, PlaylistEntryKey, PlaylistKey, ReadCancellation, ScanOutcome, SourceKey,
-};
-use sources::{Source, SourceConfiguration, SourceId};
+use futures_util::{StreamExt, TryStreamExt};
+use library::{Database, FolderKey, PlaylistEntryKey, PlaylistKey, ReadCancellation, SourceKey};
+use sources::{Implementation, Source, SourceConfiguration, SourceError, SourceId};
 use std::{
     future::Future,
     path::PathBuf,
@@ -19,30 +18,34 @@ pub fn import_local_paths(
     name: String,
 ) -> Receiver<Result<PlaylistKey, String>> {
     let (sender, receiver) = async_channel::bounded(1);
-    owner.spawn_serialized(move |owner| async move {
+    let task_owner = owner.clone();
+    owner.shared.runtime.spawn(async move {
+        let owner = task_owner;
         let result = async {
             let source = owner.ensure_local_source().await?;
-            let progress = crate::source::refreshing_progress(
-                Arc::clone(&owner.shared),
-                source.source_id().clone(),
-            );
-            progress(sources::SourceReadProgress {
-                stage: sources::SourceReadStage::Files,
-                completed: 0,
-                total: None,
-            });
+            let token = owner.shared.begin_refresh(source.source_id(), false, true);
+            if token.is_some() {
+                owner.shared.present_refresh(source.source_id());
+            }
+            let progress = |value| {
+                if let Some(token) = &token {
+                    owner
+                        .shared
+                        .refresh_progress(source.source_id(), token, value);
+                }
+            };
             let result = source
                 .import_local_paths(&owner.shared.database, paths, &name, &progress)
                 .await;
-            let playlist = result
-                .as_ref()
-                .map(|(playlist, _)| *playlist)
-                .map_err(string_error);
-            owner
-                .finish_refresh(source.source_id(), result.map(|(_, outcome)| outcome))
-                .await;
+            let playlist = result.as_ref().copied().map_err(string_error);
+            if let Some(token) = token {
+                owner
+                    .finish_source_refresh(source.source_id(), &token, result.map(|_| ()))
+                    .await;
+            }
             let playlist = playlist?;
-            accept_playlist_result(&owner, None, Some(playlist), Ok((true, None))).await;
+            crate::playlist_files::after_edit(&owner, playlist).await;
+            local_playlist_changed(&owner, None, Some(playlist)).await;
             Ok(playlist)
         }
         .await;
@@ -58,31 +61,45 @@ pub fn import_playlist(
     linked: bool,
 ) -> Receiver<Result<library::PlaylistImportReport, String>> {
     let (sender, receiver) = async_channel::bounded(1);
-    owner.spawn_serialized(move |owner| async move {
+    let task_owner = owner.clone();
+    owner.shared.runtime.spawn(async move {
+        let owner = task_owner;
+        let lane = owner.shared.lane.lock().await;
         let result = async {
             let (source_id, location, access) =
                 crate::playlist_files::local_location(&owner, &path);
             let target =
                 crate::playlist_files::import_target(&owner, source_id.as_ref(), &location, linked)
                     .await?;
-            let report =
-                crate::playlist_files::import_local_on(&owner, &access, target, current.as_ref())
-                    .await?;
+            let report = sources::import_local_playlist_file(
+                &owner.shared.database,
+                &access,
+                target,
+                |locator| {
+                    current
+                        .as_ref()
+                        .and_then(|source| source.recognize_media_locator(locator))
+                },
+            )
+            .await
+            .map_err(string_error)?;
             if linked {
                 crate::playlist_files::remember(&owner, report.playlist, source_id, location, None)
                     .await?;
             }
-            accept_playlist_result(&owner, None, Some(report.playlist), Ok((true, None))).await;
             Ok(report)
         }
         .await;
+        drop(lane);
         match result {
             Ok(report) => {
                 let playlist = report.playlist;
-                let _ = sender.send(Ok(report)).await;
                 if let Err(error) = enrich_imported_playlist(&owner, playlist).await {
                     owner.shared.warn_nonfatal(&error);
                 }
+                crate::playlist_files::after_edit(&owner, playlist).await;
+                local_playlist_changed(&owner, None, Some(playlist)).await;
+                let _ = sender.send(Ok(report)).await;
             }
             Err(error) => {
                 let _ = sender.send(Err(error)).await;
@@ -105,8 +122,11 @@ pub fn import_source_playlist(
             let target =
                 crate::playlist_files::import_target(&owner, Some(&source_id), &path, linked)
                     .await?;
-            let report =
-                crate::playlist_files::import_source_on(&owner, &source_id, &path, target).await?;
+            let report = owner
+                .client(&source_id)?
+                .import_playlist_file(&owner.shared.database, &path, target)
+                .await
+                .map_err(string_error)?;
             if linked {
                 crate::playlist_files::remember(
                     &owner,
@@ -117,7 +137,9 @@ pub fn import_source_playlist(
                 )
                 .await?;
             }
-            accept_playlist_result(&owner, None, Some(report.playlist), Ok((true, None))).await;
+            enrich_imported_playlist(&owner, report.playlist).await?;
+            crate::playlist_files::after_edit(&owner, report.playlist).await;
+            local_playlist_changed(&owner, None, Some(report.playlist)).await;
             Ok(report)
         }
         .await;
@@ -132,62 +154,94 @@ pub fn import_document_playlist(
     current: Option<SourceConfiguration>,
 ) -> Receiver<Result<library::PlaylistImportReport, String>> {
     crate::playlist_files::run(owner, move |owner| async move {
-        let roots = match owner
-            .shared
-            .settings
-            .local_configuration()
-            .as_ref()
-            .and_then(|configuration| configuration.editable().ok())
-        {
-            Some(sources::EditableSource::Local { document_roots, .. }) => document_roots,
-            _ => Vec::new(),
-        };
-        let (mut document, file, locators) = tokio::task::spawn_blocking(move || {
-            let file = sources::stat_document(&uri).map_err(string_error)?.name;
-            let input = sources::open_document_input(&uri).map_err(string_error)?;
-            let format = library::PlaylistFormat::from_path(std::path::Path::new(&file))
-                .ok_or("Unsupported playlist format")?;
-            let mut document = library::PlaylistFile::read_as(
-                std::io::BufReader::new(input),
-                std::path::Path::new(&uri),
-                format,
-            )
-            .map_err(string_error)?;
+        let report = import_document_on(&owner, uri, None, current).await?;
+        enrich_imported_playlist(&owner, report.playlist).await?;
+        crate::playlist_files::after_edit(&owner, report.playlist).await;
+        local_playlist_changed(&owner, None, Some(report.playlist)).await;
+        Ok(report)
+    })
+}
+
+pub(crate) async fn import_document_on(
+    owner: &SourceOwner,
+    uri: String,
+    target: Option<PlaylistKey>,
+    current: Option<SourceConfiguration>,
+) -> Result<library::PlaylistImportReport, String> {
+    let roots = match owner
+        .shared
+        .settings
+        .local_configuration()
+        .as_ref()
+        .and_then(|configuration| configuration.editable().ok())
+    {
+        Some(sources::EditableSource::Local { document_roots, .. }) => document_roots,
+        _ => Vec::new(),
+    };
+    let (mut document, file, locators) = tokio::task::spawn_blocking(move || {
+        let file = sources::stat_document(&uri).map_err(string_error)?.name;
+        let input = sources::open_document_input(&uri).map_err(string_error)?;
+        let format = library::PlaylistFormat::from_path(std::path::Path::new(&file))
+            .ok_or("Unsupported playlist format")?;
+        let mut document = library::PlaylistFile::read_as(
+            std::io::BufReader::new(input),
+            std::path::Path::new(&uri),
+            format,
+        )
+        .map_err(string_error)?;
+        if target.is_none() {
             document.identity = None;
-            let mut locators = Vec::new();
-            for entry in &mut document.entries {
-                if url::Url::parse(&entry.locator).is_err()
-                    && !std::path::Path::new(&entry.locator).is_absolute()
-                    && !entry.locator.starts_with("\\\\")
-                {
-                    entry.locator =
-                        sources::resolve_document_relative(&uri, &entry.locator, &roots)
-                            .map_err(string_error)?
-                            .uri;
-                }
-                if entry.locator.starts_with("content:") {
-                    let identity =
-                        sources::document_identity(&entry.locator).map_err(string_error)?;
-                    let media_uri = library::document_media_uri(&identity);
-                    locators.push(library::LocalLocatorWrite {
-                        source_id: None,
-                        media_uri: media_uri.clone(),
-                        origin: "import".into(),
-                        path: entry.locator.clone(),
-                        root: entry.locator.clone(),
-                        relative_path: sources::stat_document(&entry.locator)
-                            .map_err(string_error)?
-                            .name,
-                        access_uri: entry.locator.clone(),
-                    });
-                    entry.locator = media_uri;
-                }
+        }
+        let mut locators = Vec::new();
+        for entry in &mut document.entries {
+            if url::Url::parse(&entry.locator).is_err()
+                && !std::path::Path::new(&entry.locator).is_absolute()
+                && !entry.locator.starts_with("\\\\")
+            {
+                entry.locator = sources::resolve_document_relative(&uri, &entry.locator, &roots)
+                    .map_err(string_error)?
+                    .uri;
             }
-            Ok::<_, String>((document, file, locators))
-        })
-        .await
-        .map_err(string_error)??;
-        for locator in locators {
+            if entry.locator.starts_with("content:") {
+                let identity = sources::document_identity(&entry.locator).map_err(string_error)?;
+                let media_uri = library::document_media_uri(&identity);
+                locators.push(library::LocalLocatorWrite {
+                    source_id: None,
+                    media_uri: media_uri.clone(),
+                    origin: "import".into(),
+                    path: entry.locator.clone(),
+                    root: entry.locator.clone(),
+                    relative_path: sources::stat_document(&entry.locator)
+                        .map_err(string_error)?
+                        .name,
+                    access_uri: entry.locator.clone(),
+                });
+                entry.locator = media_uri;
+            }
+        }
+        Ok::<_, String>((document, file, locators))
+    })
+    .await
+    .map_err(string_error)??;
+    let mut rekeys = std::collections::HashMap::new();
+    for page in locators.chunks(128) {
+        let ids = page
+            .iter()
+            .map(|locator| {
+                library::document_media_id(&locator.media_uri).expect("parsed document identity")
+            })
+            .collect::<Vec<_>>();
+        let canonical = owner
+            .shared
+            .database
+            .media_uris_for_document_ids(&ids)
+            .await
+            .map_err(string_error)?;
+        for (mut locator, canonical) in page.iter().cloned().zip(canonical) {
+            if let Some(canonical) = canonical {
+                rekeys.insert(locator.media_uri.clone(), canonical.clone());
+                locator.media_uri = canonical;
+            }
             owner
                 .shared
                 .database
@@ -195,26 +249,30 @@ pub fn import_document_playlist(
                 .await
                 .map_err(string_error)?;
         }
-        let before = document.entries.len();
-        document.entries.retain(|entry| {
-            library::playlist_locator(&entry.locator, std::path::Path::new("."))
-                .and_then(|uri| library::file_media_path(&uri))
-                .is_none_or(|path| !sources::playlist_file_is_non_audio(&path))
-        });
-        document.skipped += (before - document.entries.len()) as u64;
-        let report = owner
-            .shared
-            .database
-            .import_playlist_document(document, std::path::Path::new(&file), None, |locator| {
-                current
-                    .as_ref()
-                    .and_then(|source| source.recognize_media_locator(locator))
-            })
-            .await
-            .map_err(string_error)?;
-        accept_playlist_result(&owner, None, Some(report.playlist), Ok((true, None))).await;
-        Ok(report)
-    })
+    }
+    for entry in &mut document.entries {
+        if let Some(canonical) = rekeys.get(&entry.locator) {
+            entry.locator = canonical.clone();
+        }
+    }
+    let before = document.entries.len();
+    document.entries.retain(|entry| {
+        library::playlist_locator(&entry.locator, std::path::Path::new("."))
+            .and_then(|uri| library::file_media_path(&uri))
+            .is_none_or(|path| !sources::playlist_file_is_non_audio(&path))
+    });
+    document.skipped += (before - document.entries.len()) as u64;
+    let report = owner
+        .shared
+        .database
+        .import_playlist_document(document, std::path::Path::new(&file), target, |locator| {
+            current
+                .as_ref()
+                .and_then(|source| source.recognize_media_locator(locator))
+        })
+        .await
+        .map_err(string_error)?;
+    Ok(report)
 }
 
 pub fn export_playlist(
@@ -334,105 +392,146 @@ pub(crate) async fn export_contents(
     Ok(file.into_temp_path())
 }
 
-pub fn create_playlist(
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
+pub struct PlaylistCreation {
+    pub object_id: String,
+    pub settings_error: Option<String>,
+}
+
+#[cfg_attr(feature = "bindings", uniffi::export)]
+pub async fn create_playlist(
     owner: &SourceOwner,
     source_id: Option<SourceId>,
     name: String,
-    media_uris: Vec<String>,
+    songs: Arc<library::TrackSelection>,
     public: Option<bool>,
-) -> Receiver<Result<Option<String>, String>> {
-    let (sender, receiver) = async_channel::bounded(1);
-    owner.spawn_serialized(move |owner| async move {
-        let target = async {
-            match source_id {
-                None => Ok(PlaylistOwner::Local(None)),
-                Some(id) => {
-                    let cached = owner
-                        .shared
-                        .database
-                        .cached_source(id.as_str(), &ReadCancellation::new())
-                        .await
-                        .map_err(string_error)?
-                        .ok_or_else(|| "Source access is unavailable".to_string())?;
-                    configured_playlist_owner(&owner, &id, cached.source)
-                }
+    current: Option<bool>,
+) -> sources::SourceResult<Option<PlaylistCreation>> {
+    crate::playlist_files::run(owner, move |owner| async move {
+        let database = &owner.shared.database;
+        let pin_source = source_id.clone();
+        let target = match source_id {
+            None => PlaylistOwner::Local(None),
+            Some(id) => {
+                let cached = database
+                    .cached_source(id.as_str(), &ReadCancellation::new())
+                    .await
+                    .map_err(string_error)?
+                    .ok_or("Source access is unavailable")?;
+                configured_playlist_owner(&owner, &id, cached.source)?
             }
-        }
-        .await;
-        let source_key = target.as_ref().ok().and_then(PlaylistOwner::source_key);
-        let result = match target {
-            Ok(PlaylistOwner::Local(key)) => owner
-                .shared
-                .database
-                .create_playlist(key, &name, &media_uris)
-                .await
-                .map(|playlist| {
-                    let (playlist, object_id) = playlist.unzip();
-                    (playlist.is_some(), None, playlist, object_id)
-                })
-                .map_err(string_error),
-            Ok(PlaylistOwner::Server(source, key)) => {
-                async {
-                    let (changed, outcome, object_id) = source
-                        .create_playlist(&owner.shared.database, key, &name, &media_uris, public)
-                        .await
-                        .map_err(string_error)?;
-                    let playlist = if let Some(id) = object_id.as_deref() {
-                        match owner
-                            .shared
-                            .database
-                            .playlist_key_by_object(key, id, &ReadCancellation::new())
-                            .await
-                        {
-                            Ok(playlist) => playlist,
-                            Err(error) => {
-                                owner.shared.warn_nonfatal(&error.to_string());
-                                None
-                            }
-                        }
-                    } else {
+        };
+        let source_key = target.source_key();
+        let local = matches!(target, PlaylistOwner::Local(_));
+        let (playlist, object_id) = match target {
+            PlaylistOwner::Local(key) => {
+                let Some((playlist, object)) = database
+                    .create_playlist(key, &name, &songs)
+                    .await
+                    .map_err(string_error)?
+                else {
+                    return Ok(None);
+                };
+                (Some(playlist), object)
+            }
+            PlaylistOwner::Server(source, key) => {
+                let tracks = database
+                    .source_playlist_track_ids(key, None, &songs, false)
+                    .await
+                    .map_err(string_error)?;
+                let first = &tracks[..tracks.len().min(256)];
+                let object = match &source.implementation {
+                    Implementation::Plex(provider) => provider.create_playlist(&name, first).await,
+                    Implementation::JellyfinEmby(provider) => {
+                        provider.create_playlist(&name, first, public).await
+                    }
+                    Implementation::OpenSubsonic(provider) => {
+                        provider.create_playlist(&name, first, public).await
+                    }
+                    _ => unreachable!(),
+                }
+                .map_err(string_error)?;
+                append_native_tracks(&source, &object, &tracks[first.len()..])
+                    .await
+                    .map_err(string_error)?;
+                refresh_playlist(&source, database, Some(object.clone()), None)
+                    .await
+                    .map_err(string_error)?;
+                let playlist = match database
+                    .playlist_key_by_object(key, &object, &ReadCancellation::new())
+                    .await
+                {
+                    Ok(playlist) => playlist,
+                    Err(error) => {
+                        owner.shared.warn_nonfatal(&error.to_string());
                         None
-                    };
-                    Ok((changed, outcome, playlist, object_id))
+                    }
+                };
+                (playlist, object)
+            }
+        };
+        if let Some(playlist) = playlist {
+            crate::playlist_files::after_edit(&owner, playlist).await;
+        }
+        if local {
+            local_playlist_changed(&owner, source_key, playlist).await;
+        }
+        let playlist_id = object_id.clone();
+        let settings = owner.shared.settings.clone();
+        let settings_error = tokio::task::spawn_blocking(move || {
+            settings.update(|stored| {
+                stored.ui.sidebar.set_pinned(
+                    crate::settings::SidebarPin::Playlist {
+                        source_id: pin_source,
+                        playlist_id,
+                    },
+                    true,
+                );
+                if let Some(current) = current {
+                    stored.ui.application.new_playlist_current = current;
                 }
-                .await
-            }
-            Err(error) => Err(error),
-        };
-        let reply = match result {
-            Ok((changed, outcome, playlist, object_id)) => {
-                accept_playlist_result(&owner, source_key, playlist, Ok((changed, outcome))).await;
-                Ok(object_id)
-            }
-            Err(error) => {
-                owner.shared.warn_nonfatal(&error);
-                Err(error)
-            }
-        };
-        let _ = sender.send(reply).await;
-    });
-    receiver
+                Ok(())
+            })
+        })
+        .await
+        .map_err(string_error)
+        .and_then(|result| result)
+        .err();
+        Ok(Some(PlaylistCreation {
+            object_id,
+            settings_error,
+        }))
+    })
+    .recv()
+    .await
+    .map_err(|error| SourceError::Other(error.to_string()))?
+    .map_err(SourceError::Other)
 }
 
 pub fn playlist_public(
     owner: &SourceOwner,
     playlist: PlaylistKey,
 ) -> Receiver<Result<Option<bool>, String>> {
-    owner.reply(move |owner, database| async move {
-        match playlist_source(&owner, playlist).await? {
+    owner.reply(move |owner, _database| async move {
+        let (target, id) = playlist_source(&owner, playlist, None).await?;
+        match target {
             PlaylistOwner::Local(_) => Ok(None),
-            PlaylistOwner::Server(source, key) => source
-                .playlist_public(&database, key, playlist)
-                .await
-                .map_err(string_error),
+            PlaylistOwner::Server(source, _) => match &source.implementation {
+                Implementation::JellyfinEmby(provider) => provider.playlist_public(&id).await,
+                Implementation::OpenSubsonic(provider) => provider.playlist_public(&id).await,
+                _ => Ok(None),
+            }
+            .map_err(string_error),
         }
     })
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct PlaylistArtworkEditing {
     pub binding: Option<Vec<u8>>,
-    pub representative_artwork: Vec<Vec<u8>>,
+    pub automatic_binding: Option<Vec<u8>>,
     pub writable: bool,
 }
 
@@ -441,28 +540,45 @@ pub fn playlist_artwork_editing(
     playlist: PlaylistKey,
 ) -> Receiver<Result<PlaylistArtworkEditing, String>> {
     owner.reply(move |owner, database| async move {
-        let row = database
-            .playlist_rows(&[playlist], &ReadCancellation::new())
-            .await
-            .map_err(string_error)?
-            .pop()
-            .ok_or("Playlist no longer exists")?;
+        let row = library::CatalogQuery::keys(
+            library::CatalogKind::Playlist,
+            None,
+            (&[playlist]).iter().map(|key| key.raw()).collect(),
+        )
+        .rows(&database, 0, (&[playlist]).len(), &ReadCancellation::new())
+        .await
+        .map(|rows| match rows {
+            library::CatalogRows::Playlists(rows) => rows,
+            _ => unreachable!("typed catalog projection"),
+        })
+        .map_err(string_error)?
+        .pop()
+        .ok_or("Playlist no longer exists")?;
         let writable = row.metadata_writable
-            && match playlist_source(&owner, playlist).await? {
-                PlaylistOwner::Local(_) => true,
-                PlaylistOwner::Server(source, _) => source.supports_playlist_artwork(),
-            };
-        let representative_artwork = if row.artwork_binding.is_some() {
-            database
-                .playlist_representative_artwork(playlist)
-                .await
-                .map_err(string_error)?
-        } else {
-            row.representative_artwork
-        };
+            && (!row.source_owned
+                || row
+                    .source_id
+                    .as_ref()
+                    .map(|id| owner.client(&SourceId::new(id)))
+                    .transpose()?
+                    .is_some_and(|source| source.supports_playlist_artwork()));
+        let binding = row
+            .artwork_binding
+            .as_deref()
+            .map(library::authored_playlist_artwork)
+            .transpose()
+            .map_err(string_error)?
+            .flatten();
+        let automatic_binding = row
+            .artwork_binding
+            .as_deref()
+            .map(library::automatic_playlist_artwork)
+            .transpose()
+            .map_err(string_error)?
+            .flatten();
         Ok(PlaylistArtworkEditing {
-            binding: row.artwork_binding,
-            representative_artwork,
+            binding,
+            automatic_binding,
             writable,
         })
     })
@@ -506,19 +622,21 @@ async fn generate_artwork(
 ) -> Result<Option<Arc<sources::ImageBytes>>, String> {
     let stored = owner.shared.settings.load();
     let policy = artwork::ExternalPolicy::new(
-        stored.ui.external_metadata_enabled,
+        stored.ui.application.external_metadata_enabled,
         stored.ui.allows_external_metadata_lookup(),
         stored.ui.lastfm_api_key,
     );
-    let mut images = Vec::with_capacity(bindings.len());
-    for binding in bindings {
-        let request =
-            artwork::ArtworkRequest::original(artwork::ArtworkBinding::opaque(&binding), 512)
-                .with_external(policy.clone());
-        if let Some(bytes) = owner.shared.artwork.image_bytes(request).await? {
-            images.push(bytes);
-        }
-    }
+    let mut images = futures_util::stream::iter(bindings)
+        .map(|binding| {
+            let request =
+                artwork::ArtworkRequest::new(artwork::ArtworkBinding::opaque(&binding), 512, 512)
+                    .with_external(policy.clone());
+            owner.shared.artwork.image_bytes(request)
+        })
+        .buffered(4)
+        .try_filter_map(|bytes| async { Ok(bytes) })
+        .try_collect::<Vec<_>>()
+        .await?;
     if images.is_empty() {
         return Ok(None);
     }
@@ -539,16 +657,21 @@ async fn generate_artwork(
     })))
 }
 
-pub fn update_playlist(
+#[cfg_attr(feature = "bindings", uniffi::export)]
+pub async fn update_playlist(
     owner: &SourceOwner,
     playlist: PlaylistKey,
     name: Option<String>,
     public: Option<bool>,
     artwork: Option<sources::ArtworkChange>,
-) -> Receiver<Result<bool, String>> {
+) -> sources::SourceResult<bool> {
     crate::playlist_files::run(owner, move |owner| async move {
         update_playlist_on(&owner, playlist, name.as_deref(), public, artwork.as_ref()).await
     })
+    .recv()
+    .await
+    .map_err(|error| SourceError::Other(error.to_string()))?
+    .map_err(SourceError::Other)
 }
 
 pub(crate) async fn update_playlist_on(
@@ -558,8 +681,17 @@ pub(crate) async fn update_playlist_on(
     public: Option<bool>,
     artwork: Option<&sources::ArtworkChange>,
 ) -> Result<bool, String> {
-    let target = playlist_source(owner, playlist).await?;
+    let (target, id) = playlist_source(
+        owner,
+        playlist,
+        (name.is_some() || artwork.is_some()).then_some(false),
+    )
+    .await?;
     let source_key = target.source_key();
+    let native_source = match &target {
+        PlaylistOwner::Local(_) => None,
+        PlaylistOwner::Server(source, _) => Some(source.source_id().clone()),
+    };
     let previous = if artwork.is_some() {
         owner
             .shared
@@ -583,24 +715,74 @@ pub(crate) async fn update_playlist_on(
                 .database
                 .update_playlist(source, playlist, name, image)
                 .await
-                .map(|changed| (changed, None))
                 .map_err(|error| sources::SourceMetadataError::Write(error.to_string()))
         }
-        PlaylistOwner::Server(source, key) => {
-            source
-                .update_playlist(&owner.shared.database, key, playlist, name, public, artwork)
-                .await
+        PlaylistOwner::Server(source, _) => {
+            async {
+                let error =
+                    |error: SourceError| sources::SourceMetadataError::Write(error.to_string());
+                if artwork.is_some() && !source.supports_playlist_artwork() {
+                    return Err(sources::SourceMetadataError::Unavailable);
+                }
+                if name.is_some() || public.is_some() {
+                    match &source.implementation {
+                        Implementation::Plex(provider) => {
+                            if let Some(name) = name {
+                                provider.rename_playlist(&id, name).await.map_err(error)?;
+                            }
+                        }
+                        Implementation::JellyfinEmby(provider) => provider
+                            .update_playlist(&id, name, public)
+                            .await
+                            .map_err(error)?,
+                        Implementation::OpenSubsonic(provider) => provider
+                            .update_playlist(&id, name, public)
+                            .await
+                            .map_err(error)?,
+                        _ => unreachable!(),
+                    }
+                }
+                let result = if let Some(artwork) = artwork {
+                    match &source.implementation {
+                        Implementation::Plex(provider) => {
+                            provider.change_artwork(&id, artwork).await
+                        }
+                        Implementation::JellyfinEmby(provider) => {
+                            provider.change_artwork(&id, artwork).await
+                        }
+                        Implementation::OpenSubsonic(provider) => {
+                            provider.change_playlist_artwork(&id, artwork).await
+                        }
+                        _ => unreachable!(),
+                    }
+                    .map_err(error)
+                } else {
+                    Ok(())
+                };
+                if name.is_none() && artwork.is_none() {
+                    return result.map(|()| false);
+                }
+                let refresh = refresh_playlist(&source, &owner.shared.database, Some(id), None)
+                    .await
+                    .map_err(|error| {
+                        sources::SourceMetadataError::SavedRefreshFailed(error.to_string())
+                    });
+                sources::finish_metadata_save(result, refresh, name.is_some() || public.is_some())
+                    .map(|()| true)
+            }
+            .await
         }
     };
-    let mut publication = match &result {
-        Ok((changed, outcome)) => Ok((*changed, *outcome)),
-        Err(sources::SourceMetadataError::PartiallySaved { outcome, .. }) => Ok((true, *outcome)),
-        Err(sources::SourceMetadataError::SavedRefreshFailed(_)) => Ok((true, None)),
-        Err(error) => Err(error.to_string()),
+    let changed = match &result {
+        Ok(changed) => *changed,
+        Err(sources::SourceMetadataError::PartiallySaved { .. })
+        | Err(sources::SourceMetadataError::SavedRefreshFailed(_)) => true,
+        Err(error) => {
+            owner.shared.warn_nonfatal(&error.to_string());
+            false
+        }
     };
-    if publication.as_ref().is_ok_and(|(changed, _)| *changed)
-        && let Some(binding) = previous
-    {
+    if changed && let Some(binding) = previous {
         let cache = owner.shared.artwork.clone();
         match tokio::task::spawn_blocking(move || {
             cache.invalidate_image(&artwork::ArtworkBinding::opaque(&binding))
@@ -608,8 +790,10 @@ pub(crate) async fn update_playlist_on(
         .await
         {
             Ok(Ok(true)) => {
-                if let Ok((_, Some(ScanOutcome::Identical(scan)))) = publication {
-                    publication = Ok((true, Some(ScanOutcome::ArtworkChanged(scan))));
+                if let Some(source) = &native_source {
+                    owner
+                        .artwork_invalidated(source, CatalogChange::Playlists(Some(playlist)))
+                        .await;
                 }
             }
             Ok(Ok(false)) => {}
@@ -618,79 +802,113 @@ pub(crate) async fn update_playlist_on(
                 .warn_nonfatal(&format!("Playlist artwork cache refresh failed: {error:?}")),
         }
     }
-    let reply = result
-        .as_ref()
-        .map(|(changed, _)| *changed || public.is_some())
-        .map_err(string_error);
-    accept_playlist_result(owner, source_key, Some(playlist), publication).await;
-    reply
-}
-
-pub fn delete_playlist(
-    owner: &SourceOwner,
-    playlist: PlaylistKey,
-) -> Receiver<Result<bool, String>> {
-    let operation_owner = owner.clone();
-    playlist_change(&owner, playlist, move |target, database| async move {
-        crate::playlist_files::forget_file(&operation_owner, playlist).await?;
-        let result = match target {
-            PlaylistOwner::Local(source_key) => database
-                .delete_playlist(source_key, playlist)
-                .await
-                .map(|changed| (changed, None))
-                .map_err(string_error),
-            PlaylistOwner::Server(source, source_key) => source
-                .delete_playlist(&database, source_key, playlist)
-                .await
-                .map_err(string_error),
-        };
-        if matches!(result, Ok((true, _))) {
-            prune_imported_playlist_files(&operation_owner).await;
+    if changed {
+        crate::playlist_files::after_edit(owner, playlist).await;
+        if native_source.is_none() {
+            local_playlist_changed(owner, source_key, Some(playlist)).await;
         }
-        result
-    })
+    }
+    result
+        .map(|changed| changed || public.is_some())
+        .map_err(string_error)
 }
 
-pub fn add_playlist_tracks(
+#[cfg_attr(feature = "bindings", uniffi::export)]
+pub async fn delete_playlist(
     owner: &SourceOwner,
     playlist: PlaylistKey,
-    media_uris: Vec<String>,
+) -> sources::SourceResult<bool> {
+    let operation_owner = owner.clone();
+    playlist_change(
+        &owner,
+        playlist,
+        false,
+        move |target, id, database| async move {
+            crate::playlist_files::forget_file(&operation_owner, playlist)
+                .await
+                .map_err(SourceError::Other)?;
+            let result = match target {
+                PlaylistOwner::Local(source_key) => database
+                    .delete_playlist(source_key, playlist)
+                    .await
+                    .map_err(SourceError::from),
+                PlaylistOwner::Server(source, _) => {
+                    match &source.implementation {
+                        Implementation::Plex(provider) => provider.delete_playlist(&id).await?,
+                        Implementation::JellyfinEmby(provider) => {
+                            provider.delete_playlist(&id).await?
+                        }
+                        Implementation::OpenSubsonic(provider) => {
+                            provider.delete_playlist(&id).await?
+                        }
+                        _ => unreachable!(),
+                    }
+                    refresh_playlist(&source, &database, None, Some(id))
+                        .await
+                        .map(|()| true)
+                }
+            };
+            result
+        },
+    )
+    .recv()
+    .await
+    .map_err(|error| SourceError::Other(error.to_string()))?
+    .map_err(SourceError::Other)
+}
+
+#[cfg_attr(feature = "bindings", uniffi::export)]
+pub async fn add_playlist_tracks(
+    owner: &SourceOwner,
+    playlist: PlaylistKey,
+    songs: Arc<library::TrackSelection>,
     skip_duplicates: bool,
-) -> Receiver<Result<usize, String>> {
+) -> sources::SourceResult<usize> {
     let (sender, receiver) = async_channel::bounded(1);
     owner.spawn_serialized(move |owner| async move {
-        let target = playlist_source(&owner, playlist).await;
-        let source_key = target.as_ref().ok().and_then(PlaylistOwner::source_key);
+        let target = playlist_source(&owner, playlist, Some(true)).await;
+        let source_key = target
+            .as_ref()
+            .ok()
+            .and_then(|(target, _)| target.source_key());
+        let local = matches!(&target, Ok((PlaylistOwner::Local(_), _)));
         let result = match target {
-            Ok(PlaylistOwner::Local(source_key)) => owner
+            Ok((PlaylistOwner::Local(source_key), _)) => owner
                 .shared
                 .database
-                .add_playlist_media(source_key, playlist, &media_uris, skip_duplicates)
+                .add_playlist_tracks(source_key, playlist, &songs, skip_duplicates)
                 .await
-                .map(|accepted| (accepted, None))
                 .map_err(sources::SourceError::from),
-            Ok(PlaylistOwner::Server(source, source_key)) => {
-                source
-                    .add_playlist_tracks(
-                        &owner.shared.database,
-                        source_key,
-                        playlist,
-                        &media_uris,
-                        skip_duplicates,
-                    )
-                    .await
+            Ok((PlaylistOwner::Server(source, source_key), id)) => {
+                async {
+                    let skip =
+                        skip_duplicates
+                            || owner.configuration(source.source_id()).is_some_and(
+                                |configuration| !configuration.playlist_tracks_can_repeat(),
+                            );
+                    let tracks = owner
+                        .shared
+                        .database
+                        .source_playlist_track_ids(source_key, Some(playlist), &songs, skip)
+                        .await?;
+                    append_native_tracks(&source, &id, &tracks).await?;
+                    if !tracks.is_empty() {
+                        refresh_playlist(&source, &owner.shared.database, Some(id), None).await?;
+                    }
+                    Ok(tracks.len())
+                }
+                .await
             }
             Err(error) => Err(sources::SourceError::Other(error)),
         };
         let reply = match result {
-            Ok((accepted, outcome)) => {
-                accept_playlist_result(
-                    &owner,
-                    source_key,
-                    Some(playlist),
-                    Ok((accepted > 0, outcome)),
-                )
-                .await;
+            Ok(accepted) => {
+                if accepted > 0 {
+                    crate::playlist_files::after_edit(&owner, playlist).await;
+                    if local {
+                        local_playlist_changed(&owner, source_key, Some(playlist)).await;
+                    }
+                }
                 Ok(accepted)
             }
             Err(error) => {
@@ -711,35 +929,99 @@ pub fn add_playlist_tracks(
         let _ = sender.send(reply).await;
     });
     receiver
+        .recv()
+        .await
+        .map_err(|error| SourceError::Other(error.to_string()))?
+        .map_err(SourceError::Other)
 }
 
 pub fn remove_playlist_entries(
     owner: &SourceOwner,
     playlist: PlaylistKey,
-    entries: Vec<PlaylistEntryKey>,
-) -> Receiver<Result<bool, String>> {
-    let operation_owner = owner.clone();
-    playlist_change(&owner, playlist, move |target, database| async move {
-        let result = match target {
-            PlaylistOwner::Local(source_key) => database
-                .remove_playlist_entries(source_key, playlist, &entries)
-                .await
-                .map(|removed| (removed > 0, None))
-                .map_err(string_error),
-            PlaylistOwner::Server(source, source_key) => source
-                .remove_playlist_entries(&database, source_key, playlist, &entries)
-                .await
-                .map_err(string_error),
-        };
-        if matches!(result, Ok((true, _))) {
-            prune_imported_playlist_files(&operation_owner).await;
+    selection: library::TrackSelection,
+) -> Receiver<Result<Vec<library::TrackKey>, String>> {
+    crate::playlist_files::run(owner, move |owner| async move {
+        let (target, id) = playlist_source(&owner, playlist, Some(true)).await?;
+        let source_key = target.source_key();
+        let local = matches!(target, PlaylistOwner::Local(_));
+        let database = &owner.shared.database;
+        let entries = database
+            .playlist_edit_entries(playlist, &selection, &ReadCancellation::new())
+            .await
+            .map_err(string_error)?;
+        if !local
+            && let library::TrackSelection::Query {
+                query:
+                    library::CatalogQuery {
+                        subject: library::CatalogSubject::PlaylistEntries { keys: requested },
+                        ..
+                    },
+                ..
+            } = &selection
+            && entries.len() != requested.len()
+        {
+            return Err("Playlist entry is no longer current".into());
         }
-        result
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let songs = entries
+            .iter()
+            .map(|entry| entry.track_key)
+            .collect::<Vec<_>>();
+        match target {
+            PlaylistOwner::Local(source) => {
+                let keys = entries
+                    .iter()
+                    .map(|entry| entry.playlist_entry_key)
+                    .collect::<Vec<_>>();
+                if database
+                    .remove_playlist_entries(source, playlist, &keys)
+                    .await
+                    .map_err(string_error)?
+                    == 0
+                {
+                    return Ok(Vec::new());
+                }
+            }
+            PlaylistOwner::Server(source, _) => {
+                // Later positions go first because Subsonic identifies entries by position.
+                let ids = entries
+                    .into_iter()
+                    .rev()
+                    .map(|entry| entry.object_id)
+                    .collect::<Vec<_>>();
+                for ids in ids.chunks(256) {
+                    match &source.implementation {
+                        Implementation::Plex(provider) => {
+                            provider.remove_playlist_entries(&id, ids).await
+                        }
+                        Implementation::JellyfinEmby(provider) => {
+                            provider.remove_playlist_entries(&id, ids).await
+                        }
+                        Implementation::OpenSubsonic(provider) => {
+                            provider.remove_playlist_entries(&id, ids).await
+                        }
+                        _ => unreachable!(),
+                    }
+                    .map_err(string_error)?;
+                }
+                refresh_playlist(&source, database, Some(id), None)
+                    .await
+                    .map_err(string_error)?;
+            }
+        }
+        crate::playlist_files::after_edit(&owner, playlist).await;
+        if local {
+            local_playlist_changed(&owner, source_key, Some(playlist)).await;
+        }
+        Ok(songs)
     })
 }
 
 pub fn can_remove_unavailable(owner: &SourceOwner, playlist: &library::PlaylistRow) -> bool {
-    playlist.writable
+    !playlist.source_owned
+        && playlist.writable
         && playlist.source_id.as_ref().is_none_or(|id| {
             owner
                 .configuration(&SourceId::new(id))
@@ -754,7 +1036,9 @@ pub fn remove_unavailable_tracks(
     let (sender, receiver) = async_channel::bounded(1);
     owner.spawn_serialized(move |owner| async move {
         let result = async {
-            let PlaylistOwner::Local(source) = playlist_source(&owner, playlist).await? else {
+            let (PlaylistOwner::Local(source), _) =
+                playlist_source(&owner, playlist, Some(true)).await?
+            else {
                 return Err("This playlist belongs to a server".to_string());
             };
             let database = &owner.shared.database;
@@ -780,8 +1064,8 @@ pub fn remove_unavailable_tracks(
                 .await
                 .map_err(string_error)?;
             if removed > 0 {
-                prune_imported_playlist_files(&owner).await;
-                accept_playlist_result(&owner, source, Some(playlist), Ok((true, None))).await;
+                crate::playlist_files::after_edit(&owner, playlist).await;
+                local_playlist_changed(&owner, source, Some(playlist)).await;
             }
             Ok(removed)
         }
@@ -800,19 +1084,59 @@ pub fn move_playlist_entry(
     entry: PlaylistEntryKey,
     position: usize,
 ) -> Receiver<Result<bool, String>> {
-    playlist_change(&owner, playlist, move |target, database| async move {
-        match target {
-            PlaylistOwner::Local(source_key) => database
-                .move_playlist_entry(source_key, playlist, entry, position)
-                .await
-                .map(|changed| (changed, None))
-                .map_err(string_error),
-            PlaylistOwner::Server(source, source_key) => source
-                .move_playlist_entry(&database, source_key, playlist, entry, position)
-                .await
-                .map_err(string_error),
-        }
-    })
+    playlist_change(
+        &owner,
+        playlist,
+        true,
+        move |target, id, database| async move {
+            match target {
+                PlaylistOwner::Local(source_key) => database
+                    .move_playlist_entry(source_key, playlist, entry, position)
+                    .await
+                    .map_err(SourceError::from),
+                PlaylistOwner::Server(source, _) => {
+                    let entry = database
+                        .playlist_edit_entries(
+                            playlist,
+                            &library::CatalogQuery::playlist_entries(vec![entry]).selection(),
+                            &ReadCancellation::new(),
+                        )
+                        .await?
+                        .pop()
+                        .ok_or(SourceError::NotFound)?;
+                    if entry.position == position {
+                        return Ok(false);
+                    }
+                    match &source.implementation {
+                        Implementation::Plex(provider) => {
+                            provider
+                                .move_playlist_entry(
+                                    &id,
+                                    &entry.object_id,
+                                    entry.position,
+                                    position,
+                                )
+                                .await?
+                        }
+                        Implementation::JellyfinEmby(provider) => {
+                            provider
+                                .move_playlist_entry(&id, &entry.object_id, position)
+                                .await?
+                        }
+                        Implementation::OpenSubsonic(provider) => {
+                            provider
+                                .move_playlist_entry(&id, &entry.object_id, position)
+                                .await?
+                        }
+                        _ => unreachable!(),
+                    }
+                    refresh_playlist(&source, &database, Some(id), None)
+                        .await
+                        .map(|()| true)
+                }
+            }
+        },
+    )
 }
 
 enum PlaylistOwner {
@@ -832,26 +1156,36 @@ impl PlaylistOwner {
 fn playlist_change<F, Work>(
     owner: &SourceOwner,
     playlist: PlaylistKey,
+    edit_tracks: bool,
     change: F,
 ) -> Receiver<Result<bool, String>>
 where
-    F: FnOnce(PlaylistOwner, Arc<Database>) -> Work + Send + 'static,
-    Work: Future<Output = Result<(bool, Option<ScanOutcome>), String>> + Send + 'static,
+    F: FnOnce(PlaylistOwner, String, Arc<Database>) -> Work + Send + 'static,
+    Work: Future<Output = Result<bool, SourceError>> + Send + 'static,
 {
     let (sender, receiver) = async_channel::bounded(1);
     owner.spawn_serialized(move |owner| async move {
-        let target = playlist_source(&owner, playlist).await;
-        let source_key = target.as_ref().ok().and_then(PlaylistOwner::source_key);
-        let result = match target {
-            Ok(target) => change(target, Arc::clone(&owner.shared.database)).await,
-            Err(error) => Err(error),
-        };
-        let reply = result
+        let target = playlist_source(&owner, playlist, Some(edit_tracks)).await;
+        let source_key = target
             .as_ref()
-            .map(|(changed, _)| *changed)
-            .map_err(Clone::clone);
-        accept_playlist_result(&owner, source_key, Some(playlist), result).await;
-        let _ = sender.try_send(reply);
+            .ok()
+            .and_then(|(target, _)| target.source_key());
+        let local = matches!(&target, Ok((PlaylistOwner::Local(_), _)));
+        let result = match target {
+            Ok((target, id)) => change(target, id, Arc::clone(&owner.shared.database)).await,
+            Err(error) => Err(SourceError::Other(error)),
+        };
+        match &result {
+            Ok(true) => {
+                crate::playlist_files::after_edit(&owner, playlist).await;
+                if local {
+                    local_playlist_changed(&owner, source_key, Some(playlist)).await;
+                }
+            }
+            Err(error) => owner.shared.warn_nonfatal(&error.to_string()),
+            Ok(false) => {}
+        }
+        let _ = sender.try_send(result.map_err(string_error));
     });
     receiver
 }
@@ -859,19 +1193,34 @@ where
 async fn playlist_source(
     owner: &SourceOwner,
     playlist: PlaylistKey,
-) -> Result<PlaylistOwner, String> {
-    match owner
+    edit_tracks: Option<bool>,
+) -> Result<(PlaylistOwner, String), String> {
+    let access = owner
         .shared
         .database
-        .playlist_owner(playlist, &ReadCancellation::new())
+        .playlist_access(playlist, &ReadCancellation::new())
         .await
         .map_err(string_error)?
+        .ok_or("Playlist no longer exists")?;
+    if access.source_owned
+        && edit_tracks.is_some_and(|tracks| {
+            if tracks {
+                !access.writable
+            } else {
+                !access.metadata_writable
+            }
+        })
     {
-        Some((None, None)) => Ok(PlaylistOwner::Local(None)),
-        Some((Some(key), Some(id))) => configured_playlist_owner(owner, &SourceId::new(id), key),
-        Some(_) => Err("Playlist owner is unavailable".to_string()),
-        None => Err("Playlist no longer exists".to_string()),
+        return Err("The server does not allow this playlist change".into());
     }
+    let target = if access.source_owned {
+        let key = access.source_key.ok_or("Playlist owner is unavailable")?;
+        let id = access.source_id.ok_or("Playlist owner is unavailable")?;
+        PlaylistOwner::Server(owner.client(&SourceId::new(id))?, key)
+    } else {
+        PlaylistOwner::Local(access.source_key)
+    };
+    Ok((target, access.object_id))
 }
 
 fn configured_playlist_owner(
@@ -891,117 +1240,49 @@ fn configured_playlist_owner(
     }
 }
 
-async fn enrich_imported_playlist(
+pub(crate) async fn enrich_imported_playlist(
     owner: &SourceOwner,
     playlist: library::PlaylistKey,
 ) -> Result<(), String> {
-    let mut after = String::new();
-    let mut readable = false;
-    loop {
-        let page = owner
-            .shared
-            .database
-            .imported_local_uri_page(Some(playlist), &after)
-            .await
-            .map_err(string_error)?;
-        if page.is_empty() {
-            break;
-        }
-        after = page.last().unwrap().0.clone();
-        if page.iter().any(|(uri, cue)| {
-            cue.as_ref()
-                .map(PathBuf::from)
-                .or_else(|| library::file_media_path(uri))
-                .is_some_and(|path| path.is_file())
-        }) {
-            readable = true;
-            break;
-        }
-    }
-    if readable {
-        let source = owner.ensure_local_source().await?;
-        let outcome = source
-            .import_playlist_files(&owner.shared.database, playlist)
-            .await
-            .map_err(string_error)?;
-        owner
-            .accept_scan(source.source_id(), outcome, CatalogChange::Broad)
-            .await;
-    }
-    Ok(())
-}
-
-pub(crate) async fn prune_imported_playlist_files(owner: &SourceOwner) {
-    if let Some(local) = owner
+    if owner
         .shared
-        .settings
-        .load()
-        .sources
-        .configured
-        .iter()
-        .find(|item| item.configuration.is_local())
+        .database
+        .imported_local_uri_page(Some(playlist), "")
+        .await
+        .map_err(string_error)?
+        .is_empty()
     {
-        if let Ok(client) = owner.client(&local.configuration.source_id) {
-            match client.prune_imported_files(&owner.shared.database).await {
-                Ok(Some(outcome)) => {
-                    owner
-                        .accept_scan(client.source_id(), outcome, CatalogChange::Broad)
-                        .await;
-                }
-                Err(error) => owner.shared.warn_nonfatal(&error.to_string()),
-                Ok(None) => {}
-            }
-        }
+        return Ok(());
     }
+    owner
+        .ensure_local_source()
+        .await?
+        .import_playlist_files(&owner.shared.database, playlist)
+        .await
+        .map_err(string_error)
 }
 
-async fn accept_playlist_result(
+async fn local_playlist_changed(
     owner: &SourceOwner,
     source: Option<SourceKey>,
     playlist: Option<PlaylistKey>,
-    result: Result<(bool, Option<ScanOutcome>), String>,
 ) {
-    let outcome = match result {
-        Ok((true, outcome)) => outcome,
-        Ok((false, _)) => return,
-        Err(error) => {
-            owner.shared.warn_nonfatal(&error);
-            return;
-        }
-    };
-    if let Some(playlist) = playlist {
-        crate::playlist_files::after_edit(owner, playlist).await;
-    }
-    if let Some(outcome) = outcome
-        && let Some(selected) = owner
-            .shared
-            .selected()
-            .filter(|selected| Some(selected.source_key) == source)
+    if let Err(error) = owner
+        .shared
+        .database
+        .mark_playlist_artwork_pending(playlist, false)
+        .await
     {
-        owner
-            .accept_scan(
-                selected.source_id(),
-                outcome,
-                CatalogChange::Playlists(playlist),
-            )
-            .await;
-    } else {
-        owner
-            .shared
-            .send(SourceEvent::CatalogPublished(CatalogPublication {
-                source_key: source,
-                favorite: None,
-                change: CatalogChange::Playlists(playlist),
-            }))
-            .await;
+        owner.shared.warn_nonfatal(&error.to_string());
     }
-}
-pub fn playlist_artwork_bindings(playlist: &library::PlaylistRow) -> &[Vec<u8>] {
-    playlist
-        .artwork_binding
-        .as_ref()
-        .map(std::slice::from_ref)
-        .unwrap_or(&playlist.representative_artwork)
+    owner
+        .shared
+        .send(SourceEvent::CatalogPublished(CatalogPublication {
+            source_key: source,
+            favorite: None,
+            change: CatalogChange::Playlists(playlist),
+        }))
+        .await;
 }
 
 pub fn smart_playlist_display_name(playlist: &library::SmartPlaylistRow) -> String {
@@ -1031,4 +1312,49 @@ pub enum SmartPlaylistChange {
         dragged: library::SmartPlaylistKey,
         target: library::SmartPlaylistKey,
     },
+}
+
+async fn append_native_tracks(
+    source: &Source,
+    playlist: &str,
+    tracks: &[String],
+) -> Result<(), SourceError> {
+    for tracks in tracks.chunks(256) {
+        match &source.implementation {
+            Implementation::Plex(provider) => {
+                provider.add_playlist_tracks(playlist, tracks).await?
+            }
+            Implementation::JellyfinEmby(provider) => {
+                provider.add_playlist_tracks(playlist, tracks).await?
+            }
+            Implementation::OpenSubsonic(provider) => {
+                provider.add_playlist_tracks(playlist, tracks).await?
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(())
+}
+
+async fn refresh_playlist(
+    source: &Source,
+    database: &Database,
+    affected: Option<String>,
+    deleted: Option<String>,
+) -> Result<(), SourceError> {
+    let object = |id: String| {
+        let raw = id.rsplit(':').next().unwrap_or(&id);
+        if matches!(source.implementation, Implementation::OpenSubsonic(_)) {
+            format!("playlist:{raw}")
+        } else {
+            raw.to_owned()
+        }
+    };
+    source
+        .apply_items(
+            database,
+            affected.into_iter().map(object).collect(),
+            deleted.into_iter().map(object).collect(),
+        )
+        .await
 }

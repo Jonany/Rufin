@@ -16,14 +16,20 @@ pub fn delete_playlist_dialog(name: &str, delete: impl Fn() + 'static) -> adw::A
 pub fn add_media_to_playlist(
     source: &rufin_core::source::SourceOwner,
     playlist: PlaylistKey,
-    media_uris: Vec<String>,
+    selection: library::TrackSelection,
     skip_existing: bool,
     settled: Rc<dyn Fn(usize)>,
 ) {
-    let result =
-        rufin_core::playlists::add_playlist_tracks(source, playlist, media_uris, skip_existing);
+    let source = source.clone();
     gtk::glib::spawn_future_local(async move {
-        let accepted = result.recv().await.ok().and_then(Result::ok).unwrap_or(0);
+        let accepted = rufin_core::playlists::add_playlist_tracks(
+            &source,
+            playlist,
+            selection.into(),
+            skip_existing,
+        )
+        .await
+        .unwrap_or(0);
         settled(accepted);
     });
 }

@@ -258,6 +258,7 @@ impl<'de> Deserialize<'de> for LayoutSettings {
     }
 }
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum ThemePreference {
     System,
     Light,
@@ -265,6 +266,7 @@ pub enum ThemePreference {
     Named(String),
 }
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum AccentPreference {
     #[default]
     System,
@@ -307,6 +309,7 @@ impl AccentPreference {
     ];
 }
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum LibraryLayout {
     Row,
     Grid,
@@ -412,6 +415,7 @@ impl LibraryListKey {
     }
 }
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum LibraryField {
     RowIndex,
     Image,
@@ -444,112 +448,33 @@ pub enum LibraryField {
     Tools,
 }
 impl LibraryField {
-    pub fn track_sort(self) -> library::TrackSort {
+    pub fn catalog_sort(self) -> library::CatalogSort {
+        use library::CatalogSort;
         match self {
-            Self::TrackNumber => library::TrackSort::TrackNumber,
-            Self::Artist => library::TrackSort::Artist,
-            Self::AlbumArtist => library::TrackSort::AlbumArtist,
-            Self::Album => library::TrackSort::Album,
-            Self::Year => library::TrackSort::Year,
-            Self::ReleaseDate => library::TrackSort::ReleaseDate,
-            Self::DateAdded => library::TrackSort::DateAdded,
-            Self::LastPlayed => library::TrackSort::LastPlayed,
-            Self::PlayCount => library::TrackSort::PlayCount,
-            Self::UserRating => library::TrackSort::UserRating,
-            Self::Genre => library::TrackSort::Genre,
-            Self::Bpm => library::TrackSort::Bpm,
-            Self::Duration => library::TrackSort::Duration,
-            Self::Favorite => library::TrackSort::Favorite,
-            Self::RowIndex
-            | Self::Image
-            | Self::Title
-            | Self::TitleMerged
-            | Self::DiscNumber
-            | Self::SongCount
-            | Self::AlbumCount
-            | Self::Tools => library::TrackSort::Title,
-            Self::Bitrate
-            | Self::SampleRate
-            | Self::BitDepth
-            | Self::Channels
-            | Self::Format
-            | Self::FilePath
-            | Self::Source => library::TrackSort::Title,
-        }
-    }
-
-    pub fn album_sort(self) -> library::AlbumSort {
-        match self {
-            Self::AlbumArtist | Self::Artist => library::AlbumSort::AlbumArtist,
-            Self::Year => library::AlbumSort::Year,
-            Self::ReleaseDate => library::AlbumSort::ReleaseDate,
-            Self::DateAdded => library::AlbumSort::DateAdded,
-            Self::LastPlayed => library::AlbumSort::LastPlayed,
-            Self::PlayCount => library::AlbumSort::PlayCount,
-            Self::UserRating => library::AlbumSort::Rating,
-            Self::SongCount => library::AlbumSort::TrackCount,
-            Self::Duration => library::AlbumSort::Duration,
-            Self::Favorite => library::AlbumSort::Favorite,
-            _ => library::AlbumSort::Title,
-        }
-    }
-
-    pub fn artist_sort(self) -> library::ArtistSort {
-        match self {
-            Self::AlbumCount => library::ArtistSort::AlbumCount,
-            Self::SongCount => library::ArtistSort::TrackCount,
-            Self::LastPlayed => library::ArtistSort::LastPlayed,
-            Self::PlayCount => library::ArtistSort::PlayCount,
-            Self::UserRating => library::ArtistSort::Rating,
-            Self::Favorite => library::ArtistSort::Favorite,
-            _ => library::ArtistSort::Title,
-        }
-    }
-
-    pub fn playlist_sort(self) -> library::PlaylistSort {
-        match self {
-            Self::RowIndex => library::PlaylistSort::Position,
-            Self::SongCount => library::PlaylistSort::TrackCount,
-            Self::Duration => library::PlaylistSort::Duration,
-            _ => library::PlaylistSort::Title,
-        }
-    }
-
-    pub fn playlist_entry_sort(self) -> library::PlaylistEntrySort {
-        match self {
-            Self::Artist => library::PlaylistEntrySort::Artist,
-            Self::Album => library::PlaylistEntrySort::Album,
-            Self::Title | Self::TitleMerged => library::PlaylistEntrySort::Title,
-            _ => library::PlaylistEntrySort::Position,
-        }
-    }
-
-    pub fn smart_playlist_sort(self) -> library::SmartPlaylistListSort {
-        match self {
-            Self::RowIndex => library::SmartPlaylistListSort::Position,
-            Self::SongCount => library::SmartPlaylistListSort::TrackCount,
-            Self::Duration => library::SmartPlaylistListSort::Duration,
-            _ => library::SmartPlaylistListSort::Title,
-        }
-    }
-
-    pub fn genre_sort(self) -> library::GenreSort {
-        match self {
-            Self::AlbumCount => library::GenreSort::AlbumCount,
-            Self::SongCount => library::GenreSort::TrackCount,
-            _ => library::GenreSort::Title,
-        }
-    }
-
-    pub fn mood_sort(self) -> library::MoodSort {
-        match self {
-            Self::SongCount => library::MoodSort::TrackCount,
-            Self::Duration => library::MoodSort::Duration,
-            _ => library::MoodSort::Title,
+            Self::RowIndex => CatalogSort::Position,
+            Self::TrackNumber => CatalogSort::TrackNumber,
+            Self::Artist => CatalogSort::Artist,
+            Self::AlbumArtist => CatalogSort::AlbumArtist,
+            Self::Album => CatalogSort::Album,
+            Self::Year => CatalogSort::Year,
+            Self::ReleaseDate => CatalogSort::ReleaseDate,
+            Self::DateAdded => CatalogSort::DateAdded,
+            Self::LastPlayed => CatalogSort::LastPlayed,
+            Self::PlayCount => CatalogSort::PlayCount,
+            Self::UserRating => CatalogSort::UserRating,
+            Self::Genre => CatalogSort::Genre,
+            Self::Bpm => CatalogSort::Bpm,
+            Self::Duration => CatalogSort::Duration,
+            Self::Favorite => CatalogSort::Favorite,
+            Self::SongCount => CatalogSort::TrackCount,
+            Self::AlbumCount => CatalogSort::AlbumCount,
+            _ => CatalogSort::Title,
         }
     }
 }
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum DisplaySize {
     Compact,
     #[default]
@@ -559,6 +484,7 @@ pub enum DisplaySize {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct DisplaySettings {
     pub size: DisplaySize,
     pub grid_spacing: DisplaySize,
@@ -584,6 +510,7 @@ impl Default for DisplaySettings {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct LibraryListSettings {
     #[serde(default)]
     pub display: DisplaySettings,
@@ -1136,6 +1063,24 @@ pub fn available_grid_fields(key: LibraryListKey) -> &'static [LibraryField] {
 }
 
 pub fn available_sort_fields(key: LibraryListKey) -> &'static [LibraryField] {
+    const TRACK_SORT_FIELDS: &[LibraryField] = &[
+        LibraryField::RowIndex,
+        LibraryField::TrackNumber,
+        LibraryField::Title,
+        LibraryField::Artist,
+        LibraryField::AlbumArtist,
+        LibraryField::Album,
+        LibraryField::Year,
+        LibraryField::ReleaseDate,
+        LibraryField::DateAdded,
+        LibraryField::LastPlayed,
+        LibraryField::PlayCount,
+        LibraryField::UserRating,
+        LibraryField::Genre,
+        LibraryField::Bpm,
+        LibraryField::Duration,
+        LibraryField::Favorite,
+    ];
     match key {
         LibraryListKey::Queue | LibraryListKey::FullscreenTracks => &[LibraryField::RowIndex],
         LibraryListKey::Albums | LibraryListKey::ArtistAlbums => &[
@@ -1182,12 +1127,7 @@ pub fn available_sort_fields(key: LibraryListKey) -> &'static [LibraryField] {
             LibraryField::SongCount,
             LibraryField::Duration,
         ],
-        LibraryListKey::PlaylistTracks => &[
-            LibraryField::RowIndex,
-            LibraryField::Title,
-            LibraryField::Artist,
-            LibraryField::Album,
-        ],
+        LibraryListKey::PlaylistTracks => TRACK_SORT_FIELDS,
         LibraryListKey::History => &[LibraryField::LastPlayed],
         LibraryListKey::Tracks
         | LibraryListKey::Folders
@@ -1196,23 +1136,7 @@ pub fn available_sort_fields(key: LibraryListKey) -> &'static [LibraryField] {
         | LibraryListKey::ArtistTracks
         | LibraryListKey::GenreTracks
         | LibraryListKey::MoodTracks
-        | LibraryListKey::SmartPlaylistTracks => &[
-            LibraryField::TrackNumber,
-            LibraryField::Title,
-            LibraryField::Artist,
-            LibraryField::AlbumArtist,
-            LibraryField::Album,
-            LibraryField::Year,
-            LibraryField::ReleaseDate,
-            LibraryField::DateAdded,
-            LibraryField::LastPlayed,
-            LibraryField::PlayCount,
-            LibraryField::UserRating,
-            LibraryField::Genre,
-            LibraryField::Bpm,
-            LibraryField::Duration,
-            LibraryField::Favorite,
-        ],
+        | LibraryListKey::SmartPlaylistTracks => &TRACK_SORT_FIELDS[1..],
     }
 }
 fn default_row_fields(key: LibraryListKey) -> Vec<LibraryField> {

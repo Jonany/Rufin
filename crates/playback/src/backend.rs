@@ -31,10 +31,6 @@ impl StreamRequest {
             session_identifier: None,
         }
     }
-
-    pub fn for_item(item: &crate::QueueItem, quality: StreamQuality) -> Self {
-        Self::new(item.media_uri.clone(), quality)
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,6 +41,7 @@ pub struct StreamWindow {
 
 #[derive(Clone)]
 pub struct ResolvedStream {
+    pub local_input: bool,
     transcoded: bool,
     pub content_type: Option<String>,
     uri: String,
@@ -57,6 +54,7 @@ pub struct ResolvedStream {
 impl PartialEq for ResolvedStream {
     fn eq(&self, other: &Self) -> bool {
         self.uri == other.uri
+            && self.local_input == other.local_input
             && self.transcoded == other.transcoded
             && self.redacted_uri == other.redacted_uri
             && self.trust_invalid_certificate == other.trust_invalid_certificate
@@ -71,6 +69,7 @@ impl ResolvedStream {
     pub fn new(uri: impl Into<String>) -> Self {
         let uri = uri.into();
         Self {
+            local_input: uri.starts_with("file:") || uri.starts_with("content:"),
             redacted_uri: redact_sensitive_uri(&uri),
             transcoded: false,
             uri,
@@ -82,9 +81,11 @@ impl ResolvedStream {
     }
 
     pub fn with_redacted(uri: impl Into<String>, redacted_uri: impl Into<String>) -> Self {
+        let uri = uri.into();
         Self {
+            local_input: uri.starts_with("file:") || uri.starts_with("content:"),
             transcoded: false,
-            uri: uri.into(),
+            uri,
             redacted_uri: redacted_uri.into(),
             trust_invalid_certificate: false,
             window: None,
@@ -160,25 +161,26 @@ impl fmt::Debug for ResolvedStream {
 }
 
 fn redact_sensitive_uri(uri: &str) -> String {
-    let Some((base, query)) = uri.split_once('?') else {
-        return uri.to_string();
+    let Ok(mut parsed) = url::Url::parse(uri) else {
+        return "<redacted>".into();
     };
-    let query = query
-        .split('&')
-        .map(|pair| {
-            let Some((key, value)) = pair.split_once('=') else {
-                return pair.to_string();
-            };
-            let lower = key.to_ascii_lowercase();
-            if lower.contains("token") || lower.contains("key") {
-                format!("{key}=<redacted>")
-            } else {
-                format!("{key}={value}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("&");
-    format!("{base}?{query}")
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_fragment(None);
+    let query = parsed.query().map(|query| {
+        query
+            .split('&')
+            .map(|pair| format!("{}=<redacted>", pair.split('=').next().unwrap_or_default()))
+            .collect::<Vec<_>>()
+            .join("&")
+    });
+    parsed.set_query(None);
+    let mut redacted = parsed.to_string();
+    if let Some(query) = query {
+        redacted.push('?');
+        redacted.push_str(&query);
+    }
+    redacted
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -189,6 +191,12 @@ pub struct TrackLoudness {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RunId(u64);
+
+#[cfg(feature = "bindings")]
+uniffi::custom_type!(RunId, u64, {
+    lower: |value| value.get(),
+    try_lift: |value| Ok(RunId::new(value)),
+});
 
 impl RunId {
     pub const fn new(value: u64) -> Self {
@@ -218,18 +226,18 @@ pub enum NextTransition {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedStream {
     pub stream: Box<ResolvedStream>,
-    pub loudness: TrackLoudness,
-    pub occurrence: Option<std::sync::Arc<crate::QueueOccurrence>>,
+    pub loudness: Option<TrackLoudness>,
+    pub row: Option<std::sync::Arc<crate::QueueRow>>,
     pub artwork_path: Option<Arc<PathBuf>>,
     pub allows_preloading: bool,
 }
 
 impl PreparedStream {
-    pub fn new(stream: ResolvedStream, loudness: TrackLoudness) -> Self {
+    pub fn new(stream: ResolvedStream, loudness: Option<TrackLoudness>) -> Self {
         Self {
             stream: Box::new(stream),
             loudness,
-            occurrence: None,
+            row: None,
             artwork_path: None,
             allows_preloading: true,
         }
@@ -240,12 +248,12 @@ impl PreparedStream {
         self
     }
 
-    pub fn with_occurrence(
+    pub fn with_row(
         mut self,
-        occurrence: std::sync::Arc<crate::QueueOccurrence>,
+        row: std::sync::Arc<crate::QueueRow>,
         content_type: Option<String>,
     ) -> Self {
-        self.occurrence = Some(occurrence);
+        self.row = Some(row);
         if self.stream.content_type.is_none() {
             self.stream.content_type = content_type;
         }
@@ -255,7 +263,7 @@ impl PreparedStream {
 
 impl From<ResolvedStream> for PreparedStream {
     fn from(stream: ResolvedStream) -> Self {
-        Self::new(stream, TrackLoudness::default())
+        Self::new(stream, Some(TrackLoudness::default()))
     }
 }
 
@@ -368,6 +376,10 @@ pub enum BackendCommand {
         muted: bool,
     },
     ConfigureAudio(BackendAudioSettings),
+    UpdateLoudness {
+        run: RunId,
+        loudness: TrackLoudness,
+    },
     SetPlaybackRate(f64),
     SetVisualizerEnabled(bool),
 }
@@ -379,7 +391,8 @@ impl BackendCommand {
             | Self::Play { run }
             | Self::Pause { run }
             | Self::Stop { run }
-            | Self::Seek { run, .. } => Some(*run),
+            | Self::Seek { run, .. }
+            | Self::UpdateLoudness { run, .. } => Some(*run),
             Self::PrepareNext { current_run, .. } => Some(*current_run),
             Self::SetOutputVolume { .. }
             | Self::ConfigureAudio(_)

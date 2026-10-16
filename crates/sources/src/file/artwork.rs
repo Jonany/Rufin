@@ -1,6 +1,7 @@
 //! Shared artwork format, selection, and decoding semantics.
 
 use super::{discovery, local, lofty, remote::FileSource};
+use crate::file::check_cancelled;
 use crate::{ImageBytes, LocalImageRef, SourceError, SourceResult};
 use ::lofty::file::{TaggedFile, TaggedFileExt};
 use ::lofty::picture::{Picture, PictureType};
@@ -248,7 +249,7 @@ pub(crate) enum ArtworkFiles<'a> {
 
 impl<'a> ArtworkFiles<'a> {
     fn for_path(&self, path: &str) -> ArtworkFiles<'a> {
-        if path.starts_with("rufin-document://") {
+        if path.starts_with("rufin-document://") || path.starts_with("content://") {
             return Self::Documents;
         }
         match *self {
@@ -259,182 +260,213 @@ impl<'a> ArtworkFiles<'a> {
         }
     }
 
-    pub(crate) async fn stage(
+    pub(crate) async fn acquire(
         &self,
-        database: &library::Database,
-        scan: &mut library::Scan,
+        catalog: &mut library::Catalog<'_>,
         cancelled: &(dyn Fn() -> bool + Send + Sync),
     ) -> SourceResult<()> {
-        scan.clear_local_artwork_candidates().await?;
-        let distinct = database.distinct_track_covers();
+        let database = catalog.database;
+        let source_id = catalog.source_id;
+        let stamp = catalog.observed;
         let mut after_album = String::new();
-        let mut discoverer = discovery::Reader::default();
         loop {
-            let albums = scan.local_artwork_album_page(&after_album).await?;
+            let albums = database
+                .source_artwork_album_page(source_id, &after_album, stamp)
+                .await?;
             if albums.is_empty() {
                 break;
             }
             for album in albums {
-                if cancelled() {
-                    return Err(SourceError::Cancelled);
-                }
+                check_cancelled(cancelled)?;
                 after_album.clone_from(&album);
-                let mut group = None;
                 let mut after = None;
+                let mut folder_cover = None;
                 let mut directories: [Option<(String, Option<LocalImageRef>)>; 2] = [None, None];
-                'tracks: loop {
-                    let tracks = scan
-                        .local_artwork_track_page(&album, after.as_ref())
+                loop {
+                    let tracks = database
+                        .source_artwork_track_page(source_id, &album, after.as_ref())
                         .await?;
                     if tracks.is_empty() {
                         break;
                     }
                     for track in tracks {
-                        if cancelled() {
-                            return Err(SourceError::Cancelled);
-                        }
-                        if group.is_none() {
-                            for (slot, prefix) in
-                                self.directories(&track)?.into_iter().take(2).enumerate()
+                        check_cancelled(cancelled)?;
+                        for (slot, prefix) in
+                            self.directories(&track)?.into_iter().take(2).enumerate()
+                        {
+                            let cached = &mut directories[slot];
+                            if cached
+                                .as_ref()
+                                .is_none_or(|(previous, _)| previous != &prefix)
                             {
-                                let cached = &mut directories[slot];
-                                if cached
-                                    .as_ref()
-                                    .is_none_or(|(previous, _)| previous != &prefix)
+                                let image = if slot == 0
+                                    || database
+                                        .source_artwork_directory_is_single_album(
+                                            source_id, &prefix,
+                                        )
+                                        .await?
                                 {
-                                    // A sibling cover also serves CUE and standalone copies in this folder.
-                                    let image = if slot == 0
-                                        || scan
-                                            .local_artwork_directory_is_single_album(&prefix)
-                                            .await?
-                                    {
-                                        self.folder_image(scan, &prefix, None).await?
-                                    } else {
-                                        None
-                                    };
-                                    *cached = Some((prefix, image));
-                                }
-                                group = cached.as_ref().and_then(|(_, image)| image.clone());
-                                if group.is_some() {
-                                    break;
-                                }
+                                    self.folder_image(database, source_id, &prefix, None)
+                                        .await?
+                                } else {
+                                    None
+                                };
+                                *cached = Some((prefix, image));
+                            }
+                            folder_cover = cached.as_ref().and_then(|(_, image)| image.clone());
+                            if folder_cover.is_some() {
+                                break;
                             }
                         }
-                        let embedded = if distinct || group.is_none() {
-                            self.embedded_album_image(scan.source_id(), &mut discoverer, &track)
-                        } else {
-                            None
-                        };
-                        if group.is_none() {
-                            group.clone_from(&embedded);
-                        }
-                        let group_bytes = group.as_ref().map(serde_json::to_vec).transpose()?;
-                        let track_bytes = distinct
-                            .then_some(embedded.as_ref())
-                            .flatten()
-                            .map(serde_json::to_vec)
-                            .transpose()?;
-                        if group_bytes.is_some() || track_bytes.is_some() {
-                            scan.write_local_artwork_candidate(
-                                &album,
-                                &track.object_id,
-                                group_bytes.as_deref(),
-                                track_bytes.as_deref(),
-                            )
-                            .await?;
-                        }
                         after = Some(track);
-                        if !distinct && group.is_some() {
-                            break 'tracks;
+                        if folder_cover.is_some() {
+                            break;
                         }
                     }
+                    if folder_cover.is_some() {
+                        break;
+                    }
                 }
-            }
-        }
-        self.stage_artist_artwork(scan, cancelled).await
-    }
-
-    fn embedded_album_image(
-        &self,
-        source_id: &str,
-        discoverer: &mut discovery::Reader,
-        track: &library::LocalArtworkCandidate,
-    ) -> Option<LocalImageRef> {
-        match self.for_path(&track.path) {
-            Self::Local => {
-                let path = Path::new(&track.path);
-                local::artwork::inspect_embedded(
-                    source_id,
-                    discoverer,
-                    path,
-                    local::artwork::revision(path)?,
-                )
-            }
-            Self::Remote(_) | Self::Documents => Some(LocalImageRef::Embedded {
-                source_id: crate::SourceId::new(source_id),
-                path: track.path.clone(),
-                revision: track.revision.clone().unwrap_or_default(),
-                picture_index: u32::try_from(track.picture_index?).ok()?,
-            }),
-        }
-    }
-
-    async fn stage_artist_artwork(
-        &self,
-        scan: &mut library::Scan,
-        cancelled: &(dyn Fn() -> bool + Send + Sync),
-    ) -> SourceResult<()> {
-        let mut after_artist = String::new();
-        loop {
-            let artists = scan.local_artwork_artist_page(&after_artist).await?;
-            if artists.is_empty() {
-                break;
-            }
-            for (artist, name) in artists {
-                after_artist.clone_from(&artist);
-                let mut image = None;
-                // Folder portraits take priority over embedded pictures across all tracks.
-                for embedded in [false, true] {
-                    let mut after = String::new();
-                    let mut directories: Vec<Option<(String, Option<LocalImageRef>)>> = Vec::new();
+                if folder_cover.is_none() || database.distinct_track_covers() {
+                    let mut after = None;
+                    let mut found = false;
                     loop {
-                        let tracks = scan
-                            .local_artwork_artist_track_page(&artist, &after)
+                        let tracks = database
+                            .source_artwork_track_page(source_id, &album, after.as_ref())
                             .await?;
                         if tracks.is_empty() {
                             break;
                         }
+                        let mut bindings = Vec::new();
+                        let mut inspected = Vec::new();
                         for track in tracks {
-                            if cancelled() {
-                                return Err(SourceError::Cancelled);
+                            check_cancelled(cancelled)?;
+                            let (index, _, observed) = self.embedded_file_images(&track)?;
+                            if let Some((cover, pictures)) = observed {
+                                inspected.push((track.path.clone(), cover, pictures));
                             }
-                            after.clone_from(&track.object_id);
-                            if embedded {
-                                image = self.embedded_artist_image(scan, &track, &name).await?;
-                            } else {
-                                for (slot, prefix) in
-                                    self.directories(&track)?.into_iter().enumerate()
-                                {
-                                    if slot == directories.len() {
-                                        directories.push(None);
+                            let image = index.map(|picture_index| LocalImageRef::Embedded {
+                                source_id: crate::SourceId::new(source_id),
+                                path: track.path.clone(),
+                                picture_index,
+                                revision: track.revision.clone().unwrap_or_default(),
+                            });
+                            found |= image.is_some();
+                            bindings.push((
+                                track.object_id.clone(),
+                                image.map(|image| image.artwork_binding()),
+                            ));
+                            after = Some(track);
+                            if found && !database.distinct_track_covers() {
+                                break;
+                            }
+                        }
+                        catalog.record_source_file_images(&inspected).await?;
+                        check_cancelled(cancelled)?;
+                        catalog.set_source_artwork("track", &bindings).await?;
+                        if found && !database.distinct_track_covers() {
+                            break;
+                        }
+                    }
+                }
+                check_cancelled(cancelled)?;
+                check_cancelled(cancelled)?;
+                catalog
+                    .set_source_artwork(
+                        "album",
+                        &[(album, folder_cover.map(|image| image.artwork_binding()))],
+                    )
+                    .await?;
+            }
+        }
+        self.acquire_artist_artwork(catalog, cancelled).await?;
+        if matches!(self, Self::Local) {
+            catalog.clear_partial_file_image_observations().await?;
+        }
+        Ok(())
+    }
+
+    async fn acquire_artist_artwork(
+        &self,
+        catalog: &mut library::Catalog<'_>,
+        cancelled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> SourceResult<()> {
+        let database = catalog.database;
+        let source_id = catalog.source_id;
+        let stamp = catalog.observed;
+        let mut after_artist = String::new();
+        loop {
+            let artists = database
+                .source_artwork_artist_page(source_id, &after_artist, stamp)
+                .await?;
+            if artists.is_empty() {
+                break;
+            }
+            let mut bindings = Vec::new();
+            let result: SourceResult<()> = async {
+                for (artist, name) in artists {
+                    after_artist.clone_from(&artist);
+                    let mut image = None;
+                    // Folder portraits take priority over embedded pictures across all tracks.
+                    for embedded in [false, true] {
+                        let mut after = String::new();
+                        let mut directories: Vec<Option<(String, Option<LocalImageRef>)>> =
+                            Vec::new();
+                        loop {
+                            let tracks = database
+                                .source_artwork_artist_track_page(source_id, &artist, &after)
+                                .await?;
+                            if tracks.is_empty() {
+                                break;
+                            }
+                            let mut pictures = Vec::new();
+                            let result: SourceResult<()> = async {
+                                for track in tracks {
+                                    check_cancelled(cancelled)?;
+                                    after.clone_from(&track.object_id);
+                                    if embedded {
+                                        let (found, observed) =
+                                            self.embedded_artist_image(source_id, &track, &name)?;
+                                        image = found;
+                                        if let Some((cover, observed)) = observed {
+                                            pictures.push((track.path.clone(), cover, observed));
+                                        }
+                                    } else {
+                                        for (slot, prefix) in
+                                            self.directories(&track)?.into_iter().enumerate()
+                                        {
+                                            if slot == directories.len() {
+                                                directories.push(None);
+                                            }
+                                            if directories[slot]
+                                                .as_ref()
+                                                .is_none_or(|(previous, _)| previous != &prefix)
+                                            {
+                                                let found = self
+                                                    .directory_artist_image(
+                                                        database, source_id, &prefix, &artist,
+                                                        &name,
+                                                    )
+                                                    .await?;
+                                                directories[slot] = Some((prefix, found));
+                                            }
+                                            image = directories[slot]
+                                                .as_ref()
+                                                .and_then(|(_, image)| image.clone());
+                                            if image.is_some() {
+                                                break;
+                                            }
+                                        }
                                     }
-                                    if directories[slot]
-                                        .as_ref()
-                                        .is_none_or(|(previous, _)| previous != &prefix)
-                                    {
-                                        let found = self
-                                            .directory_artist_image(scan, &prefix, &artist, &name)
-                                            .await?;
-                                        directories[slot] = Some((prefix, found));
-                                    }
-                                    image = directories[slot]
-                                        .as_ref()
-                                        .and_then(|(_, image)| image.clone());
                                     if image.is_some() {
                                         break;
                                     }
                                 }
+                                Ok(())
                             }
+                            .await;
+                            catalog.record_source_file_images(&pictures).await?;
+                            result?;
                             if image.is_some() {
                                 break;
                             }
@@ -443,15 +475,15 @@ impl<'a> ArtworkFiles<'a> {
                             break;
                         }
                     }
-                    if image.is_some() {
-                        break;
-                    }
+                    bindings.push((artist, image.map(|image| image.artwork_binding())));
                 }
-                if let Some(image) = image {
-                    scan.write_local_artist_artwork(&artist, &serde_json::to_vec(&image)?)
-                        .await?;
-                }
+                Ok(())
             }
+            .await;
+            check_cancelled(cancelled)?;
+            check_cancelled(cancelled)?;
+            catalog.set_source_artwork("artist", &bindings).await?;
+            result?;
         }
         Ok(())
     }
@@ -478,6 +510,9 @@ impl<'a> ArtworkFiles<'a> {
                 })
                 .collect()),
             Self::Documents => {
+                if track.path.starts_with("content://") {
+                    return Ok(Vec::new());
+                }
                 let mut uri = url::Url::parse(&track.path).map_err(|_| SourceError::NotFound)?;
                 uri.set_fragment(None);
                 let mut directories = Vec::new();
@@ -514,7 +549,8 @@ impl<'a> ArtworkFiles<'a> {
 
     async fn folder_image(
         &self,
-        scan: &library::Scan,
+        database: &library::Database,
+        source_id: &str,
         prefix: &str,
         artist: Option<&str>,
     ) -> SourceResult<Option<LocalImageRef>> {
@@ -526,15 +562,14 @@ impl<'a> ArtworkFiles<'a> {
                     None => local::artwork::directory_image(directory),
                 };
                 Ok(path.and_then(|path| {
-                    local::artwork::revision(&path).map(|revision| {
-                        local::artwork::file_reference(scan.source_id(), &path, revision)
-                    })
+                    local::artwork::revision(&path)
+                        .map(|revision| local::artwork::file_reference(source_id, &path, revision))
                 }))
             }
             Self::Documents => {
                 crate::file::remote::artwork::directory_image_by_role(
-                    &crate::SourceId::new(scan.source_id()),
-                    scan,
+                    database,
+                    source_id,
                     prefix,
                     artist.map(|name| (name, true)),
                 )
@@ -543,22 +578,25 @@ impl<'a> ArtworkFiles<'a> {
             Self::Remote(source) => match artist {
                 Some(name) => {
                     source
-                        .directory_artist_image_for(scan, prefix, name, true)
+                        .directory_artist_image_for(database, source_id, prefix, name, true)
                         .await
                 }
-                None => source.directory_image(scan, prefix).await,
+                None => source.directory_image(database, source_id, prefix).await,
             },
         }
     }
 
     async fn directory_artist_image(
         &self,
-        scan: &library::Scan,
+        database: &library::Database,
+        source_id: &str,
         prefix: &str,
         artist: &str,
         name: &str,
     ) -> SourceResult<Option<LocalImageRef>> {
-        let found = self.folder_image(scan, prefix, Some(name)).await?;
+        let found = self
+            .folder_image(database, source_id, prefix, Some(name))
+            .await?;
         if let Some(LocalImageRef::File { path, .. }) = &found {
             let filename = match self.for_path(path) {
                 Self::Local => Path::new(path)
@@ -586,8 +624,8 @@ impl<'a> ArtworkFiles<'a> {
                 }
             };
             if artist_image_rank_for(&filename, name, false) == usize::MAX
-                && !scan
-                    .local_artwork_directory_has_artist(prefix, artist)
+                && !database
+                    .source_artwork_directory_has_artist(source_id, prefix, artist)
                     .await?
             {
                 return Ok(None);
@@ -596,38 +634,66 @@ impl<'a> ArtworkFiles<'a> {
         Ok(found)
     }
 
-    async fn embedded_artist_image(
+    fn embedded_file_images(
         &self,
-        scan: &mut library::Scan,
         track: &library::LocalArtworkCandidate,
-        artist: &str,
-    ) -> SourceResult<Option<LocalImageRef>> {
+    ) -> SourceResult<(
+        Option<u32>,
+        Vec<ArtistPicture>,
+        Option<(Option<i64>, String)>,
+    )> {
         let owner = self.for_path(&track.path);
         let revision = match owner {
             Self::Local => local::artwork::revision(Path::new(&track.path)),
-            Self::Remote(_) | Self::Documents => Some(track.revision.clone().unwrap_or_default()),
+            Self::Remote(_) | Self::Documents => track.revision.clone(),
         };
-        let pictures = match track.artist_pictures.as_deref().filter(|_| {
-            matches!(owner, Self::Remote(_) | Self::Documents) || revision == track.revision
+        if let Some(cached) = track.artist_pictures.as_deref().filter(|_| {
+            !matches!(owner, Self::Local)
+                || revision == track.revision && track.picture_index.is_some()
         }) {
-            Some(cached) => serde_json::from_str(cached)?,
-            None if matches!(owner, Self::Local) => {
-                let pictures = local::artwork::inspect_artist_pictures(Path::new(&track.path));
-                scan.record_artist_pictures(&track.path, &serde_json::to_string(&pictures)?)
-                    .await?;
-                pictures
-            }
-            None => Vec::new(),
-        };
-        Ok(
+            return Ok((
+                track.picture_index.and_then(|i| u32::try_from(i).ok()),
+                serde_json::from_str(cached)?,
+                None,
+            ));
+        }
+        if !matches!(owner, Self::Local) {
+            return Ok((
+                track.picture_index.and_then(|i| u32::try_from(i).ok()),
+                Vec::new(),
+                None,
+            ));
+        }
+        let mut file = std::fs::File::open(&track.path)
+            .map_err(|error| SourceError::Other(error.to_string()))?;
+        let uri = url::Url::from_file_path(&track.path).map_err(|_| SourceError::NotFound)?;
+        let (cover, pictures) =
+            inspect_embedded_input(&mut discovery::Reader::default(), &mut file, uri.as_str());
+        // NULL predates cover inspection; -1 remembers an inspected file without a cover.
+        let observed = Some((
+            Some(cover.map_or(-1, i64::from)),
+            serde_json::to_string(&pictures)?,
+        ));
+        Ok((cover, pictures, observed))
+    }
+
+    fn embedded_artist_image(
+        &self,
+        source_id: &str,
+        track: &library::LocalArtworkCandidate,
+        artist: &str,
+    ) -> SourceResult<(Option<LocalImageRef>, Option<(Option<i64>, String)>)> {
+        let (_, pictures, observed) = self.embedded_file_images(track)?;
+        Ok((
             artist_picture_index(&pictures, artist, track.primary_artist)
-                .zip(revision)
+                .zip(track.revision.clone())
                 .map(|(picture_index, revision)| LocalImageRef::Embedded {
-                    source_id: crate::SourceId::new(scan.source_id()),
+                    source_id: crate::SourceId::new(source_id),
                     path: track.path.clone(),
                     revision,
                     picture_index,
                 }),
-        )
+            observed,
+        ))
     }
 }

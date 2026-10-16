@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ::library::{GenreChoice, PlayedFilter, RandomCriteria, ReadCancellation};
 use adw::prelude::*;
 use gtk::glib;
-use playback::{QueuePlacement, RandomPlayRequest};
+use rufin_core::playback::{QueuePlacement, RandomPlayRequest};
 use tracing::warn;
 
 use localization::tr;
@@ -35,11 +35,11 @@ pub(super) fn present_random_play_dialog(shell: &Rc<Shell>) {
     let Some(selected) = shell.selected_library().as_deref().cloned() else {
         return;
     };
-    let database = Arc::clone(&selected.database);
+    let database = Arc::clone(&shell.products.library);
     let source = selected.source_key;
     let folder = selected.music_folder_key;
     let cancellation = ReadCancellation::new();
-    let runtime = selected.runtime.clone();
+    let runtime = shell.products.runtime.clone();
     let task =
         runtime.spawn(async move { database.genre_choices(source, folder, &cancellation).await });
     let shell = Rc::downgrade(shell);
@@ -304,7 +304,7 @@ pub(crate) fn play_saved_random(shell: &Rc<Shell>, placement: QueuePlacement) {
         return;
     };
     let settings = shell.settings.current.borrow().random_play.clone();
-    let database = Arc::clone(&selected.database);
+    let database = Arc::clone(&shell.products.library);
     let source = selected.source_key;
     let genre_object_id = settings
         .selected_genre_id(
@@ -312,14 +312,20 @@ pub(crate) fn play_saved_random(shell: &Rc<Shell>, placement: QueuePlacement) {
             selected.music_folder_object_id.as_deref(),
         )
         .map(str::to_owned);
-    let runtime = selected.runtime.clone();
-    let queue = shell.products.playback.queue.clone();
+    let runtime = shell.products.runtime.clone();
+    let queue = shell.products.playback.clone();
     let task = runtime.spawn(async move {
         let cancellation = ReadCancellation::new();
         let genre = match genre_object_id {
             Some(object_id) => database
-                .genre_key_by_object(source, &object_id, &cancellation)
+                .catalog_keys(
+                    library::CatalogKind::Genre,
+                    Some(source),
+                    &[(&object_id).to_string()],
+                    &cancellation,
+                )
                 .await
+                .map(|keys| keys.into_iter().next().map(library::GenreKey::from_raw))
                 .ok()
                 .flatten(),
             None => None,
@@ -336,7 +342,7 @@ pub(crate) fn play_saved_random(shell: &Rc<Shell>, placement: QueuePlacement) {
                 variation: random_variation(),
             },
         };
-        execute_random_task(selected, request, queue).await
+        execute_random_task(database, selected, request, queue).await
     });
     report_random_result(shell, task);
 }
@@ -355,9 +361,10 @@ fn execute_random(
     selected: rufin_core::runtime::SelectedLibrary,
     request: RandomPlayRequest,
 ) {
-    let runtime = selected.runtime.clone();
-    let queue = shell.products.playback.queue.clone();
-    let task = runtime.spawn(execute_random_task(selected, request, queue));
+    let runtime = shell.products.runtime.clone();
+    let queue = shell.products.playback.clone();
+    let database = shell.products.library.clone();
+    let task = runtime.spawn(execute_random_task(database, selected, request, queue));
     report_random_result(shell, task);
 }
 
@@ -375,12 +382,13 @@ fn report_random_result(shell: &Shell, task: tokio::task::JoinHandle<bool>) {
 }
 
 async fn execute_random_task(
+    database: Arc<library::Database>,
     selected: rufin_core::runtime::SelectedLibrary,
     request: RandomPlayRequest,
-    queue: playback::QueueHandle,
+    queue: std::sync::Arc<rufin_core::playback::PlaybackOwner>,
 ) -> bool {
     match rufin_core::radio::queue_random(
-        &selected.database,
+        &database,
         selected.source_key,
         selected.music_folder_key,
         request,
@@ -405,7 +413,7 @@ fn random_variation() -> i64 {
 #[cfg(test)]
 mod tests {
     use library::PlayedFilter;
-    use playback::QueuePlacement;
+    use rufin_core::playback::QueuePlacement;
     use sources::SourceId;
 
     use super::{RandomPlaySettings, request_from_settings};

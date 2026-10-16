@@ -22,51 +22,54 @@ async fn metadata(
     let uri = required(&parameters, "uri")?;
     let cancel = library::ReadCancellation::new();
     if library::source_entity_parts(uri).is_some_and(|(_, kind, _)| kind == "album") {
-        let row = products
-            .library
-            .album_row_by_media_uri(uri, &cancel)
+        let row = library::CatalogQuery::uris(library::CatalogKind::Album, vec![(uri).to_string()])
+            .rows(&products.library, 0, 1, &cancel)
             .await
+            .map(|rows| match rows {
+                library::CatalogRows::Albums(mut rows) => rows.pop(),
+                _ => unreachable!("typed catalog projection"),
+            })
             .map_err(internal)?
             .ok_or_else(|| error(StatusCode::NOT_FOUND, "Album unavailable"))?;
-        let artists = row.album_artists.iter().map(|link|json!({"id":link.artist_key,"uri":link.media_uri,"name":link.name,"source":library::source_entity_parts(&link.media_uri).map(|(source,_,_)|source),"album_artists":true})).collect::<Vec<_>>();
+        let artists = row.links.album_artists.iter().map(|link|json!({"id":link.artist_key,"uri":link.media_uri,"name":link.name,"source":library::source_entity_parts(&link.media_uri).map(|(source,_,_)|source),"album_artists":true})).collect::<Vec<_>>();
         return Ok(json_response(
             StatusCode::OK,
-            json!({"favorite":row.favorite,"album":null,"artists":artists}),
+            json!({"favorite":row.state.favorite,"album":null,"artists":artists}),
         ));
     }
-    let row = products
-        .library
-        .smart_playlist_track_rows(&[uri.to_owned()], &cancel)
-        .await
-        .map_err(internal)?
-        .pop();
-    let favorite = products
-        .library
-        .favorite(&library::FavoriteTarget::Track(uri.into()))
-        .await
-        .map_err(internal)?;
+    let row =
+        library::CatalogQuery::uris(library::CatalogKind::Track, (&[uri.to_owned()]).to_vec())
+            .rows(&products.library, 0, (&[uri.to_owned()]).len(), &cancel)
+            .await
+            .map(|rows| match rows {
+                library::CatalogRows::Tracks(rows) => rows,
+                _ => unreachable!("typed catalog projection"),
+            })
+            .map_err(internal)?
+            .pop();
     let mut album = None;
     let mut artists = Vec::new();
-    if let Some(row) = row {
-        if let Some(uri) = row.album_media_uri
-            && let Some(album_row) = products
-                .library
-                .album_row_by_media_uri(&uri, &cancel)
-                .await
-                .map_err(internal)?
-        {
+    let favorite = if let Some(row) = row {
+        if let (Some(uri), Some(id)) = (&row.links.album_media_uri, row.links.album_key) {
             album = Some(
-                json!({"id":album_row.album_key,"uri":uri,"title":row.album,"source":library::source_entity_parts(&uri).map(|(source,_,_)|source)}),
+                json!({"id":id,"uri":uri,"title":row.metadata.album,"source":library::source_entity_parts(uri).map(|(source,_,_)|source)}),
             );
         }
-        let album_artist = row.artists.is_empty();
+        let album_artist = row.links.artists.is_empty();
         let links = if album_artist {
-            row.album_artists
+            row.links.album_artists
         } else {
-            row.artists
+            row.links.artists
         };
         artists = links.iter().map(|link|json!({"id":link.artist_key,"uri":link.media_uri,"name":link.name,"source":library::source_entity_parts(&link.media_uri).map(|(source,_,_)|source),"album_artists":album_artist})).collect();
-    }
+        row.state.favorite
+    } else {
+        products
+            .library
+            .favorite(&library::FavoriteTarget::Track(uri.into()))
+            .await
+            .map_err(internal)?
+    };
     Ok(json_response(
         StatusCode::OK,
         json!({"favorite":favorite,"album":album,"artists":artists}),
@@ -90,12 +93,11 @@ pub(super) async fn favorite(
         "artist" => library::FavoriteTarget::Artist(input.uri),
         _ => return Err(bad_request("Unknown favorite type")),
     };
-    let favorite = completion(
-        products
-            .source
-            .set_favorite_with_result(target, input.favorite),
-    )
-    .await?;
+    let favorite = products
+        .source
+        .set_favorite_with_result(target, input.favorite)
+        .await
+        .map_err(bad_request)?;
     Ok(json_response(StatusCode::OK, json!({"favorite":favorite})))
 }
 
@@ -127,12 +129,12 @@ async fn radio(
         Input::Playlist { id } => library::RadioSeed::Playlist(id),
     };
     let request = match input.mode.as_deref().unwrap_or("replace") {
-        "replace" => playback::RadioPlayRequest::now(seed),
-        "next" => playback::RadioPlayRequest::next(seed),
-        "append" => playback::RadioPlayRequest::last(seed),
+        "replace" => rufin_core::playback::RadioPlayRequest::now(seed),
+        "next" => rufin_core::playback::RadioPlayRequest::next(seed),
+        "append" => rufin_core::playback::RadioPlayRequest::last(seed),
         _ => return Err(bad_request("Queue mode must be replace, append or next")),
     };
-    products.playback.radio.play_radio(request);
+    products.playback.play_radio(request);
     Ok(accepted())
 }
 
@@ -140,20 +142,36 @@ async fn random_settings(
     State(products): State<ProductHandles>,
     Query(parameters): Query<HashMap<String, String>>,
 ) -> Result<Response<Body>, Error> {
-    let (source, folder) = catalog::scope(&products, &parameters).await?;
-    let rows = products
-        .library
-        .genre_page(
-            source,
-            folder,
-            parameters.get("q").map(String::as_str).unwrap_or(""),
-            library::GenreSort::Title,
-            false,
+    let (source, folder) = catalog::scope(
+        &products,
+        required(&parameters, "source")?,
+        parameters.get("folder").map(String::as_str),
+    )
+    .await?;
+    let query = library::CatalogQuery {
+        subject: library::CatalogSubject::Genres {
+            source: source,
+            sort: library::CatalogSort::Title,
+        },
+        folder: folder,
+        filter: (parameters.get("q").map(String::as_str).unwrap_or("")).to_string(),
+        descending: false,
+        favorites_only: false,
+        downloaded_only: false,
+        activity: false,
+    };
+    let rows = query
+        .rows(
+            &products.library,
             number(&parameters, "offset", 0)?,
             64,
             &library::ReadCancellation::new(),
         )
         .await
+        .map(|rows| match rows {
+            library::CatalogRows::Genres(rows) => rows,
+            _ => unreachable!("catalog page projection"),
+        })
         .map_err(internal)?;
     let settings = products.settings.load().random_play.clone();
     let mut selected_genre = None;
@@ -164,23 +182,40 @@ async fn random_settings(
         let cancel = library::ReadCancellation::new();
         if let Some(key) = products
             .library
-            .genre_key_by_object(source, object_id, &cancel)
+            .catalog_keys(
+                library::CatalogKind::Genre,
+                Some(source),
+                &[(object_id).to_string()],
+                &cancel,
+            )
             .await
+            .map(|keys| keys.into_iter().next().map(library::GenreKey::from_raw))
             .map_err(internal)?
         {
-            selected_genre = products
-                .library
-                .genre_rows(source, &[key], folder, &cancel)
-                .await
-                .map_err(internal)?
-                .into_iter()
-                .next()
-                .map(|row| json!({"id":row.genre_key,"name":row.name}));
+            selected_genre = {
+                let mut query = library::CatalogQuery::keys(
+                    library::CatalogKind::Genre,
+                    Some(source),
+                    (&[key]).iter().map(|key| key.raw()).collect(),
+                );
+                query.folder = folder;
+                query
+                    .rows(&products.library, 0, (&[key]).len(), &cancel)
+                    .await
+                    .map(|rows| match rows {
+                        library::CatalogRows::Genres(rows) => rows,
+                        _ => unreachable!("typed catalog projection"),
+                    })
+            }
+            .map_err(internal)?
+            .into_iter()
+            .next()
+            .map(|row| json!({"id":row.genre_key,"name":row.metadata.name}));
         }
     }
     Ok(json_response(
         StatusCode::OK,
-        json!({"total":catalog::page_total(&products, &parameters, "genres").await?,"settings":settings,"selected_genre":selected_genre,"genres":rows.iter().map(|row|json!({"id":row.genre_key,"object_id":row.object_id,"name":row.name})).collect::<Vec<_>>()}),
+        json!({"total":catalog::page_total(&products, &parameters, &query).await?,"settings":settings,"selected_genre":selected_genre,"genres":rows.iter().map(|row|json!({"id":row.genre_key,"object_id":row.object_id,"name":row.metadata.name})).collect::<Vec<_>>()}),
     ))
 }
 
@@ -201,18 +236,15 @@ async fn random(
         mode: String,
     }
     let input: Input = body(request).await?;
-    let mut parameters = HashMap::from([("source".into(), input.source)]);
-    if let Some(folder) = input.folder {
-        parameters.insert("folder".into(), folder);
-    }
-    let (source, folder) = catalog::scope(&products, &parameters).await?;
+    let (source, folder) =
+        catalog::scope(&products, &input.source, input.folder.as_deref()).await?;
     let placement = match input.mode.as_str() {
-        "replace" => playback::QueuePlacement::Now,
-        "next" => playback::QueuePlacement::Next,
-        "append" => playback::QueuePlacement::Last,
+        "replace" => rufin_core::playback::QueuePlacement::Now,
+        "next" => rufin_core::playback::QueuePlacement::Next,
+        "append" => rufin_core::playback::QueuePlacement::Last,
         _ => return Err(bad_request("Queue mode must be replace, append or next")),
     };
-    let request = playback::RandomPlayRequest {
+    let request = rufin_core::playback::RandomPlayRequest {
         placement,
         requested: input.count.min(500),
         criteria: library::RandomCriteria {
@@ -231,7 +263,7 @@ async fn random(
         source,
         folder,
         request,
-        &products.playback.queue,
+        &products.playback,
     )
     .await
     .map_err(bad_request)?;
@@ -244,11 +276,11 @@ pub(super) async fn play_next(
 ) -> Result<Response<Body>, Error> {
     #[derive(Deserialize)]
     struct Input {
-        id: playback::OccurrenceId,
+        position: usize,
     }
     let input: Input = body(request).await?;
-    let queue = products.playback.queue.clone();
-    tokio::task::spawn_blocking(move || queue.move_after_current(input.id))
+    let queue = products.playback.clone();
+    tokio::task::spawn_blocking(move || queue.move_after_current(input.position))
         .await
         .map_err(internal)?;
     Ok(accepted())
@@ -300,16 +332,17 @@ pub(super) fn lyrics_json(current: &CurrentLyrics, settings: &lyrics::Settings) 
             }) => {
                 let readings = document.lines.iter().map(|line| {
                     let supplied = lyrics::pronunciation_line_for(line, pronunciation.as_deref());
-                    let reading = if settings.show_furigana { supplied.and_then(|supplied|lyrics::japanese_reading_from_romanization(&line.text,&supplied.text)) } else { None };
-                    json!({"segments":reading.map(|reading|reading.segments.into_iter().map(|segment|json!({"surface":segment.surface,"furigana":segment.furigana})).collect::<Vec<_>>()),"romanization":if settings.show_romanization { supplied.map(|line|&line.text) } else { None }})
+                    let reading = if settings.preferences.show_furigana { supplied.and_then(|supplied|lyrics::japanese_reading_from_romanization(&line.text,&supplied.text)) } else { None };
+                    json!({"segments":reading.map(|reading|reading.segments.into_iter().map(|segment|json!({"surface":segment.surface,"furigana":segment.furigana})).collect::<Vec<_>>()),"romanization":if settings.preferences.show_romanization { supplied.map(|line|&line.text) } else { None }})
                 }).collect::<Vec<_>>();
-                json!({"state":"ready","document":document,"pronunciation":pronunciation,"readings":readings,"show_romanization":settings.show_romanization,"font_size":settings.lyrics_font_size.unwrap_or(19)})
+                json!({"state":"ready","document":document,"pronunciation":pronunciation,"readings":readings,"show_romanization":settings.preferences.show_romanization,"font_size":settings.preferences.lyrics_font_size.unwrap_or(19)})
             }
             None => json!({"state":"empty"}),
         },
     };
     if let CurrentLyrics::Loading { media_id } | CurrentLyrics::Ready { media_id, .. } = current {
-        value["id"] = json!(media_id.occurrence);
+        value["media_uri"] = json!(media_id.media_uri);
+        value["run"] = json!(media_id.run.map(playback::RunId::get));
     }
     value
 }
@@ -320,17 +353,17 @@ pub(super) async fn reorder(
 ) -> Result<Response<Body>, Error> {
     #[derive(Deserialize)]
     struct Input {
-        ids: Vec<playback::OccurrenceId>,
-        before: Option<playback::OccurrenceId>,
-        after: Option<playback::OccurrenceId>,
+        positions: Vec<usize>,
+        before: Option<usize>,
+        after: Option<usize>,
     }
     let input: Input = body(request).await?;
-    let queue = products.playback.queue.clone();
+    let queue = products.playback.clone();
     tokio::task::spawn_blocking(move || {
-        queue.reorder(playback::QueueReorderRequest {
-            occurrences: input.ids,
-            target: queue_drop_target(input.before, input.after),
-        })
+        queue.reorder(
+            rufin_core::playback::QueueSelection::Positions(input.positions),
+            queue_drop_target(input.before, input.after),
+        )
     })
     .await
     .map_err(internal)?;
@@ -343,47 +376,82 @@ async fn artwork(
 ) -> Result<Response<Body>, Error> {
     let cancel = library::ReadCancellation::new();
     let binding = if parameters.contains_key("genre") {
-        let (source, folder) = catalog::scope(&products, &parameters).await?;
-        products
-            .library
-            .genre_rows(source, &[key(&parameters, "genre")?], folder, &cancel)
-            .await
-            .map_err(internal)?
-            .pop()
-            .and_then(|row| {
-                row.artwork_binding
-                    .as_ref()
-                    .map(std::slice::from_ref)
-                    .unwrap_or(&row.representative_artwork)
-                    .get(
-                        parameters
-                            .get("part")
-                            .and_then(|part| part.parse::<usize>().ok())
-                            .unwrap_or(0),
-                    )
-                    .cloned()
-            })
+        let (source, folder) = catalog::scope(
+            &products,
+            required(&parameters, "source")?,
+            parameters.get("folder").map(String::as_str),
+        )
+        .await?;
+        {
+            let mut query = library::CatalogQuery::keys(
+                library::CatalogKind::Genre,
+                Some(source),
+                (&[key::<library::GenreKey>(&parameters, "genre")?])
+                    .iter()
+                    .map(|key| key.raw())
+                    .collect(),
+            );
+            query.folder = folder;
+            query
+                .rows(
+                    &products.library,
+                    0,
+                    (&[key::<library::GenreKey>(&parameters, "genre")?]).len(),
+                    &cancel,
+                )
+                .await
+                .map(|rows| match rows {
+                    library::CatalogRows::Genres(rows) => rows,
+                    _ => unreachable!("typed catalog projection"),
+                })
+        }
+        .map_err(internal)?
+        .pop()
+        .and_then(|row| {
+            row.artwork_binding
+                .as_ref()
+                .map(std::slice::from_ref)
+                .unwrap_or(&row.representative_artwork)
+                .get(
+                    parameters
+                        .get("part")
+                        .and_then(|part| part.parse::<usize>().ok())
+                        .unwrap_or(0),
+                )
+                .cloned()
+        })
     } else if parameters.contains_key("playlist") {
-        products
-            .library
-            .playlist_rows(&[key(&parameters, "playlist")?], &cancel)
-            .await
-            .map_err(internal)?
-            .into_iter()
-            .next()
-            .and_then(|row| {
-                rufin_core::playlists::playlist_artwork_bindings(&row)
-                    .get(
-                        parameters
-                            .get("part")
-                            .and_then(|part| part.parse::<usize>().ok())
-                            .unwrap_or(0),
-                    )
-                    .cloned()
-            })
+        library::CatalogQuery::keys(
+            library::CatalogKind::Playlist,
+            None,
+            (&[key::<library::PlaylistKey>(&parameters, "playlist")?])
+                .iter()
+                .map(|key| key.raw())
+                .collect(),
+        )
+        .rows(
+            &products.library,
+            0,
+            (&[key::<library::PlaylistKey>(&parameters, "playlist")?]).len(),
+            &cancel,
+        )
+        .await
+        .map(|rows| match rows {
+            library::CatalogRows::Playlists(rows) => rows,
+            _ => unreachable!("typed catalog projection"),
+        })
+        .map_err(internal)?
+        .into_iter()
+        .next()
+        .and_then(|row| row.artwork_binding)
     } else if parameters.contains_key("smart_playlist") {
         let (source, folder) = if parameters.contains_key("source") {
-            let (source, folder) = catalog::scope(&products, &parameters).await?;
+            let (source, folder) = catalog::scope(
+                &products,
+                required(&parameters, "source")?,
+                parameters.get("folder").map(String::as_str),
+            )
+            .await?;
             (Some(source), folder)
         } else {
             (None, None)
@@ -401,60 +469,42 @@ async fn artwork(
             .map_err(internal)?
             .into_iter()
             .next()
-            .and_then(|row| {
-                row.artwork_bindings
-                    .get(
-                        parameters
-                            .get("part")
-                            .and_then(|part| part.parse::<usize>().ok())
-                            .unwrap_or(0),
-                    )
-                    .cloned()
-            })
+            .and_then(|row| row.artwork_binding)
     } else {
         let uri = required(&parameters, "uri")?;
-        if library::source_entity_parts(uri).is_some_and(|(_, kind, _)| kind == "artist") {
-            products
-                .library
-                .artist_row_by_media_uri(uri, &cancel)
-                .await
-                .map_err(internal)?
-                .and_then(|row| row.artwork_binding)
-        } else if library::source_entity_parts(uri).is_some_and(|(_, kind, _)| kind == "album") {
-            products
-                .library
-                .album_row_by_media_uri(uri, &cancel)
-                .await
-                .map_err(internal)?
-                .and_then(|row| row.artwork_binding)
-        } else {
-            products
-                .library
-                .queue_artwork_for_uris(&[uri.to_owned()])
-                .await
-                .map_err(internal)?
-                .into_iter()
-                .next()
-                .and_then(|(_, binding)| binding)
-        }
+        products
+            .library
+            .artwork_bindings(&[uri.to_owned()], &cancel)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .next()
+            .flatten()
     }
     .ok_or_else(|| error(StatusCode::NOT_FOUND, "No cover image"))?;
     let external = {
         let settings = products.settings.load();
         artwork::ExternalPolicy::new(
-            settings.external_metadata_enabled,
+            settings.application.external_metadata_enabled,
             settings.allows_external_metadata_lookup(),
             settings.lastfm_api_key.clone(),
         )
     };
     let binding = artwork::ArtworkBinding::opaque(&binding);
+    let size = parameters
+        .get("size")
+        .map(|value| value.parse::<u32>())
+        .transpose()
+        .map_err(bad_request)?
+        .unwrap_or(256)
+        .max(1);
     let request = if parameters
         .get("original")
         .is_some_and(|value| value == "true")
     {
-        artwork::ArtworkRequest::original(binding, 512)
+        artwork::ArtworkRequest::original(binding, size)
     } else {
-        artwork::ArtworkRequest::new(binding, 256, 256)
+        artwork::ArtworkRequest::new(binding, size, size)
     }
     .with_external(external);
     let load = products.artwork.load(request);

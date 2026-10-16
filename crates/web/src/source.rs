@@ -1,5 +1,6 @@
 use super::*;
-use rufin_core::runtime::source::*;
+use rufin_core::source::authorization::SourceAuthorizationMethod;
+use sources::SourceSetup;
 
 pub(super) fn routes() -> Router<ProductHandles> {
     Router::new()
@@ -14,6 +15,17 @@ pub(super) fn routes() -> Router<ProductHandles> {
         .route("/api/sources/library", post(select_library))
         .route("/api/sources/edit", get(editable))
         .route("/api/sources/refresh", post(select))
+        .route("/api/sources/download-artwork", post(source_download))
+        .route("/api/sources/download-lyrics", post(source_download))
+        .route("/api/sources/cancel-download", post(source_download))
+        .route(
+            "/api/downloads/clear-artwork-cache",
+            post(clear_artwork_cache),
+        )
+        .route(
+            "/api/downloads/clear-lyrics-cache",
+            post(clear_lyrics_cache),
+        )
         .route("/api/sources/login/plex", post(plex_login))
         .route("/api/sources/login/emby", post(emby_login))
         .route("/api/sources/login/jellyfin", post(jellyfin_login))
@@ -72,7 +84,7 @@ async fn edit_file_integration(
         .ok_or_else(|| bad_request("id is required"))?;
     let preset = products
         .source
-        .file_integration_settings(&sources::SourceId::new(id))
+        .editable(sources::SourceId::new(id))
         .map_err(bad_request)?
         .ok_or_else(|| bad_request("Connection not found"))?;
     Ok(json_response(StatusCode::OK, json!(preset)))
@@ -88,7 +100,7 @@ async fn list(State(products): State<ProductHandles>) -> Result<Response<Body>, 
         json!({
             "selected": configured.selected_source_id,
             "library": selected.as_ref().and_then(|source|source.music_folder_object_id.clone()),
-            "new_playlist_current": products.settings.load().new_playlist_current,
+            "new_playlist_current": products.settings.load().application.new_playlist_current,
             "libraries": selected.as_ref().map(|source|source.music_folders.iter().map(|folder|json!({"id":folder.object_id,"name":folder.name})).collect::<Vec<_>>()).unwrap_or_default(),
             "sources": configured.sources.iter().map(|s| json!({"id":s.id,"name":s.name,"kind":s.kind,"supports_playlist_public":s.supports_playlist_public})).collect::<Vec<_>>()
         }),
@@ -110,10 +122,14 @@ pub(super) async fn select_library(
         .selected_library()
         .filter(|selected| selected.source_id == input.source)
     {
-        Some(selected) => selected,
-        None => completion(products.source.select_source(input.source)).await?,
+        Some(selected) => selected.source_id,
+        None => products
+            .source
+            .select_source(input.source)
+            .await
+            .map_err(bad_request)?,
     };
-    completion(selected.operations.set_music_folder(input.library)).await?;
+    completion(products.source.set_music_folder(selected, input.library)).await?;
     Ok(accepted())
 }
 
@@ -139,7 +155,7 @@ async fn editable(
     }
     let preset = products
         .source
-        .configured_source(&id)
+        .editable(id.clone())
         .map_err(bad_request)?
         .ok_or_else(|| bad_request("Source not found"))?;
     Ok(json_response(
@@ -227,15 +243,57 @@ pub(super) async fn select(
     }
     let id = sources::SourceId::new(input.id);
     if path.ends_with("/refresh") {
-        completion(source.refresh_source(id)).await?;
+        source
+            .refresh_source(id, false)
+            .await
+            .map_err(bad_request)?;
         Ok(json_response(StatusCode::OK, json!({"refreshed":true})))
     } else {
-        let selected = completion(source.select_source(id)).await?;
-        Ok(json_response(
-            StatusCode::OK,
-            json!({"id":selected.source_id}),
-        ))
+        let selected = source.select_source(id).await.map_err(bad_request)?;
+        Ok(json_response(StatusCode::OK, json!({"id":selected})))
     }
+}
+
+async fn source_download(
+    State(products): State<ProductHandles>,
+    request: Request<Body>,
+) -> Result<Response<Body>, Error> {
+    let path = request.uri().path().to_owned();
+    let input: Identifier = body(request).await?;
+    if input.id.is_empty() {
+        return Err(bad_request("id is required"));
+    }
+    let id = sources::SourceId::new(input.id);
+    if path.ends_with("/download-artwork") {
+        products.source.download_artwork(id).map_err(bad_request)?;
+    } else if path.ends_with("/download-lyrics") {
+        products.source.download_lyrics(id).map_err(bad_request)?;
+    } else {
+        products.source.cancel_source_download(id);
+    }
+    Ok(accepted())
+}
+
+async fn clear_artwork_cache(
+    State(products): State<ProductHandles>,
+) -> Result<Response<Body>, Error> {
+    products
+        .downloads
+        .clear_artwork_cache()
+        .await
+        .map_err(bad_request)?;
+    Ok(json_response(StatusCode::OK, json!({"cleared": true})))
+}
+
+async fn clear_lyrics_cache(
+    State(products): State<ProductHandles>,
+) -> Result<Response<Body>, Error> {
+    products
+        .downloads
+        .clear_lyrics_cache()
+        .await
+        .map_err(bad_request)?;
+    Ok(json_response(StatusCode::OK, json!({"cleared": true})))
 }
 
 async fn forget(
@@ -245,7 +303,10 @@ async fn forget(
     let products = &products;
     let parameters = &parameters;
     let source = &products.source;
-    completion(source.forget_source(sources::SourceId::new(required(parameters, "id")?))).await?;
+    source
+        .forget_source(sources::SourceId::new(required(parameters, "id")?))
+        .await
+        .map_err(bad_request)?;
     Ok(json_response(StatusCode::OK, json!({"removed":true})))
 }
 
@@ -255,7 +316,11 @@ async fn plex_login(
 ) -> Result<Response<Body>, Error> {
     let products = &products;
     let source = &products.source;
-    Ok(login_response(source.plex_login(body(request).await?)))
+    Ok(login_response(source.login(
+        SourceAuthorizationMethod::Plex {
+            method: body(request).await?,
+        },
+    )))
 }
 
 async fn emby_login(
@@ -264,9 +329,11 @@ async fn emby_login(
 ) -> Result<Response<Body>, Error> {
     let products = &products;
     let source = &products.source;
-    Ok(login_response(
-        source.emby_connect_login(body(request).await?),
-    ))
+    Ok(login_response(source.login(
+        SourceAuthorizationMethod::Emby {
+            method: body(request).await?,
+        },
+    )))
 }
 
 async fn jellyfin_login(
@@ -282,9 +349,11 @@ async fn jellyfin_login(
         trust_invalid_cert: bool,
     }
     let input: Input = body(request).await?;
-    Ok(login_response(source.jellyfin_quick_connect(
-        input.server_url,
-        input.trust_invalid_cert,
+    Ok(login_response(source.login(
+        SourceAuthorizationMethod::Jellyfin {
+            url: input.server_url,
+            trust_invalid_cert: input.trust_invalid_cert,
+        },
     )))
 }
 
@@ -295,9 +364,12 @@ async fn nextcloud_login(
     let products = &products;
     let source = &products.source;
     let input: Files = body(request).await?;
-    Ok(login_response(
-        source.nextcloud_login(input.settings, input.credentials),
-    ))
+    Ok(login_response(source.login(
+        SourceAuthorizationMethod::Nextcloud {
+            settings: input.settings,
+            credentials: input.credentials,
+        },
+    )))
 }
 
 async fn smb_shares(
@@ -307,7 +379,14 @@ async fn smb_shares(
     let products = &products;
     let source = &products.source;
     let input: Files = body(request).await?;
-    let shares = completion(source.smb_shares(input.settings, input.credentials)).await?;
+    let shares = source
+        .smb_shares(input.settings, input.credentials)
+        .await
+        .map_err(bad_request)?;
+    let shares = shares
+        .into_iter()
+        .map(|share| (share.title, share.address.unwrap_or_default()))
+        .collect::<Vec<_>>();
     Ok(json_response(StatusCode::OK, json!({"shares":shares})))
 }
 

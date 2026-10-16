@@ -1,12 +1,29 @@
 //! Rufin's SQLite-owned music library and its concrete persistence operations.
 //! Provider acquisition, playback transport, and presentation remain outside this crate.
 
+#[cfg(feature = "bindings")]
+uniffi::setup_scaffolding!();
+
+pub type LibraryIndex = usize;
+#[cfg(feature = "bindings")]
+uniffi::custom_type!(LibraryIndex, u64, {
+    remote,
+    lower: |value| value as u64,
+    try_lift: |value| Ok(usize::try_from(value)?),
+});
+
 mod activity;
 mod activity_overview;
-pub use activity_overview::{ActivityOverview, ActivityTotals};
+pub use activity_overview::{ActivityOverview, ActivityTotals, GenreActivity};
 mod artwork;
 mod backup;
+mod metadata;
+mod query;
+pub use metadata::*;
 mod collections;
+pub use query::{
+    CatalogIdentity, CatalogKind, CatalogPage, CatalogQuery, CatalogRows, CatalogSubject,
+};
 mod connect;
 mod connect_media;
 mod db;
@@ -22,36 +39,44 @@ mod playlist_links;
 mod playlists;
 mod queue;
 pub use connect_media::ConnectMediaFile;
+mod catalog;
 mod radio;
-mod scan;
 mod scroll_sections;
 pub use scroll_sections::ScrollSection;
 mod schema;
 mod search;
+mod selection;
+pub use selection::{TrackScope, TrackSelection};
 mod smart_playlists;
-mod source_window;
 mod tracks;
 pub use tracks::AudioProperties;
 
 pub use activity::{
-    ActivityAlbumRow, ActivityArtistRow, ActivityCsvFormat, ActivityGenreRow, ActivityImportReport,
-    ActivityRecord, ActivityTrackRow, CalendarActivityPeriod, CalendarActivitySummary, HistoryRow,
+    ActivityCsvFormat, ActivityImportReport, ActivityRecord, CalendarActivityPeriod,
     ListenDeliveryTarget, ListenWrite, PendingListenDelivery,
 };
-pub use artwork::{ArtistArtworkBinding, PlaylistArtworkBinding, RepresentativeArtworkScope};
+pub use artwork::{
+    AlbumCover, ArtworkCacheRetention, ArtworkCandidate, ArtworkImage, PlaylistArtworkManifest,
+    RepresentativeArtworkScope, authored_playlist_artwork, automatic_playlist_artwork,
+    merge_playlist_artwork, normalize_artwork_binding,
+};
 pub use backup::{BackupRestoreReport, StateGroups};
+pub use catalog::{
+    AlbumObservation, ArtistObservation, CachedSource, Catalog, CatalogBatch, CatalogUpdate,
+    FolderObservation, Freshness, GenreObservation, LocalArtworkCandidate, MoodObservation,
+    PlaylistEntryObservation, PlaylistObservation, TrackObservation,
+};
 pub use collections::{
-    AlbumArtistLink, AlbumGenreLink, AlbumMetadataWrite, AlbumReleaseCandidate, AlbumReleaseClass,
-    AlbumReleaseClassification, AlbumReleaseResult, AlbumRow, AlbumSort, ArtistMetadataWrite,
-    ArtistRow, ArtistSort, CollectionIdentity, CollectionSourceReference, FolderRow, GenreChoice,
-    GenreRow, GenreSort, MoodRow, MoodSort,
+    AlbumArtistLink, AlbumDetailRow, AlbumGenreLink, AlbumLinks, AlbumReleaseCandidate,
+    AlbumReleaseClass, AlbumReleaseResult, AlbumView, ArtistView, CollectionSummary, FolderChoice,
+    FolderView, GenreChoice, GenreView, MoodView,
 };
 pub use connect::{CONNECT_PAGE_SIZE, ConnectChange, ConnectRecord, ConnectRoot};
 pub use db::{Database, ReadCancellation};
-pub use favorites::{FavoriteTarget, SourceUserData, UserMediaStateWrite};
+pub use favorites::{FavoriteTarget, NativeUserState, UserMediaStateWrite};
 pub use home::{
-    HomeAlbumRow, HomeBlockKind, HomeEntryInput, HomeEntryKind, HomeGenreRow, HomePage,
-    HomeProviderSection, HomeSectionKind, HomeSectionRows, HomeTrackRow,
+    HomeAlbumRow, HomeBlockKind, HomeEntryInput, HomeEntryKind, HomePage, HomeProviderSection,
+    HomeSectionKind, HomeSectionRows, HomeTrackRow,
 };
 pub use keys::{
     AlbumKey, ArtistKey, FolderKey, GenreKey, ListenKey, ListenOutboxKey, LocalAccessFileKey,
@@ -59,11 +84,12 @@ pub use keys::{
     TrackKey, cue_media_parts, cue_media_uri, document_access_uri, document_fragment_parts,
     document_locator_fragment, document_locator_parts, document_media_id, document_media_uri,
     file_media_path, normalize_direct_media_uri, source_entity_parts, source_entity_uri,
+    source_id_for_uri,
 };
 pub use local::{
-    DownloadMetadata, LocalAccessOrigin, LocalAccessRow, LocalAccessWrite, LocalFileKind,
-    LocalFileRow, LocalFileState, LocalFileWrite, LocalLocatorWrite, LocalMediaLocation,
-    MappingTrackRow, ObservedMediaFile,
+    DownloadMetadata, FileEditRow, LocalAccessOrigin, LocalAccessRow, LocalAccessWrite,
+    LocalFileKind, LocalFileRow, LocalFileState, LocalFileWrite, LocalLocatorWrite,
+    LocalMediaLocation, MappingTrackRow, ObservedMediaFile,
 };
 pub use loudness::{AlbumLoudnessWork, LoudnessMeasurement, R128TagWrite, TrackLoudnessWork};
 pub use lyrics::LyricsCacheRow;
@@ -73,29 +99,24 @@ pub use playlist_format::{
 };
 pub use playlist_links::{ObservedPlaylistFile, PlaylistFileLink};
 pub use playlists::{
-    PlaylistDetailPage, PlaylistEntryRemovals, PlaylistEntryRow, PlaylistEntrySort,
-    PlaylistEntryWrite, PlaylistGenreLink, PlaylistIdentity, PlaylistRow, PlaylistSort,
+    PlaylistAccess, PlaylistEditEntry, PlaylistEntryRemovals, PlaylistEntryView,
+    PlaylistEntryWrite, PlaylistGenreLink, PlaylistIdentity, PlaylistRow,
 };
 pub use queue::{
-    OccurrenceId, QUEUE_CONTEXT_LIMIT, QueueChoice, QueueCollection, QueueContextTitle, QueueEntry,
-    QueueInput, QueueItem, QueueOccurrence, QueuePageRow, QueuePlacement, QueueProvenance,
-    QueueQuery, QueueReadPage, QueueReadRequest, QueueReorderTarget, QueueRepeatMode, QueueRestore,
-    QueueScope, QueueSource, QueueTransferPage, queue_content_id, shuffle_order,
+    QUEUE_CONTEXT_LIMIT, QueueContextTitle, QueueEntries, QueueEntry, QueueLoad, QueueOrderUpdate,
+    QueuePlacement, QueueProvenance, QueueReorderTarget, QueueRepeatMode, QueueRestore, QueueRow,
+    QueueTransferPage, QueueTransferRow, QueueUpdate, shuffle_order,
 };
 pub use radio::{PlayedFilter, RadioSeed, RandomCriteria};
-pub use scan::{
-    CachedSource, Freshness, LocalArtworkCandidate, Publication, Scan, ScanLink, ScanOutcome,
-};
 pub use search::{SearchRequest, SearchResults};
 pub use smart_playlists::{
-    SmartPlaylistActivityPeriod, SmartPlaylistDefinition, SmartPlaylistListSort, SmartPlaylistRow,
-    SmartPlaylistRule, SmartPlaylistRuleField, SmartPlaylistRuleOperator, SmartPlaylistRuleValue,
-    SmartPlaylistRuleValueKind, SmartPlaylistSort, SmartPlaylistTrackRow,
-    SmartPlaylistValueSuggestions, SmartPlaylistWrite, SmartSourceReference,
+    SmartPlaylistActivityPeriod, SmartPlaylistDefinition, SmartPlaylistRow, SmartPlaylistRule,
+    SmartPlaylistRuleField, SmartPlaylistRuleOperator, SmartPlaylistRuleValue,
+    SmartPlaylistRuleValueKind, SmartPlaylistSort, SmartPlaylistValueSuggestions,
+    SmartPlaylistWrite,
 };
 pub use tracks::{
-    TrackArtistLink, TrackGenreLink, TrackMetadataWrite, TrackQuery, TrackRoutePage, TrackRow,
-    TrackSort,
+    CatalogSort, TrackAccess, TrackArtistLink, TrackGenreLink, TrackLinks, TrackState, TrackView,
 };
 
 use thiserror::Error;
@@ -115,16 +136,10 @@ pub enum LibraryError {
     Migration(String),
     #[error("invalid Library Store: {0}")]
     InvalidStore(String),
-    #[error("scan input is invalid: {0}")]
-    InvalidScan(String),
     #[error("Library request is invalid: {0}")]
     InvalidRequest(String),
     #[error("Playlist only accepts Tracks from Source {0}")]
     PlaylistSourceMismatch(SourceId),
-    #[error("scan staging failed; the candidate cannot be published")]
-    ScanFailed,
-    #[error("another source scan is already active")]
-    ScanInProgress,
     #[error("the fixed Library writer is unavailable")]
     WriterUnavailable,
     #[error("the Library read was cancelled")]
@@ -135,45 +150,53 @@ pub type LibraryResult<T> = Result<T, LibraryError>;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RouteSeedWindow {
-    pub(crate) relative: f64,
-    pub(crate) limit: usize,
+    relative: f64,
+    position: Option<usize>,
 }
 
 impl RouteSeedWindow {
     const LIMIT: usize = 64;
 
     pub fn top() -> Self {
-        Self::new(0.0, Self::LIMIT)
+        Self::relative(0.0)
     }
 
     pub fn relative(relative: f64) -> Self {
-        Self::new(relative, Self::LIMIT)
-    }
-
-    fn new(relative: f64, limit: usize) -> Self {
         Self {
             relative: if relative.is_finite() {
                 relative.clamp(0.0, 1.0)
             } else {
                 0.0
             },
-            limit: limit.max(1),
+            position: None,
+        }
+    }
+
+    pub fn position(position: usize) -> Self {
+        Self {
+            relative: 0.0,
+            position: Some(position),
         }
     }
 
     pub fn range(self, len: usize) -> std::ops::Range<usize> {
-        let position = ((len.saturating_sub(1)) as f64 * self.relative).round() as usize;
-        let start = position / self.limit * self.limit;
-        start.min(len)..start.saturating_add(self.limit).min(len)
+        let position = self
+            .position
+            .unwrap_or_else(|| ((len.saturating_sub(1)) as f64 * self.relative).round() as usize)
+            .min(len.saturating_sub(1));
+        let start = position / Self::LIMIT * Self::LIMIT;
+        start.min(len)..start.saturating_add(Self::LIMIT).min(len)
     }
 }
 
 impl LibraryError {
-    pub fn is_store_path_io(&self) -> bool {
-        matches!(self, Self::Io(_) | Self::Sqlite(sqlx::Error::Io(_)))
-            || matches!(self, Self::Sqlite(sqlx::Error::Database(error))
+    pub fn is_store_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Io(_) | Self::Sqlite(sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut)
+        ) || matches!(self, Self::Sqlite(sqlx::Error::Database(error))
                 if error.code().as_deref().and_then(|code|code.parse::<i32>().ok())
-                    .is_some_and(|code|matches!(code & 0xff, 3 | 8 | 10 | 13 | 14)))
+                    .is_some_and(|code|matches!(code & 0xff, 3 | 5 | 6 | 7 | 8 | 10 | 13 | 14)))
     }
 }
 
@@ -187,5 +210,8 @@ mod route_seed_tests {
         assert_eq!(RouteSeedWindow::relative(0.5).range(1_000), 448..512);
         assert_eq!(RouteSeedWindow::relative(1.0).range(1_000), 960..1_000);
         assert_eq!(RouteSeedWindow::relative(0.5).range(0), 0..0);
+        assert_eq!(RouteSeedWindow::position(750).range(1_000), 704..768);
+        assert_eq!(RouteSeedWindow::position(750).range(500), 448..500);
+        assert_eq!(RouteSeedWindow::position(750).range(0), 0..0);
     }
 }

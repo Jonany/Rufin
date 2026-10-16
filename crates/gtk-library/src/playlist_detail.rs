@@ -1,3 +1,4 @@
+use rufin_core::browse::{DetailContent, DetailPage, DetailSummary};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -5,13 +6,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use adw::prelude::*;
 use artwork::ArtworkBinding;
 use gtk::glib;
-use library::{
-    Database, PlaylistKey, PlaylistRow, ReadCancellation, SmartPlaylistKey, SmartPlaylistRow,
-};
+use library::{PlaylistKey, PlaylistRow, ReadCancellation, SmartPlaylistKey, SmartPlaylistRow};
 use localization::{msgid, track_count_text};
 
 use crate::CatalogUi;
-use crate::track_model::{PreparedTrackProjection, TrackProjectionRequest};
 use crate::{LibraryListKey, LibraryListSettings};
 use gtk_widgets::artwork::presentation::stable_seed;
 use gtk_widgets::format_duration_units;
@@ -32,13 +30,6 @@ use gtk_widgets::route::Route;
 const PLAYLIST_DETAIL_COMPACT_WIDTH: i32 = 760;
 const PLAYLIST_DETAIL_TINY_COVER_SIZE: i32 = 150;
 const PLAYLIST_DETAIL_WIDE_COVER_SIZE: i32 = 208;
-
-pub use library::PlaylistDetailPage as PlaylistDetailData;
-
-pub struct SmartPlaylistDetailData {
-    pub summary: SmartPlaylistRow,
-    projection: PreparedTrackProjection<library::SmartPlaylistTrackRow>,
-}
 
 #[derive(Clone, PartialEq)]
 enum PlaylistDetailOwner {
@@ -114,7 +105,7 @@ impl PlaylistDetailOwner {
         match self {
             Self::Saved { summary, .. } => playlist_artwork(summary),
             Self::Smart { summary, .. } => summary
-                .artwork_bindings
+                .artwork_binding
                 .iter()
                 .map(|binding| ArtworkBinding::opaque(binding))
                 .collect(),
@@ -161,62 +152,39 @@ impl CatalogUi {
     pub fn smart_playlist_detail_route(
         self: &Rc<Self>,
         key: SmartPlaylistKey,
-        detail: Option<SmartPlaylistDetailData>,
-        source: Option<library::SourceKey>,
-        folder: Option<library::FolderKey>,
+        detail: Option<DetailPage>,
     ) -> MountedRoute {
-        let Some(detail) = detail else {
+        let Some(DetailPage {
+            summary: DetailSummary::SmartPlaylist(summary),
+            content: DetailContent::Tracks(projection),
+        }) = detail
+        else {
             return MountedRoute::static_widget(crate::route_layout::placeholder_view(
                 msgid("Smart Playlist"),
                 msgid("This isn't available"),
             ));
         };
-        (self.update_smart_playlist_pin)(&detail.summary);
+        (self.update_smart_playlist_pin)(&summary);
+        let library::CatalogSubject::Tracks {
+            scope: library::TrackScope::Smart { source, .. },
+            ..
+        } = projection.query.subject
+        else {
+            unreachable!("smart playlist page owns a smart song query")
+        };
+        let folder = projection.query.folder;
         let owner = PlaylistDetailOwner::Smart {
             key,
-            summary: detail.summary,
+            summary: summary,
         };
         let list_key = owner.key();
-        let settings = detail.projection.request.settings;
-        let rows_database = self.library.clone();
-        let load = Rc::new(
-            move |_: Vec<String>,
-                  range: std::ops::Range<usize>,
-                  request: TrackProjectionRequest,
-                  cancellation: ReadCancellation| {
-                let database = rows_database.clone();
-                Box::pin(async move {
-                    database
-                        .smart_playlist_sorted_track_page(
-                            source,
-                            key,
-                            folder,
-                            &request.query,
-                            request.settings.sort_key.track_sort(),
-                            request.settings.descending,
-                            SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .map_or(0, |duration| duration.as_secs() as i64),
-                            range.start,
-                            range.len(),
-                            &cancellation,
-                        )
-                        .await
-                        .map_err(|error| error.to_string())
-                }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
-            },
-        );
-        let model = crate::track_model::TrackCollectionModel::with_load(
+        let model = crate::track_model::TrackCollectionModel::new(
+            Arc::clone(&self.library),
             self.runtime.clone(),
-            detail.projection.order,
-            Some((library::QueueQuery::SmartDisplay { key, source }, folder)),
-            detail.projection.first_row_position,
-            detail.projection.first_rows,
-            settings,
-            load,
+            projection,
         );
         let play_model = model.clone();
-        let play_queue = self.queue.clone();
+        let play_queue = self.playback.clone();
         let play_context = owner.context_id();
         let play: CollectionPlay = Rc::new(move |placement, shuffled| {
             play_model.play_source(
@@ -233,36 +201,16 @@ impl CatalogUi {
             owner.context_id(),
         );
         let item_navigation = tracks.item_navigation();
-        let database = self.library.clone();
-        let refresh_order = tracks.connect_read(
-            self,
-            move |request| request,
-            move |request: TrackProjectionRequest, cancellation| {
-                let database = database.clone();
-                async move {
-                    prepare_smart_playlist_projection(
-                        &database,
-                        source,
-                        key,
-                        folder,
-                        request,
-                        library::RouteSeedWindow::top(),
-                        &cancellation,
-                    )
-                    .await
-                }
-            },
-            "mounted Smart Playlist route",
-        );
+        let refresh_order = tracks.connect_read(self, "mounted Smart Playlist route");
         let apply_tracks = tracks.clone();
         let apply_toolbar = toolbar.clone();
         let apply_refresh = refresh_order.clone();
         let apply = Rc::new(move |settings: &LibraryListSettings| {
-            let previous = apply_tracks.projection_request();
+            let previous = apply_tracks.query();
             apply_tracks.apply_library_list_settings(list_key, settings);
             apply_toolbar.apply(list_key, settings);
-            let request = apply_tracks.projection_request();
-            if !previous.same_query(&request) {
+            let request = apply_tracks.query();
+            if previous != request {
                 apply_refresh();
             }
         }) as Rc<dyn Fn(&LibraryListSettings)>;
@@ -291,25 +239,29 @@ impl CatalogUi {
     pub fn playlist_detail_route(
         self: &Rc<Self>,
         key: PlaylistKey,
-        detail: Option<PlaylistDetailData>,
+        detail: Option<DetailPage>,
     ) -> MountedRoute {
-        let Some(detail) = detail else {
+        let Some(DetailPage {
+            summary: DetailSummary::Playlist(summary),
+            content: DetailContent::Tracks(page),
+        }) = detail
+        else {
             return MountedRoute::static_widget(crate::route_layout::placeholder_view(
                 msgid("Playlist"),
                 msgid("This isn't available"),
             ));
         };
-        let owner = PlaylistDetailOwner::Saved {
-            key,
-            summary: detail.summary,
+        let library::CatalogRows::PlaylistEntries(first_rows) = page.rows else {
+            unreachable!("playlist entries")
         };
+        let owner = PlaylistDetailOwner::Saved { key, summary };
         let entries = Rc::new(self.playlist_entries_view(
             key,
             owner.name().to_string(),
             matches!(&owner, PlaylistDetailOwner::Saved { summary, .. } if summary.writable),
-            detail.count,
-            detail.first_row_position,
-            detail.first_rows,
+            page.count,
+            page.first_row_position,
+            first_rows,
         ));
         let item_navigation = entries.item_navigation();
         let tracks_widget = entries.widget();
@@ -320,23 +272,23 @@ impl CatalogUi {
                   cancellation: ReadCancellation| {
                 let database = Arc::clone(&database);
                 Box::pin(async move {
-                    let count = database
-                        .playlist_entries_count(key, None, &request.query, &cancellation)
+                    let count = (&request.query)
+                        .count(&database, &cancellation)
                         .await
                         .map_err(|error| error.to_string())?
                         .max(0) as usize;
-                    let rows = database
-                        .playlist_entries_page(
-                            key,
-                            None,
-                            request.settings.sort_key.playlist_entry_sort(),
-                            request.settings.descending,
-                            &request.query,
+                    let rows = (&request.query)
+                        .rows(
+                            &database,
                             request.first_row_position.min(count),
                             64,
                             &cancellation,
                         )
                         .await
+                        .map(|rows| match rows {
+                            library::CatalogRows::PlaylistEntries(rows) => rows,
+                            _ => unreachable!("typed song projection"),
+                        })
                         .map_err(|error| error.to_string())?;
                     Ok((count, rows))
                 }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
@@ -344,7 +296,7 @@ impl CatalogUi {
         );
         let apply_entries = Rc::downgrade(&entries);
         let apply = Rc::new(
-            move |request, result: Result<(usize, Vec<library::PlaylistEntryRow>), String>| {
+            move |request, result: Result<(usize, Vec<library::PlaylistEntryView>), String>| {
                 if let Ok((count, rows)) = result
                     && let Some(entries) = apply_entries.upgrade()
                 {
@@ -381,7 +333,7 @@ impl CatalogUi {
             let entries = Rc::clone(&entries);
             Rc::new(move || entries.resume_initial_demand()) as Rc<dyn Fn()>
         };
-        let play_queue = self.queue.clone();
+        let play_queue = self.playback.clone();
         let download_entries = Rc::clone(&entries);
         let play: CollectionPlay = Rc::new(move |placement, shuffled| {
             entries.play(play_queue.clone(), placement, shuffled);
@@ -447,6 +399,7 @@ impl CatalogUi {
             &artwork,
             playlist_cover_size(width),
             playlist_cover_size(i32::MAX),
+            false,
         );
         cover.widget().add_css_class("playlist-detail-cover");
         let showcase_view = DetailShowcaseView::new(
@@ -594,12 +547,28 @@ impl CatalogUi {
                     let database = Arc::clone(&database);
                     Box::pin(async move {
                         match owner_key {
-                            PlaylistDetailOwner::Saved { key, .. } => database
-                                .playlist_rows(&[key], &cancellation)
+                            PlaylistDetailOwner::Saved { key, .. } => {
+                                let mut summary = library::CatalogQuery::keys(
+                                    library::CatalogKind::Playlist,
+                                    None,
+                                    (&[key]).iter().map(|key| key.raw()).collect(),
+                                )
+                                .rows(&database, 0, (&[key]).len(), &cancellation)
                                 .await
+                                .map(|rows| match rows {
+                                    library::CatalogRows::Playlists(rows) => rows,
+                                    _ => unreachable!("typed catalog projection"),
+                                })
                                 .map_err(|error| error.to_string())?
-                                .pop()
-                                .map(|summary| PlaylistDetailOwner::Saved { key, summary }),
+                                .pop();
+                                if let Some(summary) = &mut summary {
+                                    summary.genres = database
+                                        .playlist_genres(key, &cancellation)
+                                        .await
+                                        .map_err(|error| error.to_string())?;
+                                }
+                                summary.map(|summary| PlaylistDetailOwner::Saved { key, summary })
+                            }
                             PlaylistDetailOwner::Smart { key, .. } => {
                                 let now = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
@@ -663,10 +632,10 @@ impl CatalogUi {
         showcase.clear_kind_controls();
         if let PlaylistDetailOwner::Saved { key, .. } = owner {
             let radio = detail_radio_button();
-            let controller = self.radio.clone();
+            let controller = self.playback.clone();
             let key = *key;
             radio.connect_clicked(move |_| {
-                controller.play_radio(playback::RadioPlayRequest::now(
+                controller.play_radio(rufin_core::playback::RadioPlayRequest::now(
                     library::RadioSeed::Playlist(key),
                 ));
             });
@@ -682,88 +651,6 @@ impl CatalogUi {
             }
         }
     }
-}
-
-pub async fn load_smart_playlist_detail(
-    database: &Database,
-    source: Option<library::SourceKey>,
-    folder: Option<library::FolderKey>,
-    key: SmartPlaylistKey,
-    settings: LibraryListSettings,
-    window: library::RouteSeedWindow,
-    cancellation: &ReadCancellation,
-) -> Result<Option<SmartPlaylistDetailData>, String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs() as i64);
-    let Some(summary) = database
-        .smart_playlist_rows(source, &[key], folder, now, cancellation)
-        .await
-        .map_err(|error| error.to_string())?
-        .pop()
-    else {
-        return Ok(None);
-    };
-    let projection = prepare_smart_playlist_projection(
-        database,
-        source,
-        key,
-        folder,
-        TrackProjectionRequest {
-            query: String::new(),
-            settings,
-        },
-        window,
-        cancellation,
-    )
-    .await?;
-    Ok(Some(SmartPlaylistDetailData {
-        summary,
-        projection,
-    }))
-}
-
-async fn prepare_smart_playlist_projection(
-    database: &Database,
-    source: Option<library::SourceKey>,
-    key: SmartPlaylistKey,
-    folder: Option<library::FolderKey>,
-    request: TrackProjectionRequest,
-    window: library::RouteSeedWindow,
-    cancellation: &ReadCancellation,
-) -> Result<PreparedTrackProjection<library::SmartPlaylistTrackRow>, String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs() as i64);
-    let count = database
-        .smart_playlist_track_count(source, key, folder, &request.query, now, cancellation)
-        .await
-        .map_err(|error| error.to_string())?
-        .max(0) as usize;
-    let seed = window.range(count);
-    let first_row_position = seed.start;
-    let first_rows = database
-        .smart_playlist_sorted_track_page(
-            source,
-            key,
-            folder,
-            &request.query,
-            request.settings.sort_key.track_sort(),
-            request.settings.descending,
-            now,
-            seed.start,
-            seed.len(),
-            cancellation,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(PreparedTrackProjection {
-        disc_sections: Vec::new(),
-        order: gtk_widgets::sparse_model::SparseSource::Query { count },
-        first_row_position,
-        first_rows,
-        request,
-    })
 }
 
 pub fn playlist_cover_size(width: i32) -> i32 {
@@ -821,6 +708,7 @@ mod tests {
         let owner = PlaylistDetailOwner::Saved {
             key: PlaylistKey::from_raw(1),
             summary: PlaylistRow {
+                source_owned: true,
                 writable: true,
                 metadata_writable: true,
                 playlist_key: PlaylistKey::from_raw(1),
@@ -832,7 +720,6 @@ mod tests {
                 track_count: 4,
                 duration_millis: 1,
                 downloaded_count: 0,
-                representative_artwork: Vec::new(),
                 genres: Vec::new(),
             },
         };

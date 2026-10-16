@@ -3,14 +3,20 @@ pub use files::{bind_integrations, choose_integration};
 mod jellyfin_emby;
 mod plex;
 
+use rufin_core::source::authorization::{
+    SourceAuthorization, SourceAuthorizationEvent, SourceAuthorizationInput,
+    SourceAuthorizationMethod, SourceChoice,
+};
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use adw::prelude::*;
-use rufin_core::runtime::source::{
-    CredentialInput, CredentialPreset, DiscoveryStatus, EditableSource, OpenSubsonicAuthentication,
-    OpenSubsonicKind, SourceHandle, SourceOperation, SourceSettingsChange, SourceSetup,
+use rufin_core::runtime::source::{DiscoveryStatus, EditableSource, SourceHandle, SourceOperation};
+
+use sources::{
+    CredentialInput, CredentialPreset, SourceSetup, SubsonicAuthentication, SubsonicFlavor,
 };
 
 use super::folder_selected_text;
@@ -179,9 +185,9 @@ struct CredentialHostDraft {
 struct CredentialSetupFlow {
     presentation: &'static SourcePresentation,
     draft: Rc<RefCell<CredentialHostDraft>>,
-    authentication: Rc<Cell<OpenSubsonicAuthentication>>,
+    authentication: Rc<Cell<SubsonicAuthentication>>,
     offer_authentication: bool,
-    submit: Rc<dyn Fn(&SourceHandle, CredentialInput, OpenSubsonicAuthentication)>,
+    submit: Rc<dyn Fn(&SourceHandle, CredentialInput, SubsonicAuthentication)>,
 }
 
 struct SourceChoiceFlow;
@@ -208,7 +214,7 @@ struct CredentialHost {
     username: adw::EntryRow,
     password: adw::PasswordEntryRow,
     cert_verify: adw::SwitchRow,
-    authentication: Option<Rc<Cell<OpenSubsonicAuthentication>>>,
+    authentication: Option<Rc<Cell<SubsonicAuthentication>>>,
     authentication_toggles: Option<[adw::SwitchRow; 2]>,
     save: gtk::Button,
 }
@@ -230,7 +236,7 @@ impl CredentialHost {
             &self.username,
             &self.password,
             self.authentication.as_ref().is_some_and(|authentication| {
-                authentication.get() == OpenSubsonicAuthentication::ApiKey
+                authentication.get() == SubsonicAuthentication::ApiKey
             }),
         )
     }
@@ -478,21 +484,22 @@ fn local_setup_flow(
 fn subsonic_setup_flow_for(
     _shell: &Rc<Preferences>,
     presentation: &'static SourcePresentation,
-    kind: OpenSubsonicKind,
+    kind: SubsonicFlavor,
 ) -> Rc<dyn SourceSetupFlow> {
     let preset = None;
-    let authentication = OpenSubsonicAuthentication::Password;
-    let offer_authentication = kind == OpenSubsonicKind::OpenSubsonic;
+    let authentication = SubsonicAuthentication::Password;
+    let offer_authentication = kind == SubsonicFlavor::Subsonic;
     Rc::new(CredentialSetupFlow {
         presentation,
         draft: Rc::new(RefCell::new(credential_draft(preset))),
         authentication: Rc::new(Cell::new(authentication)),
         offer_authentication,
         submit: Rc::new(move |source, input, authentication| {
-            source.configure_source(SourceSetup::OpenSubsonic {
-                kind,
-                authentication,
-                credentials: input,
+            let source = source.clone();
+            gtk::glib::spawn_future_local(async move {
+                let _ = source
+                    .save_subsonic(None, kind, authentication, input)
+                    .await;
             });
         }),
     })
@@ -502,86 +509,40 @@ fn navidrome_setup_flow(
     shell: &Rc<Preferences>,
     presentation: &'static SourcePresentation,
 ) -> Rc<dyn SourceSetupFlow> {
-    subsonic_setup_flow_for(shell, presentation, OpenSubsonicKind::Navidrome)
+    subsonic_setup_flow_for(shell, presentation, SubsonicFlavor::Navidrome)
 }
 
 fn subsonic_setup_flow(
     shell: &Rc<Preferences>,
     presentation: &'static SourcePresentation,
 ) -> Rc<dyn SourceSetupFlow> {
-    subsonic_setup_flow_for(shell, presentation, OpenSubsonicKind::OpenSubsonic)
+    subsonic_setup_flow_for(shell, presentation, SubsonicFlavor::Subsonic)
 }
 
 fn subsonic_settings_group_for(
     shell: &Rc<Preferences>,
     saved: &EditableSource,
     presentation: &'static SourcePresentation,
-    kind: OpenSubsonicKind,
+    kind: SubsonicFlavor,
 ) -> Result<gtk::Widget, String> {
     let source_id = saved.source.id.clone();
-    let authentication = (kind == OpenSubsonicKind::OpenSubsonic).then_some(
+    let authentication = (kind == SubsonicFlavor::Subsonic).then_some(
         saved
             .credentials
             .open_subsonic_authentication
-            .unwrap_or(OpenSubsonicAuthentication::Password),
+            .unwrap_or(SubsonicAuthentication::Password),
     );
-    Ok(credential_source_settings_group(
-        shell,
-        saved.credentials.clone(),
-        gtk_widgets::source_labels::source_kind_title(presentation.kind)
-            .expect("registered source presentation"),
-        authentication,
-        None,
-        move |source, input, authentication| {
-            source.update_source(SourceSettingsChange::OpenSubsonic {
-                source_id: source_id.clone(),
-                kind,
-                authentication: authentication.unwrap_or(OpenSubsonicAuthentication::Password),
-                credentials: input,
-            })
-        },
-    ))
-}
-
-fn navidrome_settings_group(
-    shell: &Rc<Preferences>,
-    saved: &EditableSource,
-    presentation: &'static SourcePresentation,
-) -> Result<gtk::Widget, String> {
-    subsonic_settings_group_for(shell, saved, presentation, OpenSubsonicKind::Navidrome)
-}
-
-fn subsonic_settings_group(
-    shell: &Rc<Preferences>,
-    saved: &EditableSource,
-    presentation: &'static SourcePresentation,
-) -> Result<gtk::Widget, String> {
-    subsonic_settings_group_for(shell, saved, presentation, OpenSubsonicKind::OpenSubsonic)
-}
-
-fn credential_source_settings_group(
-    shell: &Rc<Preferences>,
-    preset: CredentialPreset,
-    source_title: &'static str,
-    authentication: Option<OpenSubsonicAuthentication>,
-    extra: Option<adw::SwitchRow>,
-    submit: impl Fn(
-        &SourceHandle,
-        CredentialInput,
-        Option<OpenSubsonicAuthentication>,
-    ) -> async_channel::Receiver<Result<(), String>>
-    + 'static,
-) -> gtk::Widget {
-    let snapshot = credential_draft(Some(preset));
+    let snapshot = credential_draft(Some(saved.credentials.clone()));
     let authentication = authentication.map(|value| Rc::new(Cell::new(value)));
     let host = credential_host_view(&snapshot, true, authentication);
     host.fields_group.set_title(&tr("Server Settings"));
-    host.fields_group.set_description(Some(&tr(source_title)));
+    host.fields_group
+        .set_description(Some(&tr(gtk_widgets::source_labels::source_kind_title(
+            presentation.kind,
+        )
+        .expect("registered source presentation"))));
     host.cert_verify
         .set_subtitle(&tr("Off only for a server you control"));
-    if let Some(extra) = extra.as_ref() {
-        host.rows.add(extra);
-    }
 
     let save = &host.save;
     save.set_visible(true);
@@ -598,38 +559,59 @@ fn credential_source_settings_group(
         let authentication = authentication
             .as_ref()
             .map(|authentication| authentication.get());
-        let result = submit(
-            &source,
-            CredentialInput {
-                source_name: Some(name.text().trim().to_string()),
-                server_url: url.text().trim().to_string(),
-                username: username.text().trim().to_string(),
-                secret: password.text().to_string(),
-                trust_invalid_cert: !cert_verify.is_active(),
-            },
-            authentication,
-        );
+        let source = source.clone();
+        let source_id = source_id.clone();
+        let credentials = CredentialInput {
+            source_name: Some(name.text().trim().to_string()),
+            server_url: url.text().trim().to_string(),
+            username: username.text().trim().to_string(),
+            secret: password.text().to_string(),
+            trust_invalid_cert: !cert_verify.is_active(),
+        };
         if let Some(shell) = weak_shell.upgrade() {
-            complete_source_save(&shell, button, result);
+            complete_source_save(&shell, button, async move {
+                source
+                    .save_subsonic(
+                        Some(source_id),
+                        kind,
+                        authentication.unwrap_or(SubsonicAuthentication::Password),
+                        credentials,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+            });
         }
     });
 
-    host.widget.upcast()
+    Ok(host.widget.upcast())
+}
+
+fn navidrome_settings_group(
+    shell: &Rc<Preferences>,
+    saved: &EditableSource,
+    presentation: &'static SourcePresentation,
+) -> Result<gtk::Widget, String> {
+    subsonic_settings_group_for(shell, saved, presentation, SubsonicFlavor::Navidrome)
+}
+
+fn subsonic_settings_group(
+    shell: &Rc<Preferences>,
+    saved: &EditableSource,
+    presentation: &'static SourcePresentation,
+) -> Result<gtk::Widget, String> {
+    subsonic_settings_group_for(shell, saved, presentation, SubsonicFlavor::Subsonic)
 }
 
 fn complete_source_save(
     shell: &Rc<Preferences>,
     button: &gtk::Button,
-    result: async_channel::Receiver<Result<(), String>>,
+    result: impl std::future::Future<Output = Result<(), String>> + 'static,
 ) {
     button.set_sensitive(false);
     let button = button.downgrade();
     let shell = Rc::downgrade(shell);
     gtk::glib::spawn_future_local(async move {
-        let result = result
-            .recv()
-            .await
-            .unwrap_or_else(|error| Err(error.to_string()));
+        let result = result.await;
         match result {
             Ok(()) => {
                 if let Some(button) = button.upgrade() {
@@ -869,8 +851,8 @@ fn source_choice_selector(shell: &Rc<Preferences>, context: &SetupViewContext) -
     privacy.set_visible(context.onboarding);
     {
         let settings = shell.settings.current.borrow();
-        external_metadata.set_active(settings.external_metadata_enabled);
-        external_lyrics.set_active(settings.lyrics.external_lyrics_enabled);
+        external_metadata.set_active(settings.application.external_metadata_enabled);
+        external_lyrics.set_active(settings.lyrics.preferences.external_lyrics_enabled);
         discord_presence.set_active(settings.rich_presence.enabled);
     }
     let weak = Rc::downgrade(shell);
@@ -986,6 +968,7 @@ fn setup_surface_state(operation: &SourceOperation) -> SetupSurfaceState<'_> {
         SourceOperation::Idle
         | SourceOperation::Switching { .. }
         | SourceOperation::Refreshing { .. }
+        | SourceOperation::Downloading { .. }
         | SourceOperation::Failed {
             add_form: false, ..
         } => SetupSurfaceState::Form,
@@ -1014,7 +997,7 @@ fn credential_draft(preset: Option<CredentialPreset>) -> CredentialHostDraft {
 fn credential_host(
     draft: &Rc<RefCell<CredentialHostDraft>>,
     compact: bool,
-    authentication: Option<Rc<Cell<OpenSubsonicAuthentication>>>,
+    authentication: Option<Rc<Cell<SubsonicAuthentication>>>,
 ) -> CredentialHost {
     let snapshot = draft.borrow().clone();
     let host = credential_host_view(&snapshot, compact, authentication);
@@ -1032,7 +1015,7 @@ fn credential_host(
 fn credential_host_view(
     snapshot: &CredentialHostDraft,
     compact: bool,
-    authentication: Option<Rc<Cell<OpenSubsonicAuthentication>>>,
+    authentication: Option<Rc<Cell<SubsonicAuthentication>>>,
 ) -> CredentialHost {
     let resource = crate::ui_resource::CREDENTIAL_HOST_RESOURCE;
     let builder = gtk_widgets::ui_resource::builder(resource);
@@ -1100,11 +1083,11 @@ fn credential_host_view(
 }
 
 pub(super) fn update_open_subsonic_authentication_fields(
-    authentication: OpenSubsonicAuthentication,
+    authentication: SubsonicAuthentication,
     username: &adw::EntryRow,
     secret: &adw::PasswordEntryRow,
 ) {
-    let api_key = authentication == OpenSubsonicAuthentication::ApiKey;
+    let api_key = authentication == SubsonicAuthentication::ApiKey;
     username.set_visible(!api_key);
     secret.set_title(&if api_key {
         tr("API key")
@@ -1116,20 +1099,20 @@ pub(super) fn update_open_subsonic_authentication_fields(
 fn bind_open_subsonic_authentication(
     api_key: &adw::SwitchRow,
     legacy_password: &adw::SwitchRow,
-    authentication: Rc<Cell<OpenSubsonicAuthentication>>,
+    authentication: Rc<Cell<SubsonicAuthentication>>,
     username: &adw::EntryRow,
     secret: &adw::PasswordEntryRow,
 ) {
     update_open_subsonic_authentication_fields(authentication.get(), username, secret);
-    api_key.set_active(authentication.get() == OpenSubsonicAuthentication::ApiKey);
-    legacy_password.set_active(authentication.get() == OpenSubsonicAuthentication::LegacyPassword);
+    api_key.set_active(authentication.get() == SubsonicAuthentication::ApiKey);
+    legacy_password.set_active(authentication.get() == SubsonicAuthentication::LegacyPassword);
     legacy_password.set_visible(!api_key.is_active());
     for (row, other, mode) in [
-        (api_key, legacy_password, OpenSubsonicAuthentication::ApiKey),
+        (api_key, legacy_password, SubsonicAuthentication::ApiKey),
         (
             legacy_password,
             api_key,
-            OpenSubsonicAuthentication::LegacyPassword,
+            SubsonicAuthentication::LegacyPassword,
         ),
     ] {
         let other = other.downgrade();
@@ -1137,7 +1120,7 @@ fn bind_open_subsonic_authentication(
         let username = username.downgrade();
         let secret = secret.downgrade();
         row.connect_active_notify(move |row| {
-            if mode == OpenSubsonicAuthentication::ApiKey {
+            if mode == SubsonicAuthentication::ApiKey {
                 if let Some(legacy) = other.upgrade() {
                     legacy.set_visible(!row.is_active());
                 }
@@ -1150,7 +1133,7 @@ fn bind_open_subsonic_authentication(
             } else if other.upgrade().is_some_and(|other| other.is_active()) {
                 return;
             } else {
-                OpenSubsonicAuthentication::Password
+                SubsonicAuthentication::Password
             };
             authentication.set(next);
             if let (Some(username), Some(secret)) = (username.upgrade(), secret.upgrade()) {
@@ -1212,7 +1195,7 @@ fn append_credential_connect(
                 &username,
                 &password,
                 authentication.as_ref().is_some_and(|authentication| {
-                    authentication.get() == OpenSubsonicAuthentication::ApiKey
+                    authentication.get() == SubsonicAuthentication::ApiKey
                 }),
             )
         })
@@ -1259,7 +1242,7 @@ fn append_credential_connect(
                 .authentication
                 .as_ref()
                 .is_some_and(|authentication| {
-                    authentication.get() == OpenSubsonicAuthentication::ApiKey
+                    authentication.get() == SubsonicAuthentication::ApiKey
                 }) {
                 tr("Enter a server address and API key")
             } else {

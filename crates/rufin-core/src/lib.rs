@@ -1,8 +1,12 @@
 //! Rufin application composition and concrete product operations.
+#[cfg(feature = "bindings")]
+uniffi::setup_scaffolding!();
+
 pub mod activity;
 mod album_release;
 pub mod app;
 pub mod backup;
+pub mod browse;
 pub mod connect;
 pub mod detail_links;
 pub mod diagnostics;
@@ -22,8 +26,6 @@ mod waveform;
 pub use settings::SettingsHandle;
 
 pub mod lyrics;
-
-pub mod artwork;
 
 pub mod metadata;
 pub mod open;

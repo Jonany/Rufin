@@ -10,11 +10,16 @@ repository.workspace = true
 readme.workspace = true
 publish.workspace = true
 
+[features]
+bindings = ["dep:uniffi"]
+
 [dependencies]
+uniffi = { workspace = true, optional = true }
 artwork.workspace = true
 askama.workspace = true
 async-channel.workspace = true
 axum.workspace = true
+base64.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 constant_time_eq.workspace = true

@@ -2,7 +2,7 @@ use gtk_widgets::media_drag::{MediaDragSource, install_media_drag_source};
 use gtk_widgets::sparse_model::{item_at_from_item, object_item};
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-use ::library::{AlbumRow, ArtistRow, PlaylistRow, SmartPlaylistRow};
+use ::library::{AlbumView, ArtistView, PlaylistRow, SmartPlaylistRow};
 use adw::prelude::*;
 use artwork::ArtworkBinding;
 use gtk::glib;
@@ -11,7 +11,7 @@ use super::collection_context::present_track_context_menu;
 use crate::CatalogUi;
 use crate::{LibraryField, LibraryListKey};
 use gtk_media_menus::media_menus::{present_album_context_menu, present_artist_context_menu};
-use gtk_widgets::artwork::{ArtworkTile, THUMB_COVER_SIZE};
+use gtk_widgets::artwork::ArtworkTile;
 use gtk_widgets::favorites::{
     FAVORITE_COLUMN_WIDTH, album_favorite_key, artist_favorite_key, favorite_button_is_active,
     row_favorite_icon_button, set_favorite_button_active, track_favorite_key,
@@ -20,7 +20,8 @@ use gtk_widgets::interactions::install_context_menu_openers;
 use gtk_widgets::localization::localized_column;
 
 use super::collections::{install_playlist_reorder, install_smart_playlist_reorder};
-use rufin_core::playback::PlaybackTarget;
+use gtk_widgets::selection::collection_play_request;
+use rufin_core::playback::PlayRequest;
 
 use super::table_links::mapped_track_link_column;
 use gtk_widgets::detail_links::{DetailLinks, album_artist_links};
@@ -40,7 +41,7 @@ const DETAIL_TRACK_UTILITY_COLUMN_WIDTH: i32 = 48;
 pub fn bind_collection_title<T: Clone + 'static>(
     factory: &gtk::SignalListItemFactory,
     shell: &Rc<CatalogUi>,
-    target: impl Fn(&T) -> PlaybackTarget + 'static,
+    target: impl Fn(&T) -> PlayRequest + 'static,
 ) {
     let bindings = Rc::new(RefCell::new(HashMap::<
         usize,
@@ -80,7 +81,7 @@ mod collection_index_cell_imp {
     pub struct CollectionIndexCell {
         pub(super) overlay: std::cell::OnceCell<gtk::Overlay>,
         pub(super) playing: std::cell::OnceCell<Rc<super::super::grid_cells::MediaPlayingBinding>>,
-        pub(super) target: RefCell<Option<PlaybackTarget>>,
+        pub(super) target: RefCell<Option<PlayRequest>>,
         pub(super) shell: RefCell<std::rc::Weak<CatalogUi>>,
     }
 
@@ -135,7 +136,7 @@ impl CollectionIndexCell {
         cell
     }
 
-    fn bind(&self, position: u32, target: Option<PlaybackTarget>) {
+    fn bind(&self, position: u32, target: Option<PlayRequest>) {
         use gtk::subclass::prelude::ObjectSubclassIsExt;
         let imp = self.imp();
         set_track_row_index_text(
@@ -207,7 +208,7 @@ pub fn album_column(
             let row = item
                 .item()
                 .and_downcast::<gtk_widgets::sparse_model::SparseObjectItem>()
-                .and_then(|item| item.value::<std::sync::Arc<AlbumRow>>());
+                .and_then(|item| item.value::<std::sync::Arc<AlbumView>>());
             cell.bind(item.position(), row);
         }
     });
@@ -259,7 +260,7 @@ mod album_table_cell_imp {
     #[derive(Default)]
     pub struct AlbumTableCell {
         pub(super) view: RefCell<Option<AlbumCellView>>,
-        pub(super) row: RefCell<Option<std::sync::Arc<AlbumRow>>>,
+        pub(super) row: RefCell<Option<std::sync::Arc<AlbumView>>>,
         pub(super) field: std::cell::Cell<Option<LibraryField>>,
         pub(super) shell: RefCell<std::rc::Weak<CatalogUi>>,
         pub(super) playback_context: RefCell<Option<String>>,
@@ -357,15 +358,15 @@ impl AlbumTableCell {
             let context = playback_context.clone();
             install_media_drag_source(view.widget(), move || {
                 let cell = weak.upgrade()?;
-                let shell = cell.imp().shell.borrow().upgrade()?;
+                let _shell = cell.imp().shell.borrow().upgrade()?;
                 let row = cell.imp().row.borrow().clone()?;
-                let target = PlaybackTarget::Album(row.media_uri.clone());
-                let target = context
-                    .as_ref()
-                    .map_or(target.clone(), |context| target.in_context(context));
+                let target = gtk_widgets::selection::album_play_request(&row);
+                let target = context.as_ref().map_or(target.clone(), |context| {
+                    target.with_context(context.as_str().into())
+                });
                 Some((
-                    MediaDragSource::capture_target(shell.selected_library().as_deref(), target),
-                    row.title.clone(),
+                    MediaDragSource::capture_target(target),
+                    row.metadata.title.clone(),
                 ))
             });
             let weak = cell.downgrade();
@@ -407,7 +408,7 @@ impl AlbumTableCell {
         cell
     }
 
-    pub fn bind(&self, position: u32, row: Option<std::sync::Arc<AlbumRow>>) {
+    pub fn bind(&self, position: u32, row: Option<std::sync::Arc<AlbumView>>) {
         use gtk::subclass::prelude::ObjectSubclassIsExt;
         let imp = self.imp();
         imp.row.replace(row.clone());
@@ -416,11 +417,13 @@ impl AlbumTableCell {
         };
         let view = imp.view.borrow();
         let target = row.as_ref().map(|row| {
-            let target = PlaybackTarget::Album(row.media_uri.clone());
+            let target = gtk_widgets::selection::album_play_request(&row);
             imp.playback_context
                 .borrow()
                 .as_ref()
-                .map_or(target.clone(), |context| target.in_context(context))
+                .map_or(target.clone(), |context| {
+                    target.with_context(context.as_str().into())
+                })
         });
         if let Some(playing) = imp.title_playing.borrow().as_ref() {
             playing.bind(&shell, target.clone());
@@ -435,7 +438,6 @@ impl AlbumTableCell {
                         &cover,
                         opaque_artwork(row.artwork_binding.as_deref()),
                         48,
-                        THUMB_COVER_SIZE,
                     );
                 }
             }
@@ -446,7 +448,10 @@ impl AlbumTableCell {
                     shell.bind_download_badge(
                         &cell.downloaded(),
                         imp.field.get() == Some(LibraryField::Title)
-                            && collection_is_downloaded(row.track_count, row.downloaded_count),
+                            && collection_is_downloaded(
+                                row.summary.track_count,
+                                row.summary.downloaded_count,
+                            ),
                     );
                 } else {
                     cell.clear();
@@ -460,15 +465,17 @@ impl AlbumTableCell {
                         &cover,
                         opaque_artwork(row.artwork_binding.as_deref()),
                         48,
-                        THUMB_COVER_SIZE,
                     );
-                    cell.title().set_text(&row.title);
+                    cell.title().set_text(&row.metadata.title);
                     cell.bind_subtitle(album_artist_links(&row));
                     cell.subtitle()
-                        .set_visible(!row.display_artist.trim().is_empty());
+                        .set_visible(!row.metadata.artist.trim().is_empty());
                     shell.bind_download_badge(
                         &cell.downloaded().unwrap(),
-                        collection_is_downloaded(row.track_count, row.downloaded_count),
+                        collection_is_downloaded(
+                            row.summary.track_count,
+                            row.summary.downloaded_count,
+                        ),
                     );
                 } else {
                     cell.title().set_text("");
@@ -479,7 +486,7 @@ impl AlbumTableCell {
             }
             AlbumCellView::Tools(cell) => set_placeholder_favorite(
                 &cell.favorite().unwrap(),
-                row.as_ref().map(|row| row.favorite),
+                row.as_ref().map(|row| row.state.favorite),
             ),
         }
     }
@@ -492,18 +499,18 @@ pub fn artist_column(
 ) -> gtk::ColumnViewColumn {
     match field {
         LibraryField::RowIndex => {
-            mapped_row_index_column::<ArtistRow>(shell, column_width(field), move |row| {
+            mapped_row_index_column::<ArtistView>(shell, column_width(field), move |row| {
                 if album_artist {
-                    PlaybackTarget::AlbumArtist(row.media_uri.clone())
+                    gtk_widgets::selection::artist_play_request(&row, true)
                 } else {
-                    PlaybackTarget::Artist(row.media_uri.clone())
+                    gtk_widgets::selection::artist_play_request(&row, false)
                 }
             })
         }
         LibraryField::Image => artist_image_column(shell, album_artist),
         LibraryField::TitleMerged | LibraryField::Title => {
             artist_text_column(shell, field, "Title", 220, album_artist, |artist| {
-                artist.name.clone()
+                artist.metadata.name.clone()
             })
         }
         LibraryField::Tools => artist_favorite_column(shell, album_artist),
@@ -518,13 +525,14 @@ pub fn artist_column(
     }
 }
 pub fn playlist_column(shell: &Rc<CatalogUi>, field: LibraryField) -> gtk::ColumnViewColumn {
+    let selected = shell.selected.clone();
     match field {
         LibraryField::Tools => super::named_collections::named_actions_column::<PlaylistRow>(shell),
-        LibraryField::RowIndex => mapped_row_index_column::<PlaylistRow>(
-            shell,
-            column_width(field),
-            super::named_collections::NamedCollectionRow::playback,
-        ),
+        LibraryField::RowIndex => {
+            mapped_row_index_column::<PlaylistRow>(shell, column_width(field), move |row| {
+                super::named_collections::NamedCollectionRow::playback(row, selected.as_ref())
+            })
+        }
         LibraryField::Image => artwork_column::<PlaylistRow, _>(
             shell,
             "Image",
@@ -535,12 +543,12 @@ pub fn playlist_column(shell: &Rc<CatalogUi>, field: LibraryField) -> gtk::Colum
                     .next()
                     .unwrap_or_default()
             },
-            Some(|playlist| {
+            Some(Rc::new(|playlist| {
                 (
-                    PlaybackTarget::Playlist(playlist.playlist_key),
+                    collection_play_request(library::TrackScope::Playlist(playlist.playlist_key)),
                     playlist.name,
                 )
-            }),
+            })),
         ),
         LibraryField::Title | LibraryField::TitleMerged => {
             playlist_title_column(shell, "Title", 220, |playlist| playlist.name.clone())
@@ -560,12 +568,11 @@ fn playlist_title_column<F>(
 where
     F: Fn(&PlaylistRow) -> String + 'static,
 {
+    let selected = shell.selected.clone();
     let factory = gtk::SignalListItemFactory::new();
-    bind_collection_title::<PlaylistRow>(
-        &factory,
-        shell,
-        super::named_collections::NamedCollectionRow::playback,
-    );
+    bind_collection_title::<PlaylistRow>(&factory, shell, move |row| {
+        super::named_collections::NamedCollectionRow::playback(row, selected.as_ref())
+    });
     let value = Rc::new(value);
     let setup_shell = Rc::clone(shell);
     factory.connect_setup(move |_, item| {
@@ -590,7 +597,7 @@ where
             item,
             Rc::new(|playlist: PlaylistRow| {
                 (
-                    PlaybackTarget::Playlist(playlist.playlist_key),
+                    collection_play_request(library::TrackScope::Playlist(playlist.playlist_key)),
                     playlist.name,
                 )
             }),
@@ -631,33 +638,37 @@ where
 }
 
 pub fn smart_playlist_column(shell: &Rc<CatalogUi>, field: LibraryField) -> gtk::ColumnViewColumn {
+    let selected = shell.selected.clone();
     match field {
         LibraryField::Tools => {
             super::named_collections::named_actions_column::<SmartPlaylistRow>(shell)
         }
-        LibraryField::RowIndex => mapped_row_index_column::<SmartPlaylistRow>(
-            shell,
-            column_width(field),
-            super::named_collections::NamedCollectionRow::playback,
-        ),
+        LibraryField::RowIndex => {
+            mapped_row_index_column::<SmartPlaylistRow>(shell, column_width(field), move |row| {
+                super::named_collections::NamedCollectionRow::playback(row, selected.as_ref())
+            })
+        }
         LibraryField::Image => artwork_column::<SmartPlaylistRow, _>(
             shell,
             "Image",
             column_width(LibraryField::Image),
             |playlist| {
                 playlist
-                    .artwork_bindings
-                    .first()
+                    .artwork_binding
+                    .as_ref()
                     .map(|binding| ArtworkBinding::opaque(binding))
                     .unwrap_or_default()
             },
-            Some(|playlist| {
+            Some(Rc::new(move |playlist| {
                 let name = smart_playlist_display_name(&playlist);
                 (
-                    PlaybackTarget::SmartPlaylist(playlist.smart_playlist_key),
+                    gtk_widgets::selection::smart_play_request(
+                        playlist.smart_playlist_key,
+                        selected.as_ref(),
+                    ),
                     name,
                 )
-            }),
+            })),
         ),
         LibraryField::Title | LibraryField::TitleMerged => {
             smart_playlist_title_column(shell, "Title", 220, |playlist| {
@@ -679,12 +690,11 @@ fn smart_playlist_title_column<F>(
 where
     F: Fn(&SmartPlaylistRow) -> String + 'static,
 {
+    let selected = shell.selected.clone();
     let factory = gtk::SignalListItemFactory::new();
-    bind_collection_title::<SmartPlaylistRow>(
-        &factory,
-        shell,
-        super::named_collections::NamedCollectionRow::playback,
-    );
+    bind_collection_title::<SmartPlaylistRow>(&factory, shell, move |row| {
+        super::named_collections::NamedCollectionRow::playback(row, selected.as_ref())
+    });
     let value = Rc::new(value);
     let setup_shell = Rc::clone(shell);
     factory.connect_setup(move |_, item| {
@@ -703,14 +713,18 @@ where
                     .and_then(|item| item_at_from_item::<SmartPlaylistRow>(&item))
             }),
         );
+        let selected = setup_shell.selected.clone();
         install_collection_cell_drag(
             &cell,
             &setup_shell,
             item,
-            Rc::new(|playlist: SmartPlaylistRow| {
+            Rc::new(move |playlist: SmartPlaylistRow| {
                 let name = smart_playlist_display_name(&playlist);
                 (
-                    PlaybackTarget::SmartPlaylist(playlist.smart_playlist_key),
+                    gtk_widgets::selection::smart_play_request(
+                        playlist.smart_playlist_key,
+                        selected.as_ref(),
+                    ),
                     name,
                 )
             }),
@@ -750,7 +764,7 @@ where
     column
 }
 
-pub fn song_column_for_key<T: gtk_widgets::library_fields::TrackPresentation>(
+pub fn track_column_for_key<T: gtk_widgets::library_fields::TrackPresentation>(
     shell: &Rc<CatalogUi>,
     key: LibraryListKey,
     field: LibraryField,
@@ -1053,7 +1067,7 @@ pub fn row_index_column_with_width(width: i32) -> gtk::ColumnViewColumn {
 pub fn mapped_row_index_column<T: Clone + 'static>(
     shell: &Rc<CatalogUi>,
     width: i32,
-    target: impl Fn(&T) -> PlaybackTarget + 'static,
+    target: impl Fn(&T) -> PlayRequest + 'static,
 ) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
     let shell = Rc::clone(shell);
@@ -1261,13 +1275,13 @@ fn install_artist_list_item_context_menu(
         target,
         shell,
         item,
-        Rc::new(move |artist: ArtistRow| {
+        Rc::new(move |artist: ArtistView| {
             let target = if album_artist {
-                PlaybackTarget::AlbumArtist(artist.media_uri)
+                gtk_widgets::selection::artist_play_request(&artist, true)
             } else {
-                PlaybackTarget::Artist(artist.media_uri)
+                gtk_widgets::selection::artist_play_request(&artist, false)
             };
-            (target, artist.name)
+            (target, artist.metadata.name)
         }),
     );
     let item = item.downgrade();
@@ -1294,17 +1308,14 @@ fn install_collection_cell_drag<T: Clone + 'static>(
     widget: &impl IsA<gtk::Widget>,
     shell: &Rc<CatalogUi>,
     item: &gtk::ListItem,
-    target: Rc<dyn Fn(T) -> (PlaybackTarget, String)>,
+    target: Rc<dyn Fn(T) -> (PlayRequest, String)>,
 ) {
     let shell = Rc::downgrade(shell);
     let item = item.downgrade();
     install_media_drag_source(widget, move || {
-        let shell = shell.upgrade()?;
+        let _shell = shell.upgrade()?;
         let (target, title) = target(item_at_from_item::<T>(&item.upgrade()?)?);
-        Some((
-            MediaDragSource::capture_target(shell.selected_library().as_deref(), target),
-            title,
-        ))
+        Some((MediaDragSource::capture_target(target), title))
     });
 }
 
@@ -1313,7 +1324,7 @@ pub fn artwork_column<T, F>(
     title: &str,
     width: i32,
     candidates: F,
-    drag: Option<fn(T) -> (PlaybackTarget, String)>,
+    drag: Option<Rc<dyn Fn(T) -> (PlayRequest, String)>>,
 ) -> gtk::ColumnViewColumn
 where
     T: Clone + 'static,
@@ -1329,10 +1340,10 @@ where
             return;
         };
         let cell = RecycledArtworkCell::new(48);
-        if let Some(drag) = drag
+        if let Some(drag) = drag.clone()
             && let Some(shell) = setup_shell.upgrade()
         {
-            install_collection_cell_drag(&cell, &shell, item, Rc::new(drag));
+            install_collection_cell_drag(&cell, &shell, item, drag);
         }
         item.set_child(Some(&cell));
     });
@@ -1354,9 +1365,7 @@ where
             return;
         };
         set_cover_placeholder(&bind_shell, &cover, false);
-        bind_shell
-            .artwork
-            .bind_artwork_tile(&cover, artwork, 48, THUMB_COVER_SIZE);
+        bind_shell.artwork.bind_artwork_tile(&cover, artwork, 48);
     });
     let unbind_shell = Rc::clone(&shell);
     factory.connect_unbind(move |_, item| {
@@ -1394,7 +1403,7 @@ pub fn artist_image_column(shell: &Rc<CatalogUi>, album_artist: bool) -> gtk::Co
         };
         let cover = cell.artwork();
         let Some(artwork) = item.item().and_then(|object| {
-            object_item::<ArtistRow, _>(object, |row| {
+            object_item::<ArtistView, _>(object, |row| {
                 opaque_artwork(row.artwork_binding.as_deref())
             })
         }) else {
@@ -1402,9 +1411,7 @@ pub fn artist_image_column(shell: &Rc<CatalogUi>, album_artist: bool) -> gtk::Co
             return;
         };
         set_cover_placeholder(&bind_shell, &cover, false);
-        bind_shell
-            .artwork
-            .bind_artwork_tile(&cover, artwork, 48, THUMB_COVER_SIZE);
+        bind_shell.artwork.bind_artwork_tile(&cover, artwork, 48);
     });
     let unbind_shell = Rc::clone(&shell);
     factory.connect_unbind(move |_, item| {
@@ -1427,15 +1434,15 @@ pub fn artist_text_column<F>(
     value: F,
 ) -> gtk::ColumnViewColumn
 where
-    F: Fn(&ArtistRow) -> String + 'static,
+    F: Fn(&ArtistView) -> String + 'static,
 {
     let factory = gtk::SignalListItemFactory::new();
     if matches!(field, LibraryField::Title | LibraryField::TitleMerged) {
-        bind_collection_title::<ArtistRow>(&factory, shell, move |row| {
+        bind_collection_title::<ArtistView>(&factory, shell, move |row| {
             if album_artist {
-                PlaybackTarget::AlbumArtist(row.media_uri.clone())
+                gtk_widgets::selection::artist_play_request(&row, true)
             } else {
-                PlaybackTarget::Artist(row.media_uri.clone())
+                gtk_widgets::selection::artist_play_request(&row, false)
             }
         });
     }
@@ -1462,10 +1469,10 @@ where
             return;
         };
         let Some((text, downloaded)) = item.item().and_then(|object| {
-            object_item::<ArtistRow, _>(object, |row| {
+            object_item::<ArtistView, _>(object, |row| {
                 (
                     value(row),
-                    collection_is_downloaded(row.track_count, row.downloaded_count),
+                    collection_is_downloaded(row.summary.track_count, row.summary.downloaded_count),
                 )
             })
         }) else {
@@ -1568,9 +1575,7 @@ where
             return;
         };
         set_cover_placeholder(&bind_shell, &cover, false);
-        bind_shell
-            .artwork
-            .bind_artwork_tile(&cover, artwork, 48, THUMB_COVER_SIZE);
+        bind_shell.artwork.bind_artwork_tile(&cover, artwork, 48);
     });
 
     let unbind_shell = Rc::clone(&shell);
@@ -1806,9 +1811,7 @@ where
             return;
         };
         set_cover_placeholder(&bind_shell, &cover, false);
-        bind_shell
-            .artwork
-            .bind_artwork_tile(&cover, artwork, 48, THUMB_COVER_SIZE);
+        bind_shell.artwork.bind_artwork_tile(&cover, artwork, 48);
         title.set_text(&text);
         bind_shell
             .downloads
@@ -1864,7 +1867,7 @@ pub fn artist_favorite_column(shell: &Rc<CatalogUi>, album_artist: bool) -> gtk:
             Rc::new(move || {
                 favorite_item
                     .upgrade()
-                    .and_then(|item| item_at_from_item::<ArtistRow>(&item))
+                    .and_then(|item| item_at_from_item::<ArtistView>(&item))
                     .map(|artist| artist_favorite_key(&artist.media_uri))
             }),
             &button,
@@ -1875,7 +1878,7 @@ pub fn artist_favorite_column(shell: &Rc<CatalogUi>, album_artist: bool) -> gtk:
         button.connect_clicked(move |button| {
             let Some(artist) = click_item
                 .upgrade()
-                .and_then(|item| item_at_from_item::<ArtistRow>(&item))
+                .and_then(|item| item_at_from_item::<ArtistView>(&item))
             else {
                 return;
             };
@@ -1898,7 +1901,7 @@ pub fn artist_favorite_column(shell: &Rc<CatalogUi>, album_artist: bool) -> gtk:
         };
         let favorite = item
             .item()
-            .and_then(|object| object_item::<ArtistRow, _>(object, |row| row.favorite));
+            .and_then(|object| object_item::<ArtistView, _>(object, |row| row.state.favorite));
         set_placeholder_favorite(&button, favorite);
     });
 

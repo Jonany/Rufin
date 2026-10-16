@@ -1,12 +1,15 @@
-//! Rufin crossings for compact Playback, Database Queue persistence, streams, and Activity.
+//! Playback controls, source jobs, and persistent playback facts.
+pub(crate) mod actor;
+mod commands;
 mod connect;
 mod continuation;
 mod plex;
+mod queue;
+pub(crate) mod state;
+pub use commands::*;
 pub(crate) use continuation::PreparedContinuation;
 #[cfg(test)]
 mod queue_tests;
-mod target;
-pub use target::PlaybackTarget;
 
 pub fn seek_preview_matches_position(target_millis: u64, position_millis: u64) -> bool {
     const TOLERANCE_MILLIS: u64 = 1_500;
@@ -15,20 +18,20 @@ pub fn seek_preview_matches_position(target_millis: u64, position_millis: u64) -
         .contains(&position_millis)
 }
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::runtime::VisualizerPublication;
+use actor::{Playback, WeakPlayback};
 use async_channel::{Receiver, Sender as EventSender, TrySendError};
+use library::QueueUpdate;
 use library::{Database, ListenWrite, ReadCancellation};
 use playback::{
-    OccurrenceId, PlayRequest, Playback, PlaybackBackend, PlaybackProjection, PlaybackUpdate,
-    PreparedStream, QueueCommandPort, QueueReorderRequest, RadioCommandPort, RadioPlayRequest,
-    RandomPlayRequest, RepeatMode, RunId, SessionCommand, SessionEffect, StreamRequest,
-    TransportCommandPort,
+    PlaybackBackend, PlaybackProjection, PreparedStream, RepeatMode, RunId, StreamRequest,
 };
+use queue::Sequence;
 use scrobbling::Scrobbler;
+use state::{AutoDjRequest, ClockSample, Command};
 use tracing::{debug, warn};
 
 use crate::loudness::LoudnessAnalysisOwner;
@@ -37,22 +40,17 @@ use crate::settings::SettingsFile;
 use crate::source::SourceOwner;
 use crate::waveform::{WaveformMedia, WaveformOwner};
 
-#[derive(Clone)]
-struct ActivePlayback {
-    instance: u64,
-    playback: Playback,
-}
-
 struct OutputSelection {
     selected: playback::PlaybackOutput,
     prepared: Option<Box<dyn PlaybackBackend>>,
 }
 
-pub(crate) struct PlaybackOwner {
+#[cfg_attr(feature = "bindings", derive(uniffi::Object))]
+pub struct PlaybackOwner {
     database: Arc<Database>,
     settings: SettingsFile,
     runtime: tokio::runtime::Handle,
-    pub(crate) updates: playback::PlaybackUpdates,
+    pub updates: playback::PlaybackUpdates,
     visualizer_events: EventSender<crate::runtime::VisualizerPublication>,
     visualizer_drain: Receiver<VisualizerPublication>,
     waveform: Arc<WaveformOwner>,
@@ -63,14 +61,10 @@ pub(crate) struct PlaybackOwner {
     scrobbler: Arc<Scrobbler>,
     source: Mutex<std::sync::Weak<SourceOwner>>,
     connect: Mutex<std::sync::Weak<crate::connect::ConnectOwner>>,
-    active: Mutex<Option<ActivePlayback>>,
-    stream_tasks: Mutex<std::collections::HashMap<RunId, tokio::task::JoinHandle<()>>>,
-    pending_queue: Mutex<Option<playback::QueuePersistence>>,
-    latest_queue_request: Mutex<(u64, u64)>,
+    active: Mutex<Option<Playback>>,
+    pending_queue: Mutex<Option<QueueUpdate>>,
     store_sender: async_channel::Sender<PlaybackStoreWork>,
     monotonic_origin: Instant,
-    play_id_prefix: String,
-    next_instance: AtomicU64,
     start_backend: Box<dyn Fn() -> Result<Box<dyn PlaybackBackend>, String> + Send + Sync>,
     cast: playback_cast::CastManager,
     output: Mutex<OutputSelection>,
@@ -84,25 +78,20 @@ enum PlaybackStoreWork {
         prepared: Box<PreparedContinuation>,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
-    Artwork {
-        playback: Playback,
-        media_uris: Vec<String>,
-    },
-    Activity(Box<playback::ActivityListen>),
+    Activity(library::TrackKey, Box<playback::ActivityListen>),
     Flush(std::sync::mpsc::SyncSender<()>),
-    Read {
-        playback: Playback,
-        instance: u64,
-        id: u64,
-        request: library::QueueReadRequest,
+    Output {
+        volume: f64,
+        muted: bool,
+        audio_output: Option<String>,
     },
     Settings,
 }
 
 fn enqueue_queue_save(
-    pending: &Mutex<Option<playback::QueuePersistence>>,
+    pending: &Mutex<Option<QueueUpdate>>,
     sender: &async_channel::Sender<PlaybackStoreWork>,
-    update: playback::QueuePersistence,
+    update: QueueUpdate,
 ) {
     let mut pending = pending.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(current) = pending.as_mut() {
@@ -115,27 +104,30 @@ fn enqueue_queue_save(
 
 async fn save_pending_queue(
     database: &Database,
-    pending: &Mutex<Option<playback::QueuePersistence>>,
+    pending: &Mutex<Option<QueueUpdate>>,
+    failed: &mut Option<QueueUpdate>,
 ) -> library::LibraryResult<()> {
-    let state = pending.lock().unwrap_or_else(|p| p.into_inner()).take();
-    let Some(state) = state else { return Ok(()) };
-    match state.kind() {
-        playback::QueuePersistenceKind::Membership => database.save_queue(state.state()).await,
-        playback::QueuePersistenceKind::Order => database.save_queue_order(state.state()).await,
-        playback::QueuePersistenceKind::State => {
-            database
-                .persist_queue_settings(
-                    state.current(),
-                    state.progress_millis() as i64,
-                    state.repeat_mode(),
-                    state.shuffled(),
-                )
-                .await
+    let pending = pending.lock().unwrap_or_else(|p| p.into_inner()).take();
+    let update = match (failed.take(), pending) {
+        (Some(mut older), Some(newer)) => {
+            older.coalesce(newer);
+            older
         }
+        (Some(update), None) | (None, Some(update)) => update,
+        (None, None) => return Ok(()),
+    };
+    if let Err(error) = database.apply_queue_update(&update).await {
+        *failed = Some(update);
+        return Err(error);
     }
+    Ok(())
 }
 
 impl PlaybackOwner {
+    pub(crate) fn insert_load(&self, input: library::QueueLoad, target: QueueReorderTarget) {
+        self.send(Command::Insert { input, target });
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new<StartBackend>(
         database: Arc<Database>,
@@ -162,7 +154,7 @@ impl PlaybackOwner {
             cached_cast_artwork(
                 &cast_artwork,
                 &artwork_settings,
-                &stream.occurrence.as_ref()?.item,
+                stream.row.as_ref()?.track.artwork_binding.as_deref(),
             )
         };
         let owner = Arc::new(Self {
@@ -181,16 +173,12 @@ impl PlaybackOwner {
             source: Mutex::new(std::sync::Weak::new()),
             connect: Mutex::new(std::sync::Weak::new()),
             active: Mutex::new(None),
-            stream_tasks: Mutex::new(std::collections::HashMap::new()),
             pending_queue: Mutex::new(None),
-            latest_queue_request: Mutex::new((0, 0)),
             store_sender,
             monotonic_origin: Instant::now(),
-            play_id_prefix: random_identity(),
-            next_instance: AtomicU64::new(1),
             start_backend: Box::new(start_backend),
             cast: playback_cast::CastManager::new(
-                ui.cast_proxy_enabled,
+                ui.application.cast_proxy_enabled,
                 ui.cast_network_interface,
                 cast_artwork_path,
             ),
@@ -204,9 +192,10 @@ impl PlaybackOwner {
         });
         let weak = Arc::downgrade(&owner);
         owner.runtime.spawn(async move {
+            let mut failed_queue_save = None;
             while let Ok(work) = store_receiver.recv().await {
                 let Some(owner) = weak.upgrade() else { break };
-                owner.consume_store(work).await;
+                owner.consume_store(work, &mut failed_queue_save).await;
             }
         });
         owner
@@ -231,14 +220,13 @@ impl PlaybackOwner {
                     restore.repeat_mode = stored.ui.repeat_mode;
                     restore.shuffled = stored.ui.shuffle_enabled;
                 }
-                playback::Sequence::from_window(restore, 0).map_err(string_error)
+                Sequence::from_window(restore, 0, 0).map_err(string_error)
             }
             Err(error) => Err(string_error(error)),
         }.unwrap_or_else(|error| {
             warn!(%error, "could not restore optional Queue; starting with an empty playback window");
-            playback::Sequence::new()
+            Sequence::new()
         });
-        let instance = self.next_instance.fetch_add(1, Ordering::AcqRel);
         let owner = Arc::downgrade(self);
         let clock_owner = Arc::downgrade(self);
         let backend_owner = Arc::clone(self);
@@ -246,12 +234,12 @@ impl PlaybackOwner {
             tokio::task::spawn_blocking(move || backend_owner.take_selected_backend())
                 .await
                 .map_err(string_error)??;
-        let (playback, _) = Playback::start(
+        let (playback, projection) = Playback::start(
             sequence,
-            format!("{}:{instance}", self.play_id_prefix),
+            random_identity(),
             stored.ui.playback,
             stored.ui.auto_dj_enabled,
-            usize::from(stored.ui.auto_dj_refill_threshold),
+            usize::from(stored.ui.application.auto_dj_refill_threshold),
             playback_output,
             backend,
             Arc::new(move || {
@@ -259,20 +247,10 @@ impl PlaybackOwner {
                     .upgrade()
                     .map_or_else(empty_clock_sample, |owner| owner.clock_sample())
             }),
-            move |update| {
-                if let Some(owner) = owner.upgrade() {
-                    owner.consume_update(instance, update);
-                }
-            },
+            owner,
         )
         .map_err(string_error)?;
-        *self.active.lock().unwrap_or_else(|p| p.into_inner()) = Some(ActivePlayback {
-            instance,
-            playback: playback.clone(),
-        });
-        let projection = playback.projection().map_err(string_error)?;
-        self.publish_selected_products(&projection);
-        self.publish_projection(projection.clone());
+        *self.active.lock().unwrap_or_else(|p| p.into_inner()) = Some(playback.clone());
         Ok(projection)
     }
 
@@ -283,204 +261,89 @@ impl PlaybackOwner {
     }
 
     pub(crate) async fn forget_source(&self, source: library::SourceKey) -> Result<(), String> {
-        let occurrences = self
-            .database
-            .queue_occurrences_for_source(source)
-            .await
-            .map_err(string_error)?
-            .into_iter()
-            .map(OccurrenceId::new)
-            .collect::<Vec<_>>();
-        if occurrences.is_empty() {
+        let Some(active) = self.active() else {
             return Ok(());
-        }
-        if let Some(active) = self.active() {
+        };
+        let queue = active.handoff_snapshot().map_err(string_error)?.0;
+        let positions = self
+            .database
+            .queue_positions_for_source(&queue, source)
+            .await
+            .map_err(string_error)?;
+        if !positions.is_empty() {
+            let keys = positions
+                .into_iter()
+                .map(|position| queue.entries[queue.order[position] as usize].track_key)
+                .collect();
             active
-                .playback
-                .command(SessionCommand::Forget(occurrences))
+                .command(Command::Forget(keys))
                 .map_err(string_error)?;
         }
         Ok(())
     }
 
-    fn take_active(&self) -> Option<ActivePlayback> {
+    fn take_active(&self) -> Option<Playback> {
         let active = self.active.lock().unwrap_or_else(|p| p.into_inner()).take();
         self.loudness.cancel();
-        for (_, task) in self
-            .stream_tasks
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .drain()
-        {
-            task.abort();
-        }
         self.publish_current_media(None);
         (self.observe_playback)(None, false);
         self.updates.clear();
         active
     }
 
-    fn consume_update(&self, instance: u64, mut update: PlaybackUpdate) {
-        for effect in &update.effects {
-            if let SessionEffect::Queue { id, .. } = effect {
-                *self
-                    .latest_queue_request
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner()) = (instance, *id);
-            }
+    fn publish(&self, projection: PlaybackProjection, current_media_changed: bool) {
+        if current_media_changed {
+            self.publish_current_media(projection.view.transport.current.clone().map(Arc::new));
         }
-        if let Some(persistence) = update.queue_persistence.take() {
-            enqueue_queue_save(&self.pending_queue, &self.store_sender, persistence);
-        }
-        if let Some((run, levels)) = update.visualizer.take() {
-            let frame = VisualizerPublication { run, levels };
-            if let Err(TrySendError::Full(frame)) = self.visualizer_events.try_send(frame) {
-                let _ = self.visualizer_drain.try_recv();
-                let _ = self.visualizer_events.try_send(frame);
-            }
-        }
-        if update.is_empty() {
-            return;
-        }
-        let Some(active) = self.active_matching(instance) else {
-            return;
-        };
-        if let Some(projection) = update.projection.take() {
-            if update.current_media_changed {
-                self.publish_current_media(projection.view.transport.current.clone());
-            }
-            (self.observe_playback)(
-                Some(&projection),
-                projection.notices.iter().any(|notice| {
-                    matches!(notice, playback::PlaybackNotice::PositionDiscontinuity(_))
-                }),
-            );
-            self.publish_projection(projection);
-        }
-        for effect in update.effects {
-            self.consume_effect(&active, effect);
+        (self.observe_playback)(
+            Some(&projection),
+            projection
+                .notices
+                .iter()
+                .any(|notice| matches!(notice, playback::PlaybackNotice::PositionDiscontinuity(_))),
+        );
+        self.updates.publish(projection);
+    }
+
+    fn publish_visualizer(&self, run: RunId, levels: Vec<f64>) {
+        let frame = VisualizerPublication { run, levels };
+        if let Err(TrySendError::Full(frame)) = self.visualizer_events.try_send(frame) {
+            let _ = self.visualizer_drain.try_recv();
+            let _ = self.visualizer_events.try_send(frame);
         }
     }
 
-    fn publish_projection(&self, publication: PlaybackProjection) {
-        self.updates.publish(publication);
+    fn save_queue(&self, state: QueueUpdate) {
+        enqueue_queue_save(&self.pending_queue, &self.store_sender, state);
     }
 
-    async fn consume_store(&self, work: PlaybackStoreWork) {
+    fn persist_output(&self, volume: f64, muted: bool, audio_output: Option<String>) {
+        let _ = self.store_sender.try_send(PlaybackStoreWork::Output {
+            volume,
+            muted,
+            audio_output,
+        });
+    }
+
+    async fn consume_store(
+        &self,
+        work: PlaybackStoreWork,
+        failed_queue_save: &mut Option<QueueUpdate>,
+    ) {
         match work {
             PlaybackStoreWork::Continue { prepared, reply } => {
-                let _ = reply.send(self.commit_continuation(*prepared).await);
+                let _ = reply.send(self.commit_continuation(*prepared, failed_queue_save).await);
             }
-            PlaybackStoreWork::Artwork {
-                playback,
-                media_uris,
-            } => match self.database.queue_artwork_for_uris(&media_uris).await {
-                Ok(bindings) => {
-                    let _ = playback.command(SessionCommand::ArtworkRefreshed(bindings));
-                }
-                Err(error) => warn!(%error, "could not refresh playback artwork"),
-            },
-            PlaybackStoreWork::Activity(activity) => self.record_activity(*activity).await,
+            PlaybackStoreWork::Activity(key, activity) => self.store_activity(key, *activity).await,
             PlaybackStoreWork::Flush(reply) => {
+                if let Err(error) =
+                    save_pending_queue(&self.database, &self.pending_queue, failed_queue_save).await
+                {
+                    warn!(%error, "could not persist Queue");
+                }
                 let _ = reply.send(());
             }
-            PlaybackStoreWork::Read {
-                playback,
-                instance,
-                id,
-                request,
-            } => {
-                if *self
-                    .latest_queue_request
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    != (instance, id)
-                {
-                    return;
-                }
-                let capturing = matches!(request, library::QueueReadRequest::Capture { .. });
-                let hydrate_entries = match &request {
-                    library::QueueReadRequest::Hydrate { entries } => Some(entries.clone()),
-                    _ => None,
-                };
-                let result = self
-                    .database
-                    .read_queue(request)
-                    .await
-                    .map_err(string_error);
-                let result = match (hydrate_entries, result) {
-                    (Some(entries), Ok(page)) => {
-                        self.import_missing_plex_queue_rows(entries, page).await
-                    }
-                    (_, result) => result,
-                };
-                let namespace = capturing
-                    .then(|| {
-                        result
-                            .as_ref()
-                            .ok()?
-                            .entries
-                            .first()?
-                            .occurrence
-                            .as_str()
-                            .rsplit_once(':')
-                            .map(|(prefix, _)| format!("{prefix}:"))
-                    })
-                    .flatten();
-                let current = *self
-                    .latest_queue_request
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    == (instance, id);
-                let accepted = current && playback.complete_queue(id, result).unwrap_or(false);
-                if !accepted && let Some(namespace) = namespace {
-                    if let Err(error) = self.database.discard_queue_capture(&namespace).await {
-                        warn!(%error, "could not release superseded Queue capture");
-                    }
-                }
-            }
-            PlaybackStoreWork::Settings => {
-                if let Err(error) = save_pending_queue(&self.database, &self.pending_queue).await {
-                    warn!(%error,"could not persist Queue");
-                }
-            }
-        }
-    }
-
-    fn consume_effect(&self, active: &ActivePlayback, effect: SessionEffect) {
-        match effect {
-            SessionEffect::RefreshArtwork(media_uris) => {
-                let _ = self.store_sender.try_send(PlaybackStoreWork::Artwork {
-                    playback: active.playback.clone(),
-                    media_uris,
-                });
-            }
-            SessionEffect::CancelStream(run) => {
-                if let Some(task) = self
-                    .stream_tasks
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .remove(&run)
-                {
-                    task.abort();
-                }
-            }
-            SessionEffect::Queue { id, request } => {
-                let _ = self.store_sender.try_send(PlaybackStoreWork::Read {
-                    playback: active.playback.clone(),
-                    instance: active.instance,
-                    id,
-                    request,
-                });
-            }
-            SessionEffect::ResolveStream {
-                run,
-                occurrence,
-                request,
-                ..
-            } => self.resolve_stream(active.clone(), run, occurrence, request),
-            SessionEffect::PersistProgress { .. } | SessionEffect::PersistState { .. } => {}
-            SessionEffect::PersistOutputState {
+            PlaybackStoreWork::Output {
                 volume,
                 muted,
                 audio_output,
@@ -492,85 +355,116 @@ impl PlaybackOwner {
                     Ok(())
                 });
             }
-            SessionEffect::Listening(fact) => {
-                if let playback::ListeningFact::Started { item, .. } = &fact {
-                    self.scrobbler.now_playing(item);
-                }
-            }
-            SessionEffect::Activity(activity) => {
-                let _ = self
-                    .store_sender
-                    .try_send(PlaybackStoreWork::Activity(activity));
-            }
-            SessionEffect::SourceReport(report)
-                if external_source_reporting_enabled(self.settings.load().ui.private_mode) =>
-            {
-                if let Some((source_id, kind, _)) = library::source_entity_parts(&report.media_uri)
-                    && kind == "track"
+            PlaybackStoreWork::Settings => {
+                if let Err(error) =
+                    save_pending_queue(&self.database, &self.pending_queue, failed_queue_save).await
                 {
-                    let owner = self.source_owner();
-                    self.runtime.spawn(async move {
-                        if let Ok(Some(source)) =
-                            tokio::task::spawn_blocking(move || owner?.client(&source_id).ok())
-                                .await
-                        {
-                            let _ = source.report_playback(&report).await;
-                        }
-                    });
+                    warn!(%error, "could not persist Queue");
                 }
             }
-            SessionEffect::SourceReport(_) => {}
-            SessionEffect::RequestAutoDj(request) => {
-                if !self.request_plex_auto_dj(&request) {
-                    crate::radio::request_auto_dj(
-                        self.runtime.clone(),
-                        Arc::clone(&self.database),
-                        self.source_owner()
-                            .map(|source| Arc::downgrade(&source))
-                            .unwrap_or_default(),
-                        active.playback.clone(),
-                        request,
-                    );
-                }
-            }
-            SessionEffect::NonfatalError(error) => {
-                debug!(%error, "Playback operation was not available")
-            }
-            SessionEffect::FatalError(error) => warn!(%error, "Playback session failed"),
-            SessionEffect::FlushPersistence { .. }
-            | SessionEffect::Backend(_)
-            | SessionEffect::CurrentMediaChanged
-            | SessionEffect::PositionDiscontinuity(_)
-            | SessionEffect::Visualizer { .. } => {}
         }
     }
 
-    async fn record_activity(&self, activity: playback::ActivityListen) {
+    fn record_activity(&self, key: library::TrackKey, activity: Box<playback::ActivityListen>) {
+        let _ = self
+            .store_sender
+            .try_send(PlaybackStoreWork::Activity(key, activity));
+    }
+
+    fn report_source(&self, report: playback::SourceReportFact) {
+        if external_source_reporting_enabled(self.settings.load().ui.application.private_mode)
+            && let Some((source_id, kind, _)) = library::source_entity_parts(&report.media_uri)
+            && kind == "track"
+        {
+            let owner = self.source_owner();
+            self.runtime.spawn(async move {
+                if let Ok(Some(source)) =
+                    tokio::task::spawn_blocking(move || owner?.client(&source_id).ok()).await
+                {
+                    let _ = source.report_playback(&report).await;
+                }
+            });
+        }
+    }
+
+    fn request_auto_dj(&self, playback: WeakPlayback, request: AutoDjRequest) {
+        if self.request_plex_auto_dj(&request) {
+            return;
+        }
+        let database = self.database.clone();
+        let source = self.source_owner();
+        let selected = source.as_ref().and_then(|owner| owner.selected_library());
+        let source = source.as_ref().map(Arc::downgrade).unwrap_or_default();
+        self.runtime.spawn(async move {
+            let candidates = crate::radio::radio_candidates(
+                &database,
+                source,
+                selected,
+                library::RadioSeed::Track(request.seed_media_uri.clone()),
+                request.requested_count,
+                &library::ReadCancellation::new(),
+            )
+            .await;
+            playback.post(move |player, sample| match candidates {
+                Ok(candidates) => {
+                    if let Err(error) = player.complete_auto_dj_candidates(
+                        request.seed_run,
+                        &request.seed_media_uri,
+                        candidates,
+                        request.requested_count,
+                        sample,
+                    ) {
+                        player.report_error(error.to_string());
+                    }
+                }
+                Err(error) => {
+                    player.auto_dj_unavailable(
+                        request.seed_run,
+                        &request.seed_media_uri,
+                        Some(error),
+                    );
+                }
+            });
+        });
+    }
+
+    async fn store_activity(
+        &self,
+        current_track: library::TrackKey,
+        activity: playback::ActivityListen,
+    ) {
         let deliveries = if activity.skipped {
             Vec::new()
         } else {
-            self.scrobbler.listen_delivery_targets(&activity.item)
+            self.scrobbler
+                .listen_delivery_targets(activity.item.metadata.duration_millis)
         };
         let listen = ListenWrite {
             external_id: Some(activity.play_id),
             media_uri: activity.item.media_uri,
-            title: activity.item.title,
-            artist: activity.item.artist,
-            album: activity.item.album,
-            duration_millis: activity.item.duration_millis,
-            disc_number: activity.item.disc_number,
-            track_number: activity.item.track_number,
-            year: activity.item.year,
-            release_date: activity.item.release_date,
-            source_format: activity.item.source_format,
-            musicbrainz_recording_id: activity.item.musicbrainz_recording_id,
-            musicbrainz_release_track_id: activity.item.musicbrainz_release_track_id,
+            title: activity.item.metadata.title,
+            artist: activity.item.metadata.artist,
+            album: activity.item.metadata.album,
+            duration_millis: activity.item.metadata.duration_millis,
+            disc_number: (activity.item.metadata.disc_number > 0)
+                .then_some(activity.item.metadata.disc_number),
+            track_number: (activity.item.metadata.track_number > 0)
+                .then_some(activity.item.metadata.track_number),
+            year: activity.item.metadata.year,
+            release_date: activity.item.metadata.release_date,
+            source_format: activity.item.metadata.source_format,
+            musicbrainz_recording_id: activity.item.metadata.musicbrainz_recording_id,
+            musicbrainz_release_track_id: activity.item.metadata.musicbrainz_release_track_id,
             started_at: activity.started_at_unix_seconds,
             local_period: activity.local_period,
             listened_millis: i64::try_from(activity.listened_millis).unwrap_or(i64::MAX),
             skipped: activity.skipped,
         };
-        match self.database.record_listen(&listen, &deliveries).await {
+        match self
+            .database
+            .record_listen(&listen, Some(current_track), &deliveries)
+            .await
+        {
             Ok(_) => self.scrobbler.listen_recorded(deliveries.len()),
             Err(error) => warn!(%error, "could not record Rufin Activity"),
         }
@@ -578,29 +472,23 @@ impl PlaybackOwner {
 
     fn resolve_stream(
         &self,
-        active: ActivePlayback,
+        playback: WeakPlayback,
         run: RunId,
-        occurrence: Arc<playback::QueueOccurrence>,
+        occurrence: Arc<playback::QueueRow>,
         request: StreamRequest,
-    ) {
+        normalization: playback::LoudnessNormalization,
+    ) -> tokio::task::JoinHandle<()> {
         let database = Arc::clone(&self.database);
         let source_owner = self.source_owner();
-        let playback = active.playback;
         let local = self.settings.local_configuration();
         let connect = self
             .connect
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .upgrade();
-        let task = self.runtime.spawn(async move {
-            let (track, album) = database
-                .playback_loudness(&occurrence.item.media_uri, &ReadCancellation::new())
-                .await
-                .unwrap_or_default();
-            let loudness = playback::TrackLoudness {
-                track: track.map(Box::new),
-                album: album.map(Box::new),
-            };
+        self.runtime.spawn(async move {
+            let loudness =
+                cached_loudness(&database, &occurrence.track.media_uri, normalization).await;
             let result = prepare_stream(
                 &database,
                 request,
@@ -620,16 +508,34 @@ impl PlaybackOwner {
             )
             .await
             .map(|stream| prepare_media_stream(stream, loudness, occurrence));
-            let _ = tokio::task::spawn_blocking(move || playback.resolve_stream(run, result)).await;
-        });
-        if let Some(previous) = self
-            .stream_tasks
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(run, task)
-        {
-            previous.abort();
-        }
+            playback.post(move |player, sample| match result {
+                Ok(stream) => player.stream_resolved(run, stream),
+                Err(error) => player.stream_failed(run, error, sample),
+            });
+        })
+    }
+
+    fn resolve_loudness(
+        &self,
+        playback: WeakPlayback,
+        run: RunId,
+        mut stream: PreparedStream,
+    ) -> tokio::task::JoinHandle<()> {
+        let database = self.database.clone();
+        self.runtime.spawn(async move {
+            stream.loudness = cached_loudness(
+                &database,
+                &stream
+                    .row
+                    .as_ref()
+                    .expect("prepared queue entry")
+                    .track
+                    .media_uri,
+                playback::LoudnessNormalization::ReplayGain,
+            )
+            .await;
+            playback.post(move |player, _| player.loudness_resolved(run, stream));
+        })
     }
 
     pub(crate) fn waveform_setting_changed(&self, enabled: bool) {
@@ -643,10 +549,12 @@ impl PlaybackOwner {
             settings.loudness_normalization,
             settings.loudness_normalization_scope,
             settings.write_ebu_r128_tags,
-            self.source_owner()
-                .and_then(|source| source.current_session()),
+            self.source_owner(),
         );
-        self.send(SessionCommand::UpdateSettings(settings));
+        self.send(Command::UpdateSettings(settings));
+    }
+    pub(crate) fn cancel_loudness_analysis(&self) {
+        self.loudness.cancel();
     }
     pub(crate) fn cast_proxy_setting_changed(&self, enabled: bool) {
         self.cast.set_proxy_media(enabled);
@@ -655,7 +563,7 @@ impl PlaybackOwner {
         self.cast.set_network_interface(network);
     }
     pub(crate) fn auto_dj_threshold_changed(&self, enabled: bool, threshold: u8) {
-        self.send(SessionCommand::SetAutoDj {
+        self.send(Command::SetAutoDj {
             enabled,
             refill_threshold: usize::from(threshold),
         });
@@ -665,29 +573,32 @@ impl PlaybackOwner {
             .active()
             .ok_or_else(|| "Playback is unavailable".to_string())?;
         active
-            .playback
-            .command(SessionCommand::StreamInputsChanged)
+            .command(Command::StreamInputsChanged)
             .map_err(string_error)
+    }
+    pub(crate) fn rekey_tracks(&self, pairs: Arc<[(library::TrackKey, library::TrackKey)]>) {
+        self.send(Command::RekeyTracks(pairs));
     }
     pub(crate) fn catalog_changed(&self) {
         if self.active().is_some() {
-            self.send(SessionCommand::CatalogChanged);
+            self.send(Command::CatalogChanged);
             let playback = self.settings.load().ui.playback;
             self.loudness.library_changed(
                 playback.loudness_normalization,
                 playback.loudness_normalization_scope,
                 playback.write_ebu_r128_tags,
-                self.source_owner()
-                    .and_then(|source| source.current_session()),
+                self.source_owner(),
             );
         }
     }
     pub(crate) fn current_media(&self) -> Option<Arc<playback::CurrentMedia>> {
-        self.active()
-            .and_then(|active| active.playback.current_media().ok().flatten())
+        self.updates
+            .current()
+            .and_then(|view| view.transport.current.clone())
+            .map(Arc::new)
     }
 
-    fn active(&self) -> Option<ActivePlayback> {
+    fn active(&self) -> Option<Playback> {
         self.active
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -700,10 +611,6 @@ impl PlaybackOwner {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .upgrade()
     }
-    fn active_matching(&self, instance: u64) -> Option<ActivePlayback> {
-        self.active()
-            .filter(|active| instance == 0 || active.instance == instance)
-    }
     fn publish_current_media(&self, media: Option<Arc<playback::CurrentMedia>>) {
         let waveform = media
             .as_ref()
@@ -714,7 +621,7 @@ impl PlaybackOwner {
             return;
         };
         let source_owner = self.source_owner();
-        let input_digest = library::source_entity_parts(&media.media_uri)
+        let input_digest = library::source_entity_parts(&media.row.track.media_uri)
             .and_then(|(source_id, _, _)| source_owner.as_ref()?.configuration(&source_id))
             .and_then(|configuration| configuration.input_identity().ok())
             .map_or([0; 32], |input| input.digest);
@@ -726,7 +633,10 @@ impl PlaybackOwner {
 
     fn waveform_media(&self, media: Arc<playback::CurrentMedia>) -> WaveformMedia {
         WaveformMedia {
-            request: StreamRequest::for_item(&media.item, self.settings.playback_stream_quality()),
+            request: StreamRequest::new(
+                (&media.row.track).media_uri.clone(),
+                self.settings.playback_stream_quality(),
+            ),
             media,
             source: self
                 .source_owner()
@@ -736,27 +646,30 @@ impl PlaybackOwner {
         }
     }
 
-    pub(crate) fn publish_selected_products(&self, projection: &PlaybackProjection) {
-        self.publish_current_media(projection.view.transport.current.clone());
-        (self.observe_playback)(Some(projection), false);
-    }
     pub(crate) fn current_projection(&self) -> Option<PlaybackProjection> {
-        self.active()
-            .and_then(|active| active.playback.projection().ok())
+        self.updates.current().map(|view| PlaybackProjection {
+            view: (*view).clone(),
+            notices: Vec::new(),
+        })
     }
-    fn send(&self, command: SessionCommand) {
-        let command = match self.send_rufin(command) {
-            Some(command) => command,
-            None => return,
-        };
-        let command = match self.send_plex(command) {
-            Some(command) => command,
-            None => return,
+    fn send(&self, command: Command) {
+        let command = if command.addresses_occurrence() {
+            command
+        } else {
+            let Some(command) = self.send_rufin(command) else {
+                return;
+            };
+            let Some(command) = self.send_plex(command) else {
+                return;
+            };
+            command
         };
         if let Some(active) = self.active() {
-            if let Err(error) = active.playback.command(command) {
-                warn!(%error,"Playback command failed");
-            }
+            active.downgrade().post(move |player, sample| {
+                if let Err(error) = player.handle_command(command, sample) {
+                    player.report_error(error.to_string());
+                }
+            });
         }
     }
 
@@ -832,7 +745,6 @@ impl PlaybackOwner {
         let backend = self.start_output_backend(&selected)?;
         if let Some(active) = self.active() {
             active
-                .playback
                 .replace_backend(selected.clone(), backend)
                 .map_err(string_error)?;
             let mut output = self.output.lock().unwrap_or_else(|p| p.into_inner());
@@ -845,10 +757,10 @@ impl PlaybackOwner {
         }
         Ok(())
     }
-    fn clock_sample(&self) -> playback::ClockSample {
+    fn clock_sample(&self) -> ClockSample {
         let now = SystemTime::now();
         let unix_seconds = unix_seconds(now);
-        playback::ClockSample {
+        ClockSample {
             monotonic_millis: self
                 .monotonic_origin
                 .elapsed()
@@ -860,13 +772,8 @@ impl PlaybackOwner {
     }
 }
 
-impl QueueCommandPort for PlaybackOwner {
-    fn page(&self, offset: u64, limit: u32, filter: String) -> Result<playback::QueuePage, String> {
-        self.runtime
-            .block_on(self.receiver_queue_page(offset, limit, filter))
-    }
-
-    fn snapshot(&self) -> Result<library::QueueRestore, String> {
+impl PlaybackOwner {
+    pub fn snapshot(&self) -> Result<library::QueueRestore, String> {
         let receiver = self.rufin.lock().unwrap_or_else(|p| p.into_inner()).clone();
         if let Some(receiver) = receiver {
             return self
@@ -878,22 +785,12 @@ impl QueueCommandPort for PlaybackOwner {
             return Ok(library::QueueRestore::default());
         };
         active
-            .playback
             .handoff_snapshot()
             .map(|(queue, _, _)| queue)
             .map_err(string_error)
     }
 
-    fn media_uris(&self) -> Result<Vec<String>, String> {
-        let queue = self.snapshot()?;
-        Ok(queue
-            .order
-            .iter()
-            .map(|index| queue.entries[*index as usize].media_uri.to_string())
-            .collect())
-    }
-
-    fn play(&self, mut request: PlayRequest) {
+    pub fn play_selection(&self, request: PlayRequest) {
         if self.play_rufin(&request) {
             return;
         }
@@ -903,54 +800,52 @@ impl QueueCommandPort for PlaybackOwner {
         let Some(active) = self.active() else {
             return;
         };
-        let playback = active.playback;
-        self.runtime.spawn(async move {
-            let shuffled = playback
-                .projection()
-                .is_ok_and(|projection| projection.view.controls.shuffle_enabled);
-            request.shuffled_start &=
-                shuffled && request.placement == playback::QueuePlacement::Now;
-            let Some(reservation) = playback.admit_play(&request).ok().flatten() else {
-                return;
-            };
-            let seed = random_u64();
-            let (batch, placement) = request.compact_batch(seed);
-            let _ = playback.complete_materialization(reservation.id, batch, placement);
+        active.downgrade().post(move |player, sample| {
+            if let Err(error) = player.play(request, sample) {
+                player.report_error(error.to_string());
+            }
         });
     }
-    fn insert(&self, input: library::QueueInput, target: playback::QueueReorderTarget) {
-        self.send(SessionCommand::Insert { input, target });
-    }
-    fn remove(&self, occurrence: OccurrenceId) {
-        self.send(SessionCommand::Remove(occurrence));
-    }
-    fn remove_many(&self, occurrences: Vec<OccurrenceId>) {
-        self.send(SessionCommand::RemoveMany(occurrences));
-    }
-    fn activate(&self, occurrence: OccurrenceId) {
-        self.send(SessionCommand::Activate(occurrence));
-    }
-    fn move_after_current(&self, occurrence: OccurrenceId) {
-        self.send(SessionCommand::MoveAfterCurrent(occurrence));
-    }
-    fn reorder(&self, request: QueueReorderRequest) {
-        self.send(SessionCommand::Reorder {
-            occurrences: request.occurrences,
-            target: request.target,
-        });
-    }
-    fn clear(&self, include_current: bool) {
-        self.send(SessionCommand::Clear { include_current });
+    pub fn insert(&self, input: library::TrackSelection, target: QueueReorderTarget) {
+        self.insert_load(library::QueueLoad::tracks(input), target);
     }
 }
 
-impl RadioCommandPort for PlaybackOwner {
-    fn candidates(
+#[cfg_attr(feature = "bindings", uniffi::export)]
+impl PlaybackOwner {
+    pub fn remove(&self, position: usize) {
+        self.send(Command::Remove(position));
+    }
+    pub fn remove_many(&self, selection: QueueSelection) {
+        self.send(Command::RemoveMany(selection));
+    }
+    pub fn activate(&self, position: usize) {
+        self.send(Command::Activate(position));
+    }
+    pub fn activate_occurrence(&self, id: u64) {
+        self.send(Command::ActivateOccurrence(id));
+    }
+    pub fn move_occurrence_after_current(&self, id: u64) {
+        self.send(Command::MoveOccurrenceAfterCurrent(id));
+    }
+    pub fn move_after_current(&self, position: usize) {
+        self.send(Command::MoveAfterCurrent(position));
+    }
+    pub fn reorder(&self, selection: QueueSelection, target: QueueReorderTarget) {
+        self.send(Command::Reorder { selection, target });
+    }
+    pub fn clear(&self, include_current: bool) {
+        self.send(Command::Clear { include_current });
+    }
+}
+
+impl PlaybackOwner {
+    pub fn candidates(
         &self,
         seed: library::RadioSeed,
         requested: usize,
         cancellation: library::ReadCancellation,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>, String>> + Send>>
+    ) -> impl std::future::Future<Output = Result<Vec<library::TrackKey>, String>> + Send + 'static + use<>
     {
         let database = self.database.clone();
         let source = self
@@ -958,98 +853,86 @@ impl RadioCommandPort for PlaybackOwner {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        Box::pin(async move {
-            crate::radio::radio_candidates(&database, source, seed, requested, &cancellation).await
-        })
+        let selected = source.upgrade().and_then(|owner| owner.selected_library());
+        async move {
+            crate::radio::radio_candidates(
+                &database,
+                source,
+                selected,
+                seed,
+                requested,
+                &cancellation,
+            )
+            .await
+        }
     }
 
-    fn play_random(&self, request: RandomPlayRequest) {
+    pub fn play_random(&self, request: RandomPlayRequest) {
         if self.random_rufin(&request) {
             return;
         }
         if self.random_plex(&request) {
             return;
         }
-        if let (Some(active), Some(selected)) = (
-            self.active(),
-            self.source_owner()
-                .and_then(|source| source.current_session()),
-        ) {
-            let _ = crate::radio::play_random(
-                self.runtime.clone(),
-                selected.downgrade(),
-                active.playback,
-                request,
-            );
-        }
+        self.send(Command::Random(request));
     }
-    fn play_radio(&self, request: RadioPlayRequest) {
+    pub fn play_radio(&self, request: RadioPlayRequest) {
         if self.radio_rufin(&request) {
             return;
         }
         if self.radio_plex(&request) {
             return;
         }
-        if let Some(active) = self.active() {
-            let _ = crate::radio::play_radio(
-                self.runtime.clone(),
-                self.database.clone(),
-                self.source
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .clone(),
-                active.playback,
-                request,
-            );
-        }
+        self.send(Command::Radio(request));
     }
 }
 
-impl TransportCommandPort for PlaybackOwner {
-    fn play_pause(&self) {
-        self.send(SessionCommand::PlayPause)
+#[cfg_attr(feature = "bindings", uniffi::export)]
+impl PlaybackOwner {
+    pub fn play_pause(&self) {
+        self.send(Command::PlayPause)
     }
-    fn play(&self) {
-        self.send(SessionCommand::Play)
+    pub fn play(&self) {
+        self.send(Command::Play)
     }
-    fn pause(&self) {
-        self.send(SessionCommand::Pause)
+    pub fn pause(&self) {
+        self.send(Command::Pause)
     }
-    fn stop(&self) {
-        self.send(SessionCommand::Stop)
+    pub fn stop(&self) {
+        self.send(Command::Stop)
     }
-    fn next(&self) {
-        self.send(SessionCommand::Next)
+    pub fn next(&self) {
+        self.send(Command::Next)
     }
-    fn previous(&self) {
-        self.send(SessionCommand::Previous)
+    pub fn previous(&self) {
+        self.send(Command::Previous)
     }
-    fn seek_seconds(&self, seconds: u32) {
+    pub fn seek_seconds(&self, seconds: u32) {
         self.seek_millis(u64::from(seconds) * 1000)
     }
-    fn seek_millis(&self, millis: u64) {
-        self.send(SessionCommand::Seek(millis))
+    pub fn seek_millis(&self, millis: u64) {
+        self.send(Command::Seek(millis))
     }
-    fn set_volume(&self, volume: f64) {
-        self.send(SessionCommand::SetVolume(volume))
+    pub fn set_volume(&self, volume: f64) {
+        self.send(Command::SetVolume(volume))
     }
-    fn persist_volume(&self, volume: f64) {
-        self.send(SessionCommand::PersistVolume(volume))
+    pub fn persist_volume(&self, volume: f64) {
+        self.send(Command::PersistVolume(volume))
     }
-    fn set_muted(&self, muted: bool) {
-        self.send(SessionCommand::SetMuted(muted))
+    pub fn set_muted(&self, muted: bool) {
+        self.send(Command::SetMuted(muted))
     }
-    fn set_shuffle(&self, enabled: bool) {
+    pub fn set_shuffle(&self, enabled: bool) {
         let _ = self.settings.update(|stored| {
             stored.ui.shuffle_enabled = enabled;
             Ok(())
         });
-        self.send(SessionCommand::SetShuffle {
+        self.send(Command::SetShuffle {
             enabled,
             seed: random_u64(),
         })
     }
-    fn cycle_repeat(&self) {
+    pub fn cycle_repeat(&self) {
         if self
             .rufin
             .lock()
@@ -1064,18 +947,18 @@ impl TransportCommandPort for PlaybackOwner {
             stored.ui.repeat_mode = next_repeat(stored.ui.repeat_mode);
             Ok(stored.ui.repeat_mode)
         }) {
-            Ok(repeat) => self.send(SessionCommand::SetRepeat(repeat)),
+            Ok(repeat) => self.send(Command::SetRepeat(repeat)),
             Err(_) => self.set_repeat(RepeatMode::Off),
         }
     }
-    fn set_repeat(&self, repeat: RepeatMode) {
+    pub fn set_repeat(&self, repeat: RepeatMode) {
         let _ = self.settings.update(|stored| {
             stored.ui.repeat_mode = repeat;
             Ok(())
         });
-        self.send(SessionCommand::SetRepeat(repeat))
+        self.send(Command::SetRepeat(repeat))
     }
-    fn toggle_auto_dj(&self) {
+    pub fn toggle_auto_dj(&self) {
         if self
             .rufin
             .lock()
@@ -1092,32 +975,39 @@ impl TransportCommandPort for PlaybackOwner {
                 stored.ui.auto_dj_enabled = !stored.ui.auto_dj_enabled;
                 Ok((
                     stored.ui.auto_dj_enabled,
-                    stored.ui.auto_dj_refill_threshold,
+                    stored.ui.application.auto_dj_refill_threshold,
                 ))
             })
             .unwrap_or((false, 1));
-        self.send(SessionCommand::SetAutoDj {
+        self.send(Command::SetAutoDj {
             enabled: value,
             refill_threshold: usize::from(threshold),
         })
     }
-    fn set_visualizer_enabled(&self, enabled: bool) {
-        self.send(SessionCommand::SetVisualizerEnabled(enabled))
+    pub fn set_visualizer_enabled(&self, enabled: bool) {
+        if let Some(active) = self.active() {
+            active.downgrade().post(move |player, sample| {
+                let _ = player.handle_command(Command::SetVisualizerEnabled(enabled), sample);
+            });
+        }
     }
-    fn available_audio_outputs(&self) -> Vec<playback::AudioOutput> {
+}
+
+impl PlaybackOwner {
+    pub fn available_audio_outputs(&self) -> Vec<playback::AudioOutput> {
         (self.audio_outputs)()
     }
-    fn available_cast_networks(&self) -> Vec<playback::CastNetwork> {
+    pub fn available_cast_networks(&self) -> Vec<playback::CastNetwork> {
         self.cast.available_networks().unwrap_or_default()
     }
-    fn playback_output(&self) -> playback::PlaybackOutput {
+    pub fn playback_output(&self) -> playback::PlaybackOutput {
         self.output
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .selected
             .clone()
     }
-    fn discover_remote_outputs(&self) -> Result<Vec<playback::RemoteOutput>, String> {
+    pub fn discover_remote_outputs(&self) -> Result<Vec<playback::RemoteOutput>, String> {
         let mut outputs = self.cast.discover().unwrap_or_else(|error| {
             debug!(%error, "generic receiver discovery unavailable");
             Vec::new()
@@ -1132,14 +1022,14 @@ impl TransportCommandPort for PlaybackOwner {
         }
         Ok(outputs)
     }
-    fn select_playback_output(
+    pub fn select_playback_output(
         &self,
         output: playback::PlaybackOutput,
         cancelled: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<(), String> {
         self.select_output(output, cancelled)
     }
-    fn shutdown(&self) {
+    pub fn shutdown(&self) {
         if let Some(receiver) = self.rufin.lock().unwrap_or_else(|p| p.into_inner()).take() {
             receiver.cancel();
         }
@@ -1156,7 +1046,7 @@ impl TransportCommandPort for PlaybackOwner {
             let _ = backend.shutdown();
         }
         if let Some(active) = self.active() {
-            let _ = active.playback.shutdown();
+            let _ = active.shutdown();
         }
         let (reply, done) = std::sync::mpsc::sync_channel(0);
         if self
@@ -1174,7 +1064,7 @@ pub(crate) async fn prepare_stream<F>(
     database: &Database,
     request: StreamRequest,
     local: Option<&sources::SourceConfiguration>,
-    file_transfer: Option<(&crate::connect::ConnectOwner, &playback::QueueOccurrence)>,
+    file_transfer: Option<(&crate::connect::ConnectOwner, &playback::QueueRow)>,
     source: impl FnOnce(sources::SourceId) -> F + Send,
 ) -> Result<playback::ResolvedStream, String>
 where
@@ -1213,16 +1103,13 @@ where
     {
         let received_document = url::Url::parse(file_uri)
             .is_ok_and(|uri| uri.scheme() == "content")
-            && database
-                .connect_received_occurrence(&occurrence.occurrence)
-                .await
-                .map_err(string_error)?;
+            && occurrence.received_from_connect;
         if received_document {
             access = None;
         }
         let remote = received_document
             || database
-                .file_media_is_remote(&request.media_uri, &occurrence.occurrence)
+                .file_media_is_remote(&request.media_uri, occurrence.received_from_connect)
                 .await
                 .map_err(string_error)?;
         let local_access = match access.as_ref() {
@@ -1260,18 +1147,31 @@ where
     }
     // Downloads names its owned file using the actual transcoded extension.
     // Mapped and original files still use their parsed source format.
-    let content_type = access
-        .as_ref()
-        .filter(|(_, origin)| *origin == library::LocalAccessOrigin::Download)
-        .and_then(|(uri, _)| library::file_media_path(uri))
-        .and_then(|path| {
+    let content_type = if let Some((uri, library::LocalAccessOrigin::Download)) = &access {
+        let path = if uri.starts_with("content:") {
+            let uri = uri.clone();
+            Some(
+                tokio::task::spawn_blocking(move || sources::stat_document(&uri))
+                    .await
+                    .map_err(string_error)?
+                    .map_err(string_error)?
+                    .name
+                    .into(),
+            )
+        } else {
+            library::file_media_path(uri)
+        };
+        path.and_then(|path: std::path::PathBuf| {
             path.extension()
                 .and_then(|extension| extension.to_str())
                 .and_then(audio_mime)
-        });
+        })
+    } else {
+        None
+    };
     let access_uri = access.map(|(uri, _)| uri).or(fetched_uri);
     let window = database
-        .connect_media_window(&request.media_uri)
+        .playback_window(&request.media_uri)
         .await
         .map_err(string_error)?;
     if let Some((start, end)) = window.filter(|_| access_uri.is_some() || cue.is_some()) {
@@ -1321,24 +1221,47 @@ async fn direct_stream(uri: String) -> Result<playback::ResolvedStream, String> 
     }
 }
 
+async fn cached_loudness(
+    database: &Database,
+    uri: &str,
+    mode: playback::LoudnessNormalization,
+) -> Option<playback::TrackLoudness> {
+    if mode == playback::LoudnessNormalization::Off {
+        return None;
+    }
+    let (track, album) = database
+        .playback_loudness(uri, &ReadCancellation::new())
+        .await
+        .unwrap_or_default();
+    Some(playback::TrackLoudness {
+        track: track.map(Box::new),
+        album: album.map(Box::new),
+    })
+}
+
 fn prepare_media_stream(
     stream: playback::ResolvedStream,
-    loudness: playback::TrackLoudness,
-    occurrence: Arc<playback::QueueOccurrence>,
+    loudness: Option<playback::TrackLoudness>,
+    occurrence: Arc<playback::QueueRow>,
 ) -> PreparedStream {
-    let content_type = occurrence.source_format.as_deref().and_then(audio_mime);
-    PreparedStream::new(stream, loudness).with_occurrence(occurrence, content_type)
+    let content_type = occurrence
+        .track
+        .metadata
+        .source_format
+        .as_deref()
+        .and_then(audio_mime);
+    PreparedStream::new(stream, loudness).with_row(occurrence, content_type)
 }
 
 fn cached_cast_artwork(
     artwork: &artwork::Artwork,
     settings: &SettingsFile,
-    media: &playback::QueueItem,
+    binding: Option<&[u8]>,
 ) -> Option<std::path::PathBuf> {
     let stored = settings.load();
-    let binding = artwork::ArtworkBinding::opaque(media.artwork_binding.as_deref()?);
+    let binding = artwork::ArtworkBinding::opaque(binding?);
     let external = artwork::ExternalPolicy::new(
-        stored.ui.external_metadata_enabled,
+        stored.ui.application.external_metadata_enabled,
         stored.ui.allows_external_metadata_lookup(),
         stored.ui.lastfm_api_key,
     );
@@ -1349,7 +1272,7 @@ fn cached_cast_artwork(
     })
 }
 
-fn audio_mime(source_format: &str) -> Option<String> {
+pub(crate) fn audio_mime(source_format: &str) -> Option<String> {
     let mime = match source_format.trim().to_ascii_lowercase().as_str() {
         "mp3" | "mp2" | "mpeg" => "audio/mpeg",
         "flac" => "audio/flac",
@@ -1391,8 +1314,8 @@ fn local_calendar_period(unix_seconds: i64) -> String {
         .map(|period| period.to_string())
         .unwrap_or_else(|_| "1970-01".to_string())
 }
-fn empty_clock_sample() -> playback::ClockSample {
-    playback::ClockSample {
+fn empty_clock_sample() -> ClockSample {
+    ClockSample {
         monotonic_millis: 0,
         unix_seconds: 0,
         local_period: "1970-01".to_string(),
@@ -1409,40 +1332,57 @@ fn string_error(error: impl std::fmt::Display) -> String {
 mod tests {
     use super::{external_source_reporting_enabled, prepare_media_stream};
 
-    fn test_media(source_format: &str) -> playback::QueueItem {
-        playback::QueueItem {
+    fn test_media(source_format: &str) -> playback::TrackReference {
+        playback::TrackReference {
             media_uri: library::source_entity_uri(
                 &library::SourceId::new("source"),
                 "track",
                 "track",
             ),
-            title: "Track".to_string(),
-            artist: "Artist".to_string(),
-            album: "Album".to_string(),
-            album_display_artist: None,
             artwork_binding: None,
-            duration_millis: 180_000,
-            disc_number: None,
-            track_number: None,
-            year: None,
-            release_date: None,
-            source_format: Some(source_format.to_string()),
-            musicbrainz_recording_id: None,
-            musicbrainz_release_track_id: None,
-            musicbrainz_album_id: None,
-            musicbrainz_release_group_id: None,
-            primary_artist_musicbrainz_id: None,
+            metadata: library::TrackMetadata {
+                audio_properties: Default::default(),
+                title: "Track".to_string(),
+                artist: "Artist".to_string(),
+                album: "Album".to_string(),
+                album_display_artist: None,
+                duration_millis: 180_000,
+                disc_number: 0,
+                track_number: 0,
+                year: None,
+                release_date: None,
+                source_format: Some(source_format.to_string()),
+                musicbrainz_recording_id: None,
+                musicbrainz_release_track_id: None,
+                musicbrainz_album_id: None,
+                musicbrainz_release_group_id: None,
+                primary_artist_musicbrainz_id: None,
+                ..Default::default()
+            },
         }
     }
 
-    fn test_occurrence(source_format: &str) -> playback::QueueOccurrence {
-        playback::QueueOccurrence {
-            occurrence: playback::OccurrenceId::new("test-occurrence"),
-            item: test_media(source_format),
-            canonical_position: 0,
-            source_index: None,
-            playlist_entry_id: None,
+    fn test_occurrence(source_format: &str) -> playback::QueueRow {
+        playback::QueueRow {
+            occurrence_id: None,
+            position: 0,
+            received_from_connect: false,
             provenance: playback::Provenance::Manual,
+            track: {
+                let reference = test_media(source_format);
+                library::TrackView {
+                    track_key: library::TrackKey::from_raw(1),
+                    source_key: None,
+                    source_id: None,
+                    object_id: None,
+                    media_uri: reference.media_uri,
+                    metadata: reference.metadata,
+                    artwork_binding: reference.artwork_binding,
+                    state: Default::default(),
+                    access: Default::default(),
+                    links: Default::default(),
+                }
+            },
         }
     }
 
@@ -1456,7 +1396,7 @@ mod tests {
     fn prepared_original_stream_keeps_cast_format() {
         let prepared = prepare_media_stream(
             playback::ResolvedStream::new("https://provider.example/stream?id=track"),
-            playback::TrackLoudness::default(),
+            Some(playback::TrackLoudness::default()),
             test_occurrence("flac").into(),
         );
 
@@ -1468,7 +1408,7 @@ mod tests {
         let prepared = prepare_media_stream(
             playback::ResolvedStream::new("https://provider.example/stream?id=track")
                 .with_content_type(Some("audio/mpeg".to_string())),
-            playback::TrackLoudness::default(),
+            Some(playback::TrackLoudness::default()),
             test_occurrence("flac").into(),
         );
 
@@ -1486,10 +1426,10 @@ mod tests {
         std::fs::write(&path, b"downloaded audio").unwrap();
         let uri = url::Url::from_file_path(&path).unwrap().to_string();
         database
-            .upsert_local_access(
+            .write_local_access(
                 None,
-                &library::LocalAccessWrite {
-                    media_uri: occurrence.media_uri.clone(),
+                &[&library::LocalAccessWrite {
+                    media_uri: occurrence.track.media_uri.clone(),
                     origin: library::LocalAccessOrigin::Download,
                     path: path.to_string_lossy().into_owned(),
                     root: folder.path().to_string_lossy().into_owned(),
@@ -1507,14 +1447,14 @@ mod tests {
                     duration_millis: 180_000,
                     access_uri: uri.clone(),
                     loudness_analysis_key: None,
-                },
+                }],
             )
             .await
             .unwrap();
         let stream = super::prepare_stream(
             &database,
             playback::StreamRequest::new(
-                occurrence.media_uri.clone(),
+                occurrence.track.media_uri.clone(),
                 playback::StreamQuality::Original,
             ),
             None,
@@ -1523,14 +1463,110 @@ mod tests {
         )
         .await
         .unwrap();
-        let canonical = occurrence.media_uri.clone();
+        let canonical = occurrence.track.media_uri.clone();
         let prepared = prepare_media_stream(
             stream,
-            playback::TrackLoudness::default(),
+            Some(playback::TrackLoudness::default()),
             occurrence.into(),
         );
         assert_eq!(prepared.uri(), uri);
         assert_eq!(prepared.content_type.as_deref(), Some("audio/ogg"));
-        assert_eq!(prepared.occurrence.as_ref().unwrap().media_uri, canonical);
+        assert_eq!(prepared.row.as_ref().unwrap().track.media_uri, canonical);
+    }
+}
+
+#[cfg_attr(feature = "bindings", derive(uniffi::Error))]
+#[cfg_attr(feature = "bindings", uniffi(flat_error))]
+#[derive(Debug, thiserror::Error)]
+pub enum PlaybackError {
+    #[error("{0}")]
+    Message(String),
+}
+
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
+pub struct PreparedQueuePage {
+    pub revision: u64,
+    pub rows: Vec<Arc<library::QueueRow>>,
+    pub total: u64,
+    pub window_offset: u64,
+}
+
+#[cfg_attr(feature = "bindings", uniffi::export)]
+impl PlaybackOwner {
+    pub async fn selection(self: Arc<Self>) -> Result<Arc<library::TrackSelection>, PlaybackError> {
+        let runtime = self.runtime.clone();
+        runtime
+            .spawn_blocking(move || {
+                let queue = self.snapshot().map_err(PlaybackError::Message)?;
+                Ok(Arc::new(
+                    library::CatalogQuery::keys(
+                        library::CatalogKind::Track,
+                        None,
+                        queue
+                            .order
+                            .iter()
+                            .map(|index| queue.entries[*index as usize].track_key)
+                            .map(|key| key.raw())
+                            .collect(),
+                    )
+                    .selection(),
+                ))
+            })
+            .await
+            .map_err(|error| PlaybackError::Message(error.to_string()))?
+    }
+
+    pub async fn queue_page(
+        self: Arc<Self>,
+        offset: u64,
+        limit: u32,
+        filter: String,
+    ) -> Result<PreparedQueuePage, PlaybackError> {
+        let runtime = self.runtime.clone();
+        tokio_util::task::AbortOnDropHandle::new(runtime.spawn(async move {
+            let revision = self.updates.current().map_or(0, |view| view.queue.revision);
+            let page = self
+                .receiver_queue_page(offset, limit, filter)
+                .await
+                .map_err(PlaybackError::Message)?;
+            Ok(PreparedQueuePage {
+                revision,
+                rows: page.rows,
+                total: page.total,
+                window_offset: page.window_offset,
+            })
+        }))
+        .await
+        .map_err(|error| PlaybackError::Message(error.to_string()))?
+    }
+
+    pub async fn remote_outputs(
+        self: Arc<Self>,
+    ) -> Result<Vec<playback::RemoteOutput>, PlaybackError> {
+        let runtime = self.runtime.clone();
+        runtime
+            .spawn_blocking(move || {
+                self.discover_remote_outputs()
+                    .map_err(PlaybackError::Message)
+            })
+            .await
+            .map_err(|error| PlaybackError::Message(error.to_string()))?
+    }
+
+    pub async fn choose_output(
+        self: Arc<Self>,
+        output: playback::PlaybackOutput,
+    ) -> Result<(), PlaybackError> {
+        let runtime = self.runtime.clone();
+        runtime
+            .spawn_blocking(move || {
+                self.select_playback_output(
+                    output,
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                )
+                .map_err(PlaybackError::Message)
+            })
+            .await
+            .map_err(|error| PlaybackError::Message(error.to_string()))?
     }
 }

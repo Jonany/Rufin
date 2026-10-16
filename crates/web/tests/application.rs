@@ -40,7 +40,7 @@ fn controller_http_api_and_browser_share_application_operations() {
             )))
             .unwrap()
             .unwrap();
-        inputs.products.playback.transport.set_muted(true);
+        inputs.products.playback.set_muted(true);
         let mut playback = inputs.products.playback.updates.subscribe();
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -64,7 +64,7 @@ fn controller_http_api_and_browser_share_application_operations() {
         ));
         inputs.receivers.visualizer.close();
         drop(inputs.receivers);
-        inputs.products.playback.transport.shutdown();
+        inputs.products.playback.shutdown();
     })
     .unwrap();
 }
@@ -75,9 +75,7 @@ async fn exercise_desktop_controller(inputs: &rufin_core::runtime::RuntimeInputs
         .products
         .source
         .change_secret_storage(secrets::SecretStorageMode::ConfigFile)
-        .recv()
         .await
-        .unwrap()
         .unwrap();
     let controller = Controller::new(inputs.products.clone());
     let mut status = controller.status();
@@ -169,7 +167,7 @@ async fn exercise_desktop_controller(inputs: &rufin_core::runtime::RuntimeInputs
         .await
         .unwrap();
     assert!(connected.chunk().await.unwrap().is_some());
-    let regenerated = controller.regenerate_token().await.unwrap().unwrap();
+    let regenerated = controller.token(true).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while let Ok(Some(_)) = connected.chunk().await {}
     })
@@ -227,7 +225,7 @@ async fn exercise_desktop_controller(inputs: &rufin_core::runtime::RuntimeInputs
     );
     let mut playback = inputs.products.playback.updates.subscribe();
     for muted in [false, true] {
-        inputs.products.playback.transport.set_muted(muted);
+        inputs.products.playback.set_muted(muted);
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if playback
@@ -489,10 +487,6 @@ async fn exercise_http_api(
         .unwrap();
     assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
     assert_eq!(
-        api(reqwest::Method::GET, "sources/progress", Value::Null).await["state"],
-        "failed"
-    );
-    assert_eq!(
         api(
             reqwest::Method::POST,
             "sources/refresh",
@@ -500,10 +494,6 @@ async fn exercise_http_api(
         )
         .await["refreshed"],
         true
-    );
-    assert_eq!(
-        api(reqwest::Method::GET, "sources/progress", Value::Null).await["state"],
-        "idle"
     );
     let response: Value = client
         .get(format!("{base}/tracks"))
@@ -558,11 +548,11 @@ async fn exercise_http_api(
     let limited = api(reqwest::Method::GET, "queue?limit=1", Value::Null).await;
     assert_eq!(limited["total"], 2);
     assert_eq!(limited["window"].as_array().unwrap().len(), 1);
-    let moved = queue["window"][0]["id"].clone();
+    let moved = queue["window"][0]["position"].clone();
     api(
         reqwest::Method::POST,
         "queue/reorder",
-        json!({"ids":[moved],"before":null}),
+        json!({"positions":[moved],"before":null}),
     )
     .await;
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -583,26 +573,6 @@ async fn exercise_http_api(
     .await["id"]
         .clone();
     assert!(playlist.is_i64());
-    let mut cover_row = products
-        .library
-        .playlist_rows(
-            &[serde_json::from_value(playlist.clone()).unwrap()],
-            &library::ReadCancellation::new(),
-        )
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-    cover_row.artwork_binding = Some(vec![1]);
-    assert_eq!(
-        rufin_core::playlists::playlist_artwork_bindings(&cover_row),
-        &[vec![1]]
-    );
-    cover_row.artwork_binding = None;
-    assert_eq!(
-        rufin_core::playlists::playlist_artwork_bindings(&cover_row),
-        &[] as &[Vec<u8>]
-    );
     let listed = api(reqwest::Method::GET, "playlists", Value::Null).await;
     let row = listed["playlists"]
         .as_array()
@@ -904,7 +874,7 @@ async fn exercise_http_api(
     assert_eq!(metadata["favorite"], true);
     for include_current in [false, true] {
         let mut saved = settings.load();
-        saved.clear_queue_includes_current = include_current;
+        saved.player_display.clear_queue_includes_current = include_current;
         settings.save(&saved).unwrap();
         api(reqwest::Method::DELETE, "queue", Value::Null).await;
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -932,7 +902,7 @@ async fn exercise_http_api(
     let inserted = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let queue = api(reqwest::Method::GET, "queue", Value::Null).await;
-            if queue["total"] == 1 {
+            if queue["total"] == 1 && queue["loading"] == false {
                 break queue;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -940,7 +910,7 @@ async fn exercise_http_api(
     })
     .await
     .unwrap();
-    let anchor = inserted["window"][0]["id"].clone();
+    let anchor = inserted["window"][0]["position"].clone();
     let first_drop = api(reqwest::Method::GET, "playback", Value::Null).await;
     api(
         reqwest::Method::POST,
@@ -951,13 +921,13 @@ async fn exercise_http_api(
     api(
         reqwest::Method::POST,
         "queue",
-        json!({"mode":"insert","uris":[uri],"after":anchor}),
+        json!({"mode":"insert","uris":[uri],"after":anchor.as_u64().unwrap()+1}),
     )
     .await;
     let inserted = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let queue = api(reqwest::Method::GET, "queue", Value::Null).await;
-            if queue["total"] == 3 {
+            if queue["total"] == 3 && queue["loading"] == false {
                 break queue;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -974,7 +944,19 @@ async fn exercise_http_api(
     assert_eq!(uris, vec![json!(items[1]), json!(items[0]), json!(uri)]);
     let after_drop = api(reqwest::Method::GET, "playback", Value::Null).await;
     assert_eq!(after_drop["state"], previous_playback["state"]);
-    assert_eq!(after_drop["current"], first_drop["current"]);
+    assert!(
+        !products
+            .playback
+            .updates
+            .current()
+            .unwrap()
+            .transport
+            .desired_playing
+    );
+    assert!(after_drop["current"]["run"].is_null());
+    let mut expected_current = first_drop["current"].clone();
+    expected_current["position"] = json!(1);
+    assert_eq!(after_drop["current"], expected_current);
 
     exercise_browser(&format!("http://{address}"), token, &sources[1], uri).await;
     exercise_browser_restart(products.clone()).await;
@@ -999,7 +981,7 @@ async fn exercise_http_api(
         .await
         .unwrap();
     assert!(!playback_event(&mut stopped_http).await.is_null());
-    let transport = products.playback.transport.clone();
+    let transport = products.playback.clone();
     tokio::task::spawn_blocking(move || transport.shutdown())
         .await
         .unwrap();
@@ -1278,12 +1260,12 @@ async fn exercise_browser(origin: &str, token: &str, source: &str, uri: &str) {
         .json()
         .await
         .unwrap();
-    let id = queue["window"][0]["id"].as_str().unwrap();
+    let position = queue["window"][0]["position"].as_u64().unwrap();
     for (route, payload) in [
-        ("activate", json!({"id":id})),
-        ("next", json!({"id":id})),
-        ("reorder", json!({"ids":[id]})),
-        ("item", json!({"id":id})),
+        ("activate", json!({"position":position})),
+        ("next", json!({"position":position})),
+        ("reorder", json!({"positions":[position]})),
+        ("item", json!({"position":position})),
         ("clear", json!({})),
     ] {
         let response = client

@@ -1,10 +1,11 @@
-//! Concrete music sources behind one source-agnostic application boundary.
+//! Native music providers and file access.
 //!
 //! Providers own authentication, HTTP or filesystem work, paging, wire
-//! translation, and preparation of invisible Library candidates. Rufin owns
-//! source lifecycle, artwork preparation, and candidate acceptance. Local
-//! preparation reads one selected Library's accepted baselines; only Library
-//! can accept and persist the resulting replacement.
+//! translation, and bounded Library updates. Rufin owns source lifecycle,
+//! artwork preparation, and publication of committed catalog changes.
+
+#[cfg(feature = "bindings")]
+uniffi::setup_scaffolding!();
 
 #[cfg(test)]
 extern crate self as sources;
@@ -33,9 +34,8 @@ mod local_change_integration_tests {
 }
 
 pub use config::{
-    CredentialHostInput, CredentialHostPreset, CredentialSettingsInput, EditableSource,
-    JellyfinEmbySettingsInput, JellyfinEmbySetupInput, LocalFolderHostInput, PlexSettingsInput,
-    PlexSetupInput, SourceConfiguration, SourceSettingsInput, SourceSetupInput,
+    CredentialInput, CredentialPreset, EditableSource, PlexSettingsInput, PlexSetupInput,
+    SourceConfiguration, SourceSettingsChange, SourceSetup,
 };
 pub use file::discovery::DiscoveryWorker;
 pub use file::discovery::run_worker as run_discovery_worker;
@@ -48,14 +48,19 @@ pub use file::documents::{
     list_documents, open_document_input, rename_document, resolve_document_relative,
     resolve_document_stream, save_document, stat_document,
 };
-pub use file::documents::{read_document_prefix, read_document_queue_item};
-pub use file::local::media::read_local_queue_item;
+pub use file::documents::{
+    read_document_image, read_document_prefix, read_document_track_reference,
+};
+pub use file::local::media::{local_media_identity_path, read_local_track_reference};
 pub use file::metadata::read_embedded_lyrics;
-pub use file::playlist::{playlist_file_is_non_audio, playlist_file_revision};
+pub use file::playlist::{
+    import_local_playlist_file, playlist_file_is_non_audio, playlist_file_revision,
+};
 pub use file::remote::smb::list_smb_shares;
 pub use file::remote::webdav::nextcloud::authorize_nextcloud;
 pub use file::remote::{
-    FileAuthentication, FileCredentials, FileCredentialsEdit, FileSourceSettings,
+    FileAuthentication, FileCredentials, FileCredentialsEdit, FileHeader, FileSource,
+    FileSourceSettings,
 };
 pub use jellyfin_emby::{
     EmbyConnectLogin, EmbyConnectPin, EmbyConnectServer, JellyfinQuickConnect,
@@ -63,12 +68,9 @@ pub use jellyfin_emby::{
 };
 pub use library::SourceId;
 pub use operations::{
-    AlbumMetadata, AlbumMetadataEdit, AlbumMetadataMixed, AlbumMetadataValues,
-    AlbumMetadataWritable, ArtistMetadata, ArtistMetadataEdit, ArtistMetadataMixed,
-    ArtistMetadataValues, ArtistMetadataWritable, ArtworkChange, ArtworkEdit, ArtworkEditing,
-    ArtworkStorage, ImageBytes, MetadataChanges, MetadataEdit, MetadataField, MetadataFieldKind,
-    SourceMetadataError, TrackMetadata, TrackMetadataEdit, TrackMetadataValues,
-    TrackMetadataWritable,
+    ArtworkChange, ArtworkEdit, ArtworkEditing, ArtworkStorage, ImageBytes, MetadataChanges,
+    MetadataDraft, MetadataEdit, MetadataField, MetadataFieldKind, SourceMetadataError,
+    artwork_file, finish_metadata_save,
 };
 pub use source::*;
 
@@ -84,12 +86,9 @@ pub use subsonic::{SubsonicAuthentication, SubsonicFlavor};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Error))]
+#[cfg_attr(feature = "bindings", uniffi(flat_error))]
 pub enum SourceError {
-    #[error("{error}")]
-    IncompleteScan {
-        outcome: library::ScanOutcome,
-        error: Box<SourceError>,
-    },
     #[error(transparent)]
     Library(#[from] library::LibraryError),
     #[error(transparent)]

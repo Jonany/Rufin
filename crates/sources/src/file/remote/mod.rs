@@ -14,11 +14,11 @@ pub(crate) mod artwork;
 pub(crate) mod changes;
 mod cue;
 pub(crate) mod input;
-mod metadata;
+pub(crate) mod metadata;
 mod playlist;
 mod profile_file;
 pub(crate) mod reader;
-mod scan;
+pub(crate) mod scan;
 pub(crate) mod smb;
 #[cfg(test)]
 mod tests;
@@ -26,17 +26,38 @@ pub(crate) mod webdav;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum FileAuthentication {
     Password,
     Anonymous,
     Bearer,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
+#[serde(from = "(String, String)", into = "(String, String)")]
+pub struct FileHeader {
+    pub name: String,
+    pub value: String,
+}
+
+impl From<(String, String)> for FileHeader {
+    fn from((name, value): (String, String)) -> Self {
+        Self { name, value }
+    }
+}
+impl From<FileHeader> for (String, String) {
+    fn from(header: FileHeader) -> Self {
+        (header.name, header.value)
+    }
+}
+
 /// Header values and the password/token belong in the existing credential store.
 #[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct FileCredentials {
     pub secret: String,
-    pub headers: Vec<(String, String)>,
+    pub headers: Vec<FileHeader>,
 }
 
 impl std::fmt::Debug for FileCredentials {
@@ -48,9 +69,10 @@ impl std::fmt::Debug for FileCredentials {
 }
 
 #[derive(Clone, Default, Eq, PartialEq, serde::Deserialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct FileCredentialsEdit {
     pub secret: Option<String>,
-    pub headers: Option<Vec<(String, String)>>,
+    pub headers: Option<Vec<FileHeader>>,
 }
 
 impl std::fmt::Debug for FileCredentialsEdit {
@@ -125,6 +147,7 @@ pub(crate) async fn edit(
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct FileSourceSettings {
     pub url: String,
     pub alternate_urls: Vec<String>,
@@ -188,7 +211,9 @@ pub(crate) fn detail_folder_uri(
     Ok(url.into())
 }
 
-pub(crate) struct FileSource {
+const DIRECTORY_VERSION: i64 = 8;
+
+pub struct FileSource {
     source_id: SourceId,
     kind: String,
     name: String,
@@ -288,7 +313,7 @@ impl FileSource {
         source
     }
 
-    pub(crate) fn document_profile(root: crate::DocumentRoot) -> Self {
+    pub fn document_profile(root: crate::DocumentRoot) -> Self {
         let namespace_url = format!("rufin-document://{}/", root.id);
         Self {
             source_id: SourceId::new(root.id.clone()),
@@ -298,7 +323,7 @@ impl FileSource {
             backend: FileBackend::Documents(Arc::new(crate::file::documents::DocumentAccess::new(
                 root,
             ))),
-            directory_version: scan::PARSER_VERSION,
+            directory_version: DIRECTORY_VERSION,
             input: Mutex::new(None),
         }
     }
@@ -370,11 +395,11 @@ impl FileSource {
             .collect();
         let payload: Payload = crate::config::decode_provider_payload(configuration)?;
         let directory_version = if settings.excluded_folders.is_empty() {
-            scan::PARSER_VERSION
+            DIRECTORY_VERSION
         } else {
             // A directory listing depends on both the reader and the excluded paths.
             let mut hash = blake3::Hasher::new();
-            hash.update(&scan::PARSER_VERSION.to_le_bytes());
+            hash.update(&DIRECTORY_VERSION.to_le_bytes());
             for folder in &settings.excluded_folders {
                 hash.update(&(folder.len() as u64).to_le_bytes());
                 hash.update(folder.as_bytes());
@@ -558,7 +583,7 @@ impl FileSource {
             })
     }
 
-    pub(super) fn location(&self, relative: &str) -> SourceResult<String> {
+    pub(crate) fn location(&self, relative: &str) -> SourceResult<String> {
         let (relative, document) = if self.document_access().is_some() {
             crate::file::documents::relative_parts(relative)
         } else {
@@ -608,7 +633,7 @@ impl FileSource {
         )
     }
 
-    fn input_path(&self, input: &FileInput, relative: &str) -> SourceResult<String> {
+    pub(crate) fn input_path(&self, input: &FileInput, relative: &str) -> SourceResult<String> {
         match input {
             FileInput::Smb(_) | FileInput::Documents(_) => Ok(relative.into()),
             FileInput::WebDav(client) => {
@@ -716,6 +741,7 @@ impl FileSource {
                 source_id,
                 path,
                 revision,
+                ..
             }
             | crate::LocalImageRef::Embedded {
                 source_id,
@@ -735,14 +761,17 @@ impl FileSource {
                 content_type: crate::file::artwork::content_type(std::path::Path::new(&relative)),
             }),
             crate::LocalImageRef::Embedded { picture_index, .. } => {
-                let stream = input
-                    .playback_stream(&self.input_path(input.input(), &relative)?, revision, path)
-                    .await?;
-                let uri = stream.uri().to_string();
-                let mut reader = crate::file::remote::reader::FileReader::open(stream).await?;
+                let mut reader = crate::file::remote::reader::FileReader::open(
+                    &input,
+                    &self.input_path(input.input(), &relative)?,
+                    revision,
+                    path,
+                )
+                .await?;
+                let uri = reader.uri().to_owned();
                 tokio::task::spawn_blocking(move || {
                     crate::file::artwork::read_image_input(
-                        &mut crate::file::discovery::Reader::network(),
+                        &mut crate::file::discovery::Reader::default(),
                         &mut reader,
                         &uri,
                         picture_index,

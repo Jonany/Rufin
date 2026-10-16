@@ -129,11 +129,6 @@ msgid ""
 msgstr ""
 
 msgid ""
-"Rufin started with fresh user state because the saved database could not be "
-"used. Your settings and saved logins are unchanged."
-msgstr ""
-
-msgid ""
 "Rufin will calculate the missing EBU R128 metadata for the whole library. "
 "This can use significant CPU, battery, and network bandwidth for a long time."
 msgstr ""
@@ -463,6 +458,9 @@ msgstr ""
 msgid "Artists"
 msgstr ""
 
+msgid "Artwork cache cleared"
+msgstr ""
+
 msgid "Artwork editing is no longer available"
 msgstr ""
 
@@ -679,7 +677,13 @@ msgstr ""
 msgid "Clear artist"
 msgstr ""
 
+msgid "Clear artwork cache"
+msgstr ""
+
 msgid "Clear fetched lyrics for this track"
+msgstr ""
+
+msgid "Clear lyrics cache"
 msgstr ""
 
 msgid "Clear queue"
@@ -891,6 +895,9 @@ msgstr ""
 msgid "Could not load listening overview"
 msgstr ""
 
+msgid "Could not load page"
+msgstr ""
+
 msgid "Could not load related tracks"
 msgstr ""
 
@@ -1053,6 +1060,9 @@ msgstr ""
 msgid "Device name"
 msgstr ""
 
+msgid "Device"
+msgstr ""
+
 msgid "Diagnostic log saved"
 msgstr ""
 
@@ -1129,6 +1139,12 @@ msgstr ""
 msgid "Download Queue"
 msgstr ""
 
+msgid "Download artwork"
+msgstr ""
+
+msgid "Download lyrics"
+msgstr ""
+
 msgid "Download quality"
 msgstr ""
 
@@ -1145,6 +1161,14 @@ msgid "Downloaded"
 msgstr ""
 
 msgid "Downloading Japanese dictionary..."
+msgstr ""
+
+#, rust-format
+msgid "Downloading artwork... {count} checked"
+msgstr ""
+
+#, rust-format
+msgid "Downloading lyrics... {count} checked"
 msgstr ""
 
 msgid "Downloading"
@@ -1772,9 +1796,6 @@ msgstr ""
 msgid "Local file access is required before these tags can be saved."
 msgstr ""
 
-msgid "Local file mapping is no longer available"
-msgstr ""
-
 #, rust-format
 msgid "Local file mapping: {matched} of {total} server path matches"
 msgid_plural "Local file mapping: {matched} of {total} server paths match"
@@ -1833,6 +1854,9 @@ msgid "Loudness normalization"
 msgstr ""
 
 msgid "Lyrics background opacity"
+msgstr ""
+
+msgid "Lyrics cache cleared"
 msgstr ""
 
 msgid "Lyrics loaded"
@@ -2066,6 +2090,9 @@ msgid "New Smart Playlist"
 msgstr ""
 
 msgid "New download rule"
+msgstr ""
+
+msgid "New file"
 msgstr ""
 
 msgid "New release is available"
@@ -3290,6 +3317,9 @@ msgstr ""
 msgid "Sign In with Password"
 msgstr ""
 
+msgid "Sign in to Plex first"
+msgstr ""
+
 msgid "Sign in with Nextcloud"
 msgstr ""
 
@@ -3362,6 +3392,9 @@ msgstr ""
 msgid "Source by position"
 msgstr ""
 
+msgid "Source is no longer available"
+msgstr ""
+
 msgid "Source setup is unavailable"
 msgstr ""
 
@@ -3402,6 +3435,9 @@ msgid "Store calculated loudness in supported Local music files"
 msgstr ""
 
 msgid "Stream quality"
+msgstr ""
+
+msgid "Streaming"
 msgstr ""
 
 msgid "Studio"
@@ -3471,6 +3507,9 @@ msgid "Text"
 msgstr ""
 
 msgid "The API token was not accepted. Please connect again."
+msgstr ""
+
+msgid "The connection no longer exists"
 msgstr ""
 
 msgid "TheAudioDB album ID"

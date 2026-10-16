@@ -1,5 +1,6 @@
 package io.github.screwys.rufin.settings
 
+
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.CircularProgressIndicator
@@ -23,8 +24,8 @@ internal fun LibrarySettingsPage(model: RufinConnection, preferences: Preference
     SettingsPage {
         SourcesPage(model, addSource, editSource, embedded = true)
         SettingsGroup(translate("Downloads")) {
-            SettingsSwitch(translate("Show downloaded badge"), state.optBoolean("show_downloaded_badges")) {
-                preferences.changePreference("show_downloaded_badges", it)
+            SettingsSwitch(translate("Show downloaded badge"), state.showDownloadedBadges) {
+                preferences.changePreference { setShowDownloadedBadges(it) }
             }
         }
     }

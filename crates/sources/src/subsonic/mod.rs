@@ -1,8 +1,8 @@
 use crate::config::{decode_provider_payload, require_payload_version};
-use crate::policy::{raw_item_id, stable_hash, u16_from_option};
+use crate::policy::{raw_item_id, u16_from_option};
 use crate::{
-    ConnectedSource, CredentialHostInput, CredentialSettingsInput, ImageBytes, SourceConfiguration,
-    SourceEditResult, SourceError, SourceResult,
+    ConnectedSource, CredentialInput, ImageBytes, SourceConfiguration, SourceEditResult,
+    SourceError, SourceResult,
 };
 use lyrics::{
     LyricsAgent, LyricsAgentRole, LyricsBundle, LyricsCue, LyricsCueLine, LyricsDocument,
@@ -26,148 +26,18 @@ use item::*;
 
 use crate::{NativeImageRef as ImageRef, SourceId};
 
-type AlbumId = String;
-type ArtistId = String;
-type GenreId = String;
-type MusicFolderId = String;
 type PlaylistId = String;
-type TrackId = String;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ArtistCredit {
-    id: String,
-    name: String,
-    sort_name: Option<String>,
-    musicbrainz_artist_id: Option<String>,
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct GenreCredit {
-    id: String,
-    name: String,
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct MoodCredit {
-    id: String,
-    name: String,
-}
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct AlbumRelations {
-    album_artists: Vec<ArtistCredit>,
-    artists: Vec<ArtistCredit>,
-    genres: Vec<GenreCredit>,
-}
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct TrackRelations {
-    artists: Vec<ArtistCredit>,
-    album_artists: Vec<ArtistCredit>,
-    genres: Vec<GenreCredit>,
-    moods: Vec<MoodCredit>,
-    music_folders: Option<Vec<MusicFolderId>>,
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Album {
-    id: AlbumId,
-    title: String,
-    sort_name: Option<String>,
-    artist: String,
-    year: u16,
-    release_date: Option<String>,
-    date_added: Option<String>,
-    last_played: Option<String>,
-    play_count: Option<u32>,
-    user_rating: Option<u8>,
-    favorite: Option<bool>,
-    color_seed: u32,
-    image_ref: Option<ImageRef>,
-    local_artwork: Option<()>,
-    release_types: Vec<String>,
-    is_compilation: Option<bool>,
-    musicbrainz_album_id: Option<String>,
-    musicbrainz_release_group_id: Option<String>,
-    relations: AlbumRelations,
-}
 #[derive(Clone, Debug, PartialEq)]
-struct Track {
-    audio_properties: library::AudioProperties,
-    id: TrackId,
-    album_id: Option<AlbumId>,
-    title: String,
-    sort_name: Option<String>,
-    artist: String,
-    album: String,
-    year: u16,
-    release_date: Option<String>,
-    date_added: Option<String>,
-    last_played: Option<i64>,
-    play_count: Option<u32>,
-    user_rating: Option<u8>,
-    duration_seconds: u32,
-    favorite: Option<bool>,
-    disc_number: u16,
-    track_number: u16,
-    image_ref: Option<ImageRef>,
-    local_artwork: Option<()>,
-    musicbrainz_recording_id: Option<String>,
-    musicbrainz_release_track_id: Option<String>,
-    source_path: Option<String>,
-    cue: Option<()>,
-    source_format: Option<String>,
-    comment: Option<String>,
-    skip_count: Option<u32>,
-    bpm: Option<u16>,
-    replay_gain_track_db: Option<f64>,
-    replay_gain_track_peak: Option<f64>,
-    replay_gain_album_db: Option<f64>,
-    replay_gain_album_peak: Option<f64>,
-    relations: TrackRelations,
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Artist {
-    id: ArtistId,
-    name: String,
-    sort_name: Option<String>,
-    favorite: Option<bool>,
-    last_played: Option<String>,
-    play_count: Option<u32>,
-    user_rating: Option<u8>,
-    musicbrainz_artist_id: Option<String>,
-    image_ref: Option<ImageRef>,
-    local_artwork: Option<()>,
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Genre {
-    id: GenreId,
-    name: String,
-    image_ref: Option<ImageRef>,
-    local_artwork: Option<()>,
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct MusicFolder {
-    id: MusicFolderId,
-    name: String,
-    image_ref: Option<ImageRef>,
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
 struct Playlist {
-    id: PlaylistId,
-    name: String,
-    duration_seconds: u32,
-    track_count: usize,
-    image_ref: Option<ImageRef>,
+    header: library::PlaylistObservation,
     revision: Option<String>,
     valid_until: Option<i64>,
-    writable: bool,
-    metadata_writable: bool,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PlaylistEntry {
-    occurrence_id: String,
-    track_id: TrackId,
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct PlaylistSnapshot {
     playlist: Playlist,
-    entries: Vec<PlaylistEntry>,
+    entries: Vec<library::PlaylistEntryObservation>,
 }
 
 fn normalize_release_types(values: Vec<String>) -> Vec<String> {
@@ -201,6 +71,7 @@ struct SubsonicSourcePayload {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum SubsonicAuthentication {
     #[default]
     Password,
@@ -274,7 +145,7 @@ pub(crate) async fn connect(
     source_id: SourceId,
     flavor: SubsonicFlavor,
     authentication: SubsonicAuthentication,
-    credentials: CredentialHostInput,
+    credentials: CredentialInput,
 ) -> SourceResult<ConnectedSource> {
     SubsonicSource::authenticate(source_id, flavor, authentication, credentials)
         .await
@@ -300,16 +171,19 @@ pub(crate) async fn edit(
     current: SourceConfiguration,
     current_credential: Option<String>,
     authentication: SubsonicAuthentication,
-    credentials: CredentialSettingsInput,
+    mut credentials: CredentialInput,
 ) -> SourceResult<SourceEditResult> {
     let flavor = SubsonicFlavor::from_source_id(&current.kind)?;
     crate::source::require_source_edit(&current, flavor.source_id())?;
     let saved = SubsonicSourceConfig::from_configuration(&current)?;
-    let name = crate::source::edited_source_name(&credentials.name, &current.name);
-    let address_changed = crate::source::comparable_address(&credentials.base_url)
+    let name = crate::source::edited_source_name(
+        credentials.source_name.as_deref().unwrap_or_default(),
+        &current.name,
+    );
+    let address_changed = crate::source::comparable_address(&credentials.server_url)
         != crate::source::comparable_address(&saved.base_url);
     let username_changed = credentials.username.trim() != saved.username;
-    let has_password = !credentials.password.is_empty();
+    let has_password = !credentials.secret.is_empty();
     let authentication_changed = authentication != saved.authentication;
 
     if (username_changed || authentication_changed) && !has_password {
@@ -319,19 +193,10 @@ pub(crate) async fn edit(
     }
 
     if has_password {
-        let authenticated = SubsonicSource::authenticate(
-            current.source_id,
-            flavor,
-            authentication,
-            CredentialHostInput {
-                server_name: Some(name),
-                server_url: credentials.base_url,
-                username: credentials.username,
-                password: credentials.password,
-                trust_invalid_cert: credentials.trust_invalid_cert,
-            },
-        )
-        .await?;
+        credentials.source_name = Some(name);
+        let authenticated =
+            SubsonicSource::authenticate(current.source_id, flavor, authentication, credentials)
+                .await?;
         return Ok(SourceEditResult::Connected(Box::new(
             authenticated.connected(),
         )));
@@ -343,7 +208,7 @@ pub(crate) async fn edit(
         flavor.source_id(),
         name,
         SubsonicSourceConfig {
-            base_url: normalize_base_url(&credentials.base_url)?
+            base_url: normalize_base_url(&credentials.server_url)?
                 .as_str()
                 .trim_end_matches('/')
                 .to_owned(),
@@ -366,9 +231,12 @@ pub(crate) async fn edit(
     )))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum SubsonicFlavor {
     Navidrome,
+    #[serde(rename = "open_subsonic")]
     Subsonic,
 }
 impl SubsonicFlavor {
@@ -408,6 +276,7 @@ pub struct SubsonicSource {
     navidrome_session: navidrome::NavidromeSession,
     trust_invalid_cert: bool,
     metadata_editing: AtomicBool,
+    song_lyrics_version: tokio::sync::OnceCell<u64>,
 }
 impl SubsonicSource {
     fn open(
@@ -449,6 +318,7 @@ impl SubsonicSource {
             navidrome_session: navidrome::NavidromeSession::default(),
             trust_invalid_cert: config.trust_invalid_cert,
             metadata_editing: AtomicBool::new(false),
+            song_lyrics_version: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -457,13 +327,13 @@ impl SubsonicSource {
         source_id: SourceId,
         flavor: SubsonicFlavor,
         authentication: SubsonicAuthentication,
-        credentials: CredentialHostInput,
+        credentials: CredentialInput,
     ) -> SourceResult<AuthenticatedSubsonic> {
-        let CredentialHostInput {
-            server_name: submitted_name,
+        let CredentialInput {
+            source_name: submitted_name,
             server_url,
             username,
-            password,
+            secret: password,
             trust_invalid_cert,
         } = credentials;
         let base_url = normalize_base_url(&server_url)?;
@@ -570,6 +440,7 @@ impl SubsonicSource {
             navidrome_session: navidrome::NavidromeSession::default(),
             trust_invalid_cert,
             metadata_editing: AtomicBool::new(metadata_editing),
+            song_lyrics_version: tokio::sync::OnceCell::new(),
         };
         Ok(AuthenticatedSubsonic {
             configuration,

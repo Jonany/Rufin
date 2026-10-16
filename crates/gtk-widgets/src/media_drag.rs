@@ -1,19 +1,18 @@
+use crate::selection::collection_play_request;
 use crate::{
-    artwork::{ArtworkTile, THUMB_COVER_SIZE},
+    artwork::ArtworkTile,
     selection::{PlaylistEntrySelectionSnapshot, TrackSelectionSnapshot},
 };
 use adw::prelude::*;
 use artwork::ArtworkBinding;
 use downloads::DownloadSubject;
 use gtk::glib;
-use rufin_core::playback::PlaybackTarget;
+use rufin_core::playback::PlayRequest;
 use std::{cell::RefCell, rc::Rc};
 use std::{future::Future, ops::Range, pin::Pin, sync::Arc};
 
 pub type CollectionPageLoad = Arc<
-    dyn Fn(
-            Range<usize>,
-        ) -> Pin<Box<dyn Future<Output = Result<Vec<PlaybackTarget>, String>> + Send>>
+    dyn Fn(Range<usize>) -> Pin<Box<dyn Future<Output = Result<Vec<PlayRequest>, String>> + Send>>
         + Send
         + Sync,
 >;
@@ -30,7 +29,7 @@ pub type CollectionRowsLoad<Q, R> = Arc<
 
 #[derive(Clone)]
 pub enum CollectionTargets {
-    Ready(Vec<PlaybackTarget>),
+    Ready(Vec<PlayRequest>),
     Query {
         ranges: Vec<Range<usize>>,
         load: CollectionPageLoad,
@@ -38,7 +37,7 @@ pub enum CollectionTargets {
 }
 
 impl CollectionTargets {
-    async fn resolve(&self) -> Result<Vec<PlaybackTarget>, String> {
+    async fn resolve(&self) -> Result<Vec<PlayRequest>, String> {
         match self {
             Self::Ready(targets) => Ok(targets.clone()),
             Self::Query { ranges, load } => {
@@ -58,7 +57,7 @@ pub fn install_collection_selection<K, R, Q>(
     sparse: &Rc<crate::sparse_model::SparseRouteModel<K, R>>,
     request: Rc<RefCell<Q>>,
     load: CollectionRowsLoad<Q, R>,
-    target: impl Fn(&R) -> PlaybackTarget + Send + Sync + 'static,
+    target: impl Fn(&R) -> PlayRequest + Send + Sync + 'static,
 ) where
     K: Clone + Eq + Send + Sync + 'static,
     R: Clone + Send + Sync + 'static,
@@ -70,7 +69,37 @@ pub fn install_collection_selection<K, R, Q>(
         .list_model()
         .set_collection_selection(Box::new(move |dragged, positions| {
             let sparse = weak.upgrade()?;
-            let position = sparse.ready_position(|row| target(row) == *dragged)?;
+            let position = sparse.ready_position(|row| {
+                match (target(row).selection(), dragged.selection()) {
+                    (
+                        Some(library::TrackSelection::Query { query: left, .. }),
+                        Some(library::TrackSelection::Query { query: right, .. }),
+                    ) => match (&left.subject, &right.subject) {
+                        (
+                            library::CatalogSubject::Tracks {
+                                scope:
+                                    library::TrackScope::Smart {
+                                        key: left,
+                                        source: left_source,
+                                        ..
+                                    },
+                                ..
+                            },
+                            library::CatalogSubject::Tracks {
+                                scope:
+                                    library::TrackScope::Smart {
+                                        key: right,
+                                        source: right_source,
+                                        ..
+                                    },
+                                ..
+                            },
+                        ) => left == right && left_source == right_source,
+                        _ => left == right,
+                    },
+                    (left, right) => left == right,
+                }
+            })?;
             positions.contains(position).then(|| {
                 let request = request.borrow().clone();
                 let load = Arc::clone(&load);
@@ -238,7 +267,6 @@ impl MediaDragPreviewBinding {
                             &tile,
                             binding,
                             PLAYLIST_DRAG_ICON_COVER_SIZE,
-                            THUMB_COVER_SIZE,
                         );
                         let widget = tile.widget();
                         active_tile.replace(Some(tile));
@@ -292,36 +320,23 @@ pub enum MediaDragSource {
         operations: rufin_core::runtime::source::SourceHandle,
     },
     Target {
-        source_key: Option<library::SourceKey>,
-        folder: Option<library::FolderKey>,
-        target: PlaybackTarget,
+        target: PlayRequest,
     },
     Targets {
-        source_key: Option<library::SourceKey>,
-        folder: Option<library::FolderKey>,
         targets: CollectionTargets,
     },
     Selection(TrackSelectionSnapshot),
     PlaylistEntries(PlaylistEntrySelectionSnapshot),
     MediaUris(std::sync::Arc<[String]>),
     Queue {
-        occurrences: std::sync::Arc<[playback::OccurrenceId]>,
+        selection: rufin_core::playback::QueueSelection,
         media_uris: std::sync::Arc<[String]>,
     },
 }
 
 impl MediaDragSource {
-    pub fn capture_target(
-        selected: Option<&rufin_core::runtime::SelectedLibrary>,
-        target: PlaybackTarget,
-    ) -> Self {
-        Self::Target {
-            source_key: selected.as_ref().map(|selected| selected.source_key),
-            folder: selected
-                .as_ref()
-                .and_then(|selected| selected.music_folder_key),
-            target,
-        }
+    pub fn capture_target(target: PlayRequest) -> Self {
+        Self::Target { target }
     }
 
     pub fn selection(selection: TrackSelectionSnapshot) -> Self {
@@ -412,12 +427,7 @@ fn capture_collection_selection(
     source: MediaDragSource,
     widget: &glib::WeakRef<gtk::Widget>,
 ) -> MediaDragSource {
-    let MediaDragSource::Target {
-        source_key,
-        folder,
-        target,
-    } = &source
-    else {
+    let MediaDragSource::Target { target } = &source else {
         return source;
     };
     let Some(widget) = widget.upgrade() else {
@@ -446,19 +456,11 @@ fn capture_collection_selection(
     if positions.size() < 2 {
         return source;
     }
-    let target = match target {
-        PlaybackTarget::Contextual { target, .. } => target.as_ref(),
-        target => target,
-    };
     if let Some(targets) = selection
         .downcast_ref::<crate::selection::PositionSelectionModel>()
         .and_then(|selection| selection.collection_selection(target, &positions))
     {
-        return MediaDragSource::Targets {
-            source_key: *source_key,
-            folder: *folder,
-            targets,
-        };
+        return MediaDragSource::Targets { targets };
     }
     source
 }
@@ -516,40 +518,61 @@ fn compact_playlist_drag_icon(cover: Option<gtk::Widget>, title: &str) -> gtk::W
 }
 
 impl MediaDragSource {
-    pub async fn queue_input(&self) -> Result<library::QueueInput, String> {
+    pub async fn track_selection(
+        &self,
+        database: &library::Database,
+    ) -> Result<library::TrackSelection, String> {
+        match self {
+            Self::MediaUris(uris)
+            | Self::Queue {
+                media_uris: uris, ..
+            } => Ok(
+                library::CatalogQuery::uris(library::CatalogKind::Track, uris.to_vec()).selection(),
+            ),
+            _ => Ok(self
+                .play_request(database)
+                .await?
+                .selection()
+                .expect("song-backed collection drag")),
+        }
+    }
+
+    pub async fn playlist_input(
+        &self,
+        database: &library::Database,
+    ) -> Result<(library::TrackSelection, String, Vec<String>), String> {
+        let selection = self.track_selection(database).await?;
+        let title = match self {
+            Self::Target { .. } | Self::LiveCollection { .. } => selection_title(Some(&selection)),
+            Self::PlaylistEntries(_) => localization::tr("Playlist"),
+            _ => localization::tr("Selection"),
+        };
+        let preview = database
+            .selected_track_uris(&selection, Some(4), &library::ReadCancellation::new())
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok((selection, title, preview))
+    }
+
+    pub async fn play_request(&self, database: &library::Database) -> Result<PlayRequest, String> {
+        let placement = rufin_core::playback::QueuePlacement::Now;
         Ok(match self {
             Self::LiveCollection {
                 media_uri,
                 operations,
-            } => prepare_live_collection(operations, media_uri)
-                .await?
-                .queue_input(None, None),
-            Self::Target {
-                source_key,
-                folder,
-                target,
-            } => target.queue_input(*source_key, *folder),
-            Self::Targets {
-                source_key,
-                folder,
-                targets,
-            } => library::QueueInput::Groups(
-                targets
-                    .resolve()
-                    .await?
-                    .iter()
-                    .map(|target| target.queue_input(*source_key, *folder))
-                    .collect(),
-            ),
-            Self::Selection(selection) => selection.input.clone(),
-            Self::PlaylistEntries(selection) => selection.input.clone(),
+            } => prepare_live_collection(database, operations, media_uri).await?,
+            Self::Target { target } => target.clone(),
+            Self::Targets { targets } => PlayRequest::group(targets.resolve().await?, placement),
+            Self::Selection(selection) => {
+                PlayRequest::ordered(selection.input.clone(), 0, placement, false)
+            }
+            Self::PlaylistEntries(selection) => {
+                PlayRequest::ordered(selection.input.clone(), 0, placement, false)
+            }
             Self::MediaUris(order)
             | Self::Queue {
                 media_uris: order, ..
-            } => library::QueueInput::MediaUris {
-                order: order.clone(),
-                provenance: library::QueueProvenance::Manual,
-            },
+            } => PlayRequest::uris(order.to_vec(), placement),
         })
     }
 
@@ -557,80 +580,125 @@ impl MediaDragSource {
         &self,
         database: &library::Database,
     ) -> Result<(Vec<String>, DownloadSubject), String> {
-        match self {
-            Self::LiveCollection {
-                media_uri,
-                operations,
-            } => {
-                let target = prepare_live_collection(operations, media_uri).await?;
-                let media_uris = target.resolve_media_uris(database, None, None).await?;
-                let subject = target.download_subject();
-                Ok((media_uris, subject))
+        let mut prepared = None;
+        let uris = match self {
+            Self::MediaUris(uris)
+            | Self::Queue {
+                media_uris: uris, ..
+            } => uris.to_vec(),
+            _ => {
+                let request = self.play_request(database).await?;
+                let selection = request.selection().expect("song-backed collection drag");
+                prepared = Some(request);
+                database
+                    .selected_track_uris(&selection, None, &library::ReadCancellation::new())
+                    .await
+                    .map_err(|error| error.to_string())?
             }
-            Self::Target {
-                source_key,
-                folder,
-                target,
-            } => {
-                let media_uris = target
-                    .resolve_media_uris(database, *source_key, *folder)
-                    .await?;
-                let subject = target.download_subject();
-                Ok((media_uris, subject))
-            }
-            Self::Selection(selection) => {
-                let media_uris = selection.media_uris(database).await?;
-                let subject = DownloadSubject::for_media_uris("track-selection", None, &media_uris);
-                Ok((media_uris, subject))
-            }
-            Self::Targets {
-                source_key,
-                folder,
-                targets,
-            } => {
-                let mut media_uris = Vec::new();
-                for target in targets.resolve().await? {
-                    media_uris.extend(
-                        target
-                            .resolve_media_uris(database, *source_key, *folder)
-                            .await?,
-                    );
+        };
+        let subject = match self {
+            Self::Target { .. } | Self::LiveCollection { .. } => {
+                let target = prepared.as_ref().expect("prepared collection");
+                let title = selection_title(target.selection().as_ref());
+                DownloadSubject::Prepared {
+                    context_id: target.context().map(str::to_string).unwrap_or_else(|| {
+                        format!("track:{}", uris.first().map_or("", String::as_str))
+                    }),
+                    title: Some(title),
                 }
-                let subject = DownloadSubject::for_media_uris("collections", None, &media_uris);
-                Ok((media_uris, subject))
             }
-            Self::PlaylistEntries(selection) => {
-                let media_uris = selection.media_uris(database).await?;
-                let subject =
-                    DownloadSubject::for_media_uris("playlist", Some("Playlist"), &media_uris);
-                Ok((media_uris, subject))
+            Self::PlaylistEntries(_) => {
+                DownloadSubject::for_media_uris("playlist", Some("Playlist"), &uris)
             }
-            Self::MediaUris(media_uris) | Self::Queue { media_uris, .. } => {
-                let media_uris = media_uris.to_vec();
-                let subject = DownloadSubject::for_media_uris("playlist-media", None, &media_uris);
-                Ok((media_uris, subject))
+            Self::Targets { .. } => DownloadSubject::for_media_uris("collections", None, &uris),
+            Self::MediaUris(_) | Self::Queue { .. } => {
+                DownloadSubject::for_media_uris("playlist-media", None, &uris)
             }
-        }
+            Self::Selection(_) => DownloadSubject::for_media_uris("track-selection", None, &uris),
+        };
+        Ok((uris, subject))
+    }
+}
+
+fn selection_title(selection: Option<&library::TrackSelection>) -> String {
+    match selection {
+        Some(library::TrackSelection::Query { query, .. }) => match &query.subject {
+            library::CatalogSubject::Keys {
+                kind: library::CatalogKind::Track,
+                ..
+            } => localization::tr("Track"),
+            library::CatalogSubject::Tracks {
+                scope: library::TrackScope::Album(_),
+                ..
+            } => localization::tr("Album"),
+            library::CatalogSubject::Tracks {
+                scope: library::TrackScope::Artist { .. },
+                ..
+            } => localization::tr("Artist"),
+            library::CatalogSubject::Tracks {
+                scope: library::TrackScope::Genre(_),
+                ..
+            } => localization::tr("Genre"),
+            library::CatalogSubject::Tracks {
+                scope: library::TrackScope::Mood(_),
+                ..
+            } => localization::tr("Mood"),
+            library::CatalogSubject::Tracks {
+                scope: library::TrackScope::Playlist(_),
+                ..
+            } => localization::tr("Playlist"),
+            library::CatalogSubject::Tracks {
+                scope: library::TrackScope::Smart { .. },
+                ..
+            } => localization::tr("Smart Playlist"),
+            _ => localization::tr("Folder"),
+        },
+        _ => localization::tr("Selection"),
     }
 }
 
 async fn prepare_live_collection(
+    database: &library::Database,
     operations: &rufin_core::runtime::source::SourceHandle,
     media_uri: &str,
-) -> Result<PlaybackTarget, String> {
+) -> Result<PlayRequest, String> {
     operations
         .prepare_collection(media_uri.to_string())
         .recv()
         .await
         .map_err(|error| error.to_string())??;
-    match library::source_entity_parts(media_uri)
+    let cancellation = library::ReadCancellation::new();
+    let scope = match library::source_entity_parts(media_uri)
         .map(|(_, kind, _)| kind)
         .as_deref()
     {
-        Some("album") => Ok(PlaybackTarget::Album(media_uri.to_string())),
-        Some("artist") => Ok(PlaybackTarget::Artist(media_uri.to_string())),
-        _ => Err("Collection is no longer available".to_string()),
+        Some("album") => {
+            library::CatalogQuery::uris(library::CatalogKind::Album, vec![(media_uri).to_string()])
+                .rows(&database, 0, 1, &cancellation)
+                .await
+                .map(|rows| match rows {
+                    library::CatalogRows::Albums(mut rows) => rows.pop(),
+                    _ => unreachable!("typed catalog projection"),
+                })
+                .map_err(|error| error.to_string())?
+                .map(|row| library::TrackScope::Album(row.album_key))
+        }
+        Some("artist") => database
+            .catalog_identity(library::CatalogKind::Artist, media_uri, &cancellation)
+            .await
+            .map_err(|error| error.to_string())?
+            .map(|identity| library::TrackScope::Artist {
+                key: library::ArtistKey::from_raw(identity.key),
+                album_artist: false,
+            }),
+        _ => None,
     }
+    .ok_or_else(|| "Collection is no longer available".to_string())?;
+    let kind = match &scope {
+        library::TrackScope::Album(_) => "album",
+        _ => "artist",
+    };
+    Ok(collection_play_request(scope).with_context(format!("{kind}:{media_uri}").into()))
 }
 
 #[cfg(test)]

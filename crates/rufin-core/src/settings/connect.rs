@@ -616,7 +616,7 @@ mod tests {
             )
             .unwrap();
         let stored = file.load();
-        assert!(stored.ui.private_mode);
+        assert!(stored.ui.application.private_mode);
         assert_eq!(
             stored.sources.configured[0]
                 .credential_ref
@@ -652,7 +652,7 @@ mod tests {
                     local_access: None,
                     enable_half_stars: false,
                 });
-                stored.ui.private_mode = true;
+                stored.ui.application.private_mode = true;
                 stored.ui.playback.audio_output = Some("sender-device".into());
                 stored.ui.playback.stream_quality = StreamQuality::MaxBitrateKbps(128);
                 Ok(())
@@ -667,7 +667,7 @@ mod tests {
                 stored.ui.playback.audio_output = Some("receiver-device".into());
                 stored.ui.playback.stream_quality = StreamQuality::Original;
                 stored.ui.random_play.limit = 200;
-                stored.ui.lyrics.lyrics_font_family = Some("Custom font".into());
+                stored.ui.lyrics.preferences.lyrics_font_family = Some("Custom font".into());
                 stored.ui.queue_lyrics_height = Some(200);
                 Ok(())
             })
@@ -702,14 +702,14 @@ mod tests {
             .apply_connect_records(&records, &secrets)
             .unwrap();
         let value = receiver.load();
-        assert!(value.ui.private_mode);
+        assert!(value.ui.application.private_mode);
         assert_eq!(
             value.ui.playback.audio_output.as_deref(),
             Some("receiver-device")
         );
         assert_eq!(value.ui.playback.stream_quality, StreamQuality::Original);
         assert_eq!(value.ui.random_play, RandomPlaySettings::default());
-        assert!(value.ui.lyrics.lyrics_font_family.is_none());
+        assert!(value.ui.lyrics.preferences.lyrics_font_family.is_none());
         assert!(value.ui.queue_lyrics_height.is_none());
         assert_eq!(value.jellyfin_device_id, device_identity);
         assert_eq!(

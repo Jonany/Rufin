@@ -8,26 +8,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_channel::Sender;
 use library::{Database, ReadCancellation};
 use playback::{CurrentMedia, CurrentMediaId};
-use serde::{Deserialize, Serialize};
 use sources::Source;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use ::lyrics::{
-    LocalLyricsInput, LyricsBundle, LyricsDocument, LyricsOrigin, LyricsQuery, LyricsRole,
-    LyricsSearchResult, Settings, lyrics_from_search_result, lyrics_to_lrc_text,
-    save_current_lyrics, search_lyrics,
+    LyricsBundle, LyricsDocument, LyricsOrigin, LyricsQuery, LyricsRole, LyricsSearchResult,
+    Settings, lyrics_from_search_result, lyrics_to_lrc_text, save_current_lyrics, search_lyrics,
 };
 use ::lyrics::{
-    LyricsLookup, LyricsPlan, cached_lyrics_allowed, external_best_lyrics, local_sidecar_lyrics,
-    lyrics_from_edited_text, lyrics_with_displayable_content,
+    LyricsLookup, LyricsPlan, cached_lyrics_allowed, external_best_lyrics, lyrics_from_edited_text,
+    lyrics_with_displayable_content,
 };
 
 mod events;
 pub use events::{CurrentLyrics, CurrentLyricsContent, LyricsEvent};
-
-const LYRICS_CACHE_PAYLOAD_VERSION: u32 = 4;
 
 #[derive(Clone)]
 pub struct LyricsContext {
@@ -37,12 +33,12 @@ pub struct LyricsContext {
 
 impl LyricsService {
     async fn source(&self, context: &LyricsContext) -> Option<Arc<Source>> {
-        let source_id = match library::source_entity_parts(&context.media.media_uri) {
+        let source_id = match library::source_entity_parts(&context.media.id.media_uri) {
             Some((source, kind, _)) if kind == "track" => source,
             Some(_) => return None,
             None => self
                 .database
-                .track_source_by_uri(&context.media.media_uri, &ReadCancellation::new())
+                .track_source_by_uri(&context.media.id.media_uri, &ReadCancellation::new())
                 .await
                 .ok()??,
         };
@@ -62,7 +58,7 @@ struct DocumentKey {
 impl DocumentKey {
     fn for_context(context: &LyricsContext) -> Self {
         Self {
-            media_uri: context.media.media_uri.clone(),
+            media_uri: context.media.id.media_uri.clone(),
         }
     }
 
@@ -133,7 +129,6 @@ struct State {
 struct CurrentResolution {
     context: LyricsContext,
     lookup: LyricsLookup,
-    local: Option<LocalLyricsInput>,
     cue_track: bool,
     plan: LyricsPlan,
 }
@@ -156,17 +151,12 @@ enum LyricsAuthority {
     External,
 }
 
-#[derive(Deserialize, Serialize)]
-struct CachedBundle {
-    version: u32,
-    bundle: LyricsBundle,
-}
-
 pub struct LyricsService {
     dictionary_directory: PathBuf,
     dictionary_status: Mutex<::lyrics::JapaneseDictionaryStatus>,
     database: Database,
     source_owner: Arc<crate::source::SourceOwner>,
+    connect: Mutex<std::sync::Weak<crate::connect::ConnectOwner>>,
     runtime: tokio::runtime::Handle,
     events: Sender<LyricsEvent>,
     current: tokio::sync::watch::Sender<CurrentLyrics>,
@@ -177,6 +167,7 @@ pub struct LyricsService {
 }
 
 #[derive(Clone)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Object))]
 pub struct LyricsHandle {
     service: Arc<LyricsService>,
 }
@@ -196,6 +187,7 @@ impl LyricsService {
             dictionary_status: Mutex::new(::lyrics::JapaneseDictionaryStatus::Idle),
             database,
             source_owner,
+            connect: Mutex::new(std::sync::Weak::new()),
             runtime,
             events,
             current: tokio::sync::watch::channel(CurrentLyrics::Cleared).0,
@@ -217,113 +209,6 @@ impl LyricsService {
         LyricsHandle {
             service: Arc::clone(self),
         }
-    }
-
-    fn cache_changed(&self, records: &[library::ConnectRecord]) {
-        let event = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let Some(current) = state.current.as_ref() else {
-                return;
-            };
-            let plan = state
-                .settings
-                .configured_lyrics_plan(state.private_mode, &current.key.media_uri);
-            let cache_key = current.key.cache_key(&plan);
-            let original_key = current.key.cache_key_for(LyricsRole::Original, "");
-            let cue_track = library::cue_media_parts(&current.key.media_uri).is_some();
-            let mut bundle = current.bundle.clone();
-            for record in records
-                .iter()
-                .filter(|record| record.kind == "cache_lyrics")
-            {
-                let Ok((media_uri, authority, role, language, script)) =
-                    serde_json::from_str::<(String, String, String, String, String)>(&record.key)
-                else {
-                    continue;
-                };
-                let row_key = (role, language, script);
-                if media_uri != current.key.media_uri
-                    || row_key != cache_key && row_key != original_key
-                {
-                    continue;
-                }
-                let Some(value) = &record.value else {
-                    if bundle.as_ref().is_some_and(|bundle| {
-                        bundle.origin != LyricsOrigin::Local
-                            && cache_authority(bundle.origin) == authority
-                            && cache_key_for_bundle(&current.key, &plan, bundle) == row_key
-                    }) {
-                        bundle = None;
-                    }
-                    continue;
-                };
-                if authority != "external"
-                    && !value
-                        .get("cache_input_digest")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|digest| {
-                            digest.eq_ignore_ascii_case(
-                                blake3::Hash::from_bytes(current.context.input_digest)
-                                    .to_hex()
-                                    .as_str(),
-                            )
-                        })
-                {
-                    continue;
-                }
-                let candidate = value
-                    .get("lyrics")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(decode_cached_bundle)
-                    .and_then(lyrics_with_displayable_content)
-                    .filter(|candidate| {
-                        candidate.origin != LyricsOrigin::Local
-                            && cache_authority(candidate.origin) == authority
-                            && cached_lyrics_allowed(candidate, &plan, cue_track)
-                    });
-                let Some(candidate) = candidate else {
-                    continue;
-                };
-                let replace = bundle.as_ref().is_none_or(|visible| {
-                    if acquisition_complete(visible, &plan) {
-                        acquisition_complete(&candidate, &plan)
-                            && visible.origin != LyricsOrigin::Local
-                            && (cache_authority(visible.origin) == authority
-                                || (plan.prefers_server() && authority == "source")
-                                || (!plan.prefers_server() && authority == "external"))
-                    } else {
-                        acquisition_complete(&candidate, &plan)
-                            || !bundle_satisfies_plan(visible, &plan)
-                                && bundle_satisfies_plan(&candidate, &plan)
-                            || visible.origin != LyricsOrigin::Local
-                                && cache_authority(visible.origin) == authority
-                    }
-                });
-                if replace {
-                    bundle = Some(Arc::new(candidate));
-                }
-            }
-            if bundle == current.bundle {
-                return;
-            }
-            cancel_current_work(&mut state);
-            let settings = state.settings.clone();
-            let current = state.current.as_mut().expect("current lyrics document");
-            current.request = self.next_request.fetch_add(1, Ordering::AcqRel);
-            current.loading = false;
-            if let Some(bundle) = bundle {
-                apply_bundle(current, &settings, bundle);
-            } else {
-                current.bundle = None;
-                current.document = None;
-                current.pronunciation = None;
-            }
-            current_event(current)
-        };
-        self.publish(event);
     }
 
     pub fn set_current(self: &Arc<Self>, context: Option<LyricsContext>) {
@@ -379,6 +264,7 @@ impl LyricsService {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .settings
+                .preferences
                 .save_lyrics_as_sidecar;
             let writable = match service.source(&context).await {
                 Some(source) => {
@@ -393,7 +279,7 @@ impl LyricsService {
                     .state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if state.settings.save_lyrics_as_sidecar != sidecar {
+                if state.settings.preferences.save_lyrics_as_sidecar != sidecar {
                     return;
                 }
                 let Some(current) = state.current.as_mut().filter(|current| current.key == key)
@@ -443,7 +329,8 @@ impl LyricsService {
                 )
             });
             let selection_changed = lyrics_selection_changed(&state.settings, &settings);
-            let karaoke_enabled = !state.settings.karaoke_mode && settings.karaoke_mode;
+            let karaoke_enabled =
+                !state.settings.preferences.karaoke_mode && settings.preferences.karaoke_mode;
             let acquisition_changed = current.as_ref().is_some_and(|(_, track_id, ..)| {
                 lyrics_acquisition_changed(&state.settings, &settings, track_id)
             });
@@ -594,7 +481,7 @@ impl LyricsService {
             if !service.current_request_active(request, &task_key, &task_cancelled) {
                 return;
             }
-            let resolution = current_resolution(context, plan, &service.database).await;
+            let resolution = current_resolution(context, plan);
             service
                 .resolve_current(request, task_key, resolution, task_cancelled, use_cache)
                 .await;
@@ -622,57 +509,33 @@ impl LyricsService {
         self: &Arc<Self>,
         request: u64,
         key: DocumentKey,
-        mut resolution: CurrentResolution,
+        resolution: CurrentResolution,
         cancelled: Arc<AtomicBool>,
         use_cache: bool,
     ) {
         let mut fallback = LyricsFallback::default();
-        if let Some(input) = resolution.local.as_ref() {
-            let input = input.clone();
-            let document = tokio::task::spawn_blocking(move || local_sidecar_lyrics(&input))
+        let document = sources::read_local_lyrics(
+            &self.database,
+            &key.media_uri,
+            Some(&resolution.context.media.row.track.metadata.title),
+            &selection_settings(&resolution.plan),
+        )
+        .await
+        .ok()
+        .flatten();
+        if let Some(document) = document
+            && self
+                .resolve_candidate(
+                    request,
+                    &key,
+                    &resolution,
+                    &cancelled,
+                    &mut fallback,
+                    document,
+                )
                 .await
-                .ok()
-                .flatten();
-            if let Some(document) = document
-                && self
-                    .resolve_candidate(
-                        request,
-                        &key,
-                        &resolution,
-                        &cancelled,
-                        &mut fallback,
-                        document,
-                    )
-                    .await
-            {
-                return;
-            }
-        }
-        if !self.current_request_active(request, &key, &cancelled) {
-            return;
-        }
-        if !resolution.cue_track
-            && let Some(input) = resolution.local.take()
         {
-            let document =
-                tokio::task::spawn_blocking(move || embedded_lyrics_from_audio(&input.audio_path))
-                    .await
-                    .ok()
-                    .flatten();
-            if let Some(document) = document
-                && self
-                    .resolve_candidate(
-                        request,
-                        &key,
-                        &resolution,
-                        &cancelled,
-                        &mut fallback,
-                        document,
-                    )
-                    .await
-            {
-                return;
-            }
+            return;
         }
         if !self.current_request_active(request, &key, &cancelled) {
             return;
@@ -755,12 +618,15 @@ impl LyricsService {
         fallback: &mut LyricsFallback,
         authority: LyricsAuthority,
     ) -> bool {
-        let (role, language, script) = key.cache_key(&resolution.plan);
+        let (role, language, script) = match authority {
+            LyricsAuthority::Source => key.cache_key_for(LyricsRole::Original, ""),
+            LyricsAuthority::External => key.cache_key(&resolution.plan),
+        };
         let authority = match authority {
             LyricsAuthority::Source => "source",
             LyricsAuthority::External => "external",
         };
-        let cached = self
+        let mut cached = self
             .database
             .lyrics_cache_for_role(
                 &key.media_uri,
@@ -774,12 +640,30 @@ impl LyricsService {
             .await
             .ok()
             .flatten();
+        if cached.is_none() && self.current_request_active(request, key, cancelled) {
+            let connect = self
+                .connect
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .upgrade();
+            if let Some(connect) = connect {
+                cached = connect
+                    .fetch_cached_lyrics(crate::connect::LyricsCacheQuery {
+                        media_uri: key.media_uri.clone(),
+                        authority: authority.into(),
+                        role,
+                        language,
+                        script,
+                        input: resolution.context.input_digest,
+                    })
+                    .await;
+            }
+        }
         let Some(cached) = cached else {
             return false;
         };
-        let candidate = cached_bundle(&cached)
-            .and_then(lyrics_with_displayable_content)
-            .filter(|document| document.origin != LyricsOrigin::Local);
+        let candidate = LyricsBundle::from_cache_payload(&cached.lyrics)
+            .and_then(lyrics_with_displayable_content);
         if let Some(document) = candidate {
             if !cached_lyrics_allowed(&document, &resolution.plan, resolution.cue_track) {
                 return false;
@@ -802,7 +686,13 @@ impl LyricsService {
         if self.current_request_active(request, key, cancelled) {
             let _ = self
                 .database
-                .remove_lyrics_cache(&key.media_uri, authority, &role, &language, &script)
+                .remove_lyrics_cache(
+                    &key.media_uri,
+                    authority,
+                    &cached.role,
+                    &cached.language,
+                    &cached.script,
+                )
                 .await;
         }
         false
@@ -819,18 +709,23 @@ impl LyricsService {
         let Some(source) = self.source(&resolution.context).await else {
             return false;
         };
-        match source.lyrics(&self.database, &key.media_uri).await {
-            Ok(Some(lyrics)) => {
-                let candidate = match lyrics {
-                    sources::SourceLyrics::Structured(native) => native,
-                    sources::SourceLyrics::Text(text) => {
-                        let Some(mut bundle) = lyrics_from_edited_text(&text) else {
-                            return false;
-                        };
-                        bundle.origin = LyricsOrigin::Native;
-                        bundle
-                    }
-                };
+        if (library::file_media_path(&key.media_uri).is_some() || resolution.cue_track)
+            && matches!(&source.implementation, sources::Implementation::Local(_))
+        {
+            return false;
+        }
+        match source
+            .cached_lyrics(
+                &self.database,
+                &key.media_uri,
+                resolution.context.input_digest,
+            )
+            .await
+        {
+            Ok(Some(candidate)) => {
+                if !cached_lyrics_allowed(&candidate, &resolution.plan, resolution.cue_track) {
+                    return false;
+                }
                 self.resolve_candidate(request, key, resolution, cancelled, fallback, candidate)
                     .await
             }
@@ -926,7 +821,7 @@ impl LyricsService {
         let write_target = matches!(document.origin, LyricsOrigin::External(_))
             .then(|| self.fetched_lyrics_write_target(request, key, &document))
             .flatten();
-        if document.origin != LyricsOrigin::Local {
+        if matches!(document.origin, LyricsOrigin::External(_)) {
             match cache_write(key, plan, &document) {
                 Ok((authority, role, language, script, payload, updated_at)) => {
                     if let Err(error) = self
@@ -973,16 +868,18 @@ impl LyricsService {
             else {
                 return None;
             };
-            if !state.settings.save_lyrics_to_source || !state.settings.save_lyrics_automatically {
+            if !state.settings.preferences.save_lyrics_to_source
+                || !state.settings.preferences.save_lyrics_automatically
+            {
                 return None;
             }
-            let Some(document) = lyrics.selected_document(&state.settings) else {
+            let Some(document) = lyrics.selected_document(&state.settings.preferences) else {
                 return None;
             };
             Some(LyricsWriteTarget {
                 context: current.context.clone(),
                 content: lyrics_to_lrc_text(document, 0),
-                sidecar: state.settings.save_lyrics_as_sidecar,
+                sidecar: state.settings.preferences.save_lyrics_as_sidecar,
             })
         }
     }
@@ -994,7 +891,7 @@ impl LyricsService {
         if !source
             .lyrics_writable(
                 &self.database,
-                &target.context.media.media_uri,
+                &target.context.media.id.media_uri,
                 target.sidecar,
             )
             .await
@@ -1004,15 +901,15 @@ impl LyricsService {
         let Ok(_permit) = self.write_lane.acquire().await else {
             return;
         };
-        if let Err(error) = source
+        let result = source
             .write_lyrics(
                 &self.database,
-                &target.context.media.media_uri,
+                &target.context.media.id.media_uri,
                 &target.content,
                 target.sidecar,
             )
-            .await
-        {
+            .await;
+        if let Err(error) = result {
             warn!(%error, "could not save lyrics to source");
             self.publish(LyricsEvent::SourceSaveFailed {
                 media_id: target.context.media.id.clone(),
@@ -1146,9 +1043,10 @@ impl LyricsService {
             let event_media = current.context.media.id.clone();
             let allowed = state
                 .settings
+                .preferences
                 .external_lyrics_network_allowed(state.private_mode);
             let providers = if allowed {
-                state.settings.external_lyrics_providers.clone()
+                state.settings.preferences.external_lyrics_providers.clone()
             } else {
                 Vec::new()
             };
@@ -1258,12 +1156,12 @@ impl LyricsService {
             };
             let save_plan = plan.clone();
             let saved = tokio::task::spawn_blocking(move || {
-                let selection = Settings {
+                let selection = lyrics::UserPreferences {
                     prefer_translations: save_plan.prefers_translations(),
                     preferred_translation_language: save_plan
                         .preferred_translation_language()
                         .to_string(),
-                    ..Settings::default()
+                    ..lyrics::UserPreferences::default()
                 };
                 let Some(document) = bundle.selected_document(&selection) else {
                     return Ok(None);
@@ -1332,9 +1230,11 @@ impl LyricsService {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if !state
                 .settings
+                .preferences
                 .external_lyrics_network_allowed(state.private_mode)
                 || !state
                     .settings
+                    .preferences
                     .external_lyrics_providers
                     .contains(&result.provider)
             {
@@ -1434,7 +1334,7 @@ impl LyricsService {
             let plan = state
                 .settings
                 .configured_lyrics_plan(state.private_mode, &key.media_uri);
-            let sidecar = state.settings.save_lyrics_as_sidecar;
+            let sidecar = state.settings.preferences.save_lyrics_as_sidecar;
             cancel_current_work(&mut state);
             let request = self.next_request.fetch_add(1, Ordering::AcqRel);
             if let Some(current) = state.current.as_mut() {
@@ -1511,8 +1411,12 @@ impl LyricsService {
 }
 
 impl LyricsHandle {
-    pub fn cache_changed(&self, records: &[library::ConnectRecord]) {
-        self.service.cache_changed(records);
+    pub(crate) fn install_connect(&self, owner: &Arc<crate::connect::ConnectOwner>) {
+        *self
+            .service
+            .connect
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::downgrade(owner);
     }
 
     pub fn current(&self) -> tokio::sync::watch::Receiver<CurrentLyrics> {
@@ -1532,7 +1436,10 @@ impl LyricsHandle {
             self.load(media_id);
         }
     }
+}
 
+#[cfg_attr(feature = "bindings", uniffi::export)]
+impl LyricsHandle {
     pub fn japanese_dictionary(&self, retry: bool) -> ::lyrics::JapaneseDictionaryStatus {
         use ::lyrics::JapaneseDictionaryStatus;
 
@@ -1574,7 +1481,10 @@ impl LyricsHandle {
         }
         status.clone()
     }
+}
 
+#[cfg_attr(feature = "bindings", uniffi::export)]
+impl LyricsHandle {
     pub fn load(&self, media_id: CurrentMediaId) {
         self.service.load(media_id);
     }
@@ -1586,20 +1496,30 @@ impl LyricsHandle {
     pub fn preview(&self, media_id: CurrentMediaId, result: LyricsSearchResult) {
         self.service.preview(media_id, result);
     }
+}
 
+impl LyricsHandle {
     pub fn save_result(&self, media_id: CurrentMediaId, result: LyricsSearchResult, path: PathBuf) {
         self.service.save_result(media_id, result, Some(path));
     }
+}
 
+#[cfg_attr(feature = "bindings", uniffi::export)]
+impl LyricsHandle {
     pub fn save_result_to_source(&self, media_id: CurrentMediaId, result: LyricsSearchResult) {
         self.service.save_result(media_id, result, None);
     }
+}
 
+impl LyricsHandle {
     pub fn save_current(&self, media_id: CurrentMediaId, offset_millis: i64, path: PathBuf) {
         self.service
             .save_current(media_id, offset_millis, Some(path));
     }
+}
 
+#[cfg_attr(feature = "bindings", uniffi::export)]
+impl LyricsHandle {
     pub fn save_current_to_source(&self, media_id: CurrentMediaId, offset_millis: i64) {
         self.service.save_current(media_id, offset_millis, None);
     }
@@ -1654,7 +1574,7 @@ fn current_event(current: &CurrentDocument) -> LyricsEvent {
 }
 
 fn apply_bundle(current: &mut CurrentDocument, settings: &Settings, bundle: Arc<LyricsBundle>) {
-    let selected = bundle.selected_document(settings);
+    let selected = bundle.selected_document(&settings.preferences);
     current.pronunciation = selected
         .and_then(|document| bundle.pronunciation_for(document))
         .map(|pronunciation| {
@@ -1676,31 +1596,21 @@ fn apply_bundle(current: &mut CurrentDocument, settings: &Settings, bundle: Arc<
     current.bundle = Some(bundle);
 }
 
-fn selection_settings(plan: &LyricsPlan) -> Settings {
-    Settings {
+fn selection_settings(plan: &LyricsPlan) -> lyrics::UserPreferences {
+    lyrics::UserPreferences {
         prefer_translations: plan.prefers_translations(),
         preferred_translation_language: plan.preferred_translation_language().to_string(),
-        ..Settings::default()
+        karaoke_mode: plan.requires_word_timing(),
+        ..lyrics::UserPreferences::default()
     }
 }
 
 fn bundle_satisfies_plan(bundle: &LyricsBundle, plan: &LyricsPlan) -> bool {
-    if bundle.is_instrumental() {
-        true
-    } else if plan.prefers_translations() {
-        bundle.has_preferred_translation(&selection_settings(plan))
-    } else {
-        bundle.has_original()
-    }
+    bundle.satisfies_preferences(&selection_settings(plan))
 }
 
 fn acquisition_complete(bundle: &LyricsBundle, plan: &LyricsPlan) -> bool {
-    bundle.is_instrumental()
-        || bundle_satisfies_plan(bundle, plan)
-            && (!plan.requires_word_timing()
-                || bundle
-                    .selected_document(&selection_settings(plan))
-                    .is_some_and(LyricsDocument::has_word_timing))
+    bundle.acquisition_complete(&selection_settings(plan))
 }
 
 fn prefer_fallback(
@@ -1722,7 +1632,10 @@ fn cache_key_for_bundle(
     plan: &LyricsPlan,
     bundle: &LyricsBundle,
 ) -> (String, String, String) {
-    if plan.prefers_translations() && bundle.has_preferred_translation(&selection_settings(plan)) {
+    if matches!(bundle.origin, LyricsOrigin::External(_))
+        && plan.prefers_translations()
+        && bundle.has_preferred_translation(&selection_settings(plan))
+    {
         key.cache_key(plan)
     } else {
         key.cache_key_for(LyricsRole::Original, "")
@@ -1730,8 +1643,9 @@ fn cache_key_for_bundle(
 }
 
 fn lyrics_selection_changed(previous: &Settings, current: &Settings) -> bool {
-    previous.prefer_translations != current.prefer_translations
-        || previous.preferred_translation_language != current.preferred_translation_language
+    previous.preferences.prefer_translations != current.preferences.prefer_translations
+        || previous.preferences.preferred_translation_language
+            != current.preferences.preferred_translation_language
 }
 
 fn acquisition_order(prefer_server: bool) -> [LyricsAuthority; 2] {
@@ -1744,13 +1658,15 @@ fn acquisition_order(prefer_server: bool) -> [LyricsAuthority; 2] {
 
 fn lyrics_acquisition_changed(previous: &Settings, current: &Settings, track_id: &str) -> bool {
     let previous_external =
-        previous.external_lyrics_enabled && !previous.auto_lyrics_suppressed(track_id);
+        previous.preferences.external_lyrics_enabled && !previous.auto_lyrics_suppressed(track_id);
     let current_external =
-        current.external_lyrics_enabled && !current.auto_lyrics_suppressed(track_id);
+        current.preferences.external_lyrics_enabled && !current.auto_lyrics_suppressed(track_id);
     previous_external != current_external
         || (previous_external || current_external)
-            && (previous.prefer_server_lyrics != current.prefer_server_lyrics
-                || previous.external_lyrics_providers != current.external_lyrics_providers)
+            && (previous.preferences.prefer_server_lyrics
+                != current.preferences.prefer_server_lyrics
+                || previous.preferences.external_lyrics_providers
+                    != current.preferences.external_lyrics_providers)
 }
 
 fn cancel_current_work(state: &mut State) {
@@ -1762,54 +1678,19 @@ fn cancel_current_work(state: &mut State) {
     }
 }
 
-async fn current_resolution(
-    context: LyricsContext,
-    plan: LyricsPlan,
-    database: &Database,
-) -> CurrentResolution {
-    let cue_track = library::cue_media_parts(&context.media.media_uri).is_some();
-    let access = database
-        .playback_access(&context.media.media_uri)
-        .await
-        .ok()
-        .flatten()
-        .map(|(uri, _)| uri);
-    let local = access
-        .as_deref()
-        .and_then(local_audio_path)
-        .or_else(|| local_audio_path(&context.media.media_uri))
-        .map(|path| LocalLyricsInput {
-            audio_path: path,
-            title: context.media.title.clone(),
-            cue_track,
-        });
+fn current_resolution(context: LyricsContext, plan: LyricsPlan) -> CurrentResolution {
+    let cue_track = library::cue_media_parts(&context.media.id.media_uri).is_some();
     CurrentResolution {
         lookup: LyricsLookup::from_search(
-            &context.media.artist,
-            &context.media.title,
-            u32::try_from(context.media.duration_millis.max(0) / 1_000).unwrap_or(u32::MAX),
+            &context.media.row.track.metadata.artist,
+            &context.media.row.track.metadata.title,
+            u32::try_from(context.media.row.track.metadata.duration_millis.max(0) / 1_000)
+                .unwrap_or(u32::MAX),
         ),
-        local,
         cue_track,
         plan,
         context,
     }
-}
-
-fn local_audio_path(media_uri: &str) -> Option<PathBuf> {
-    match library::cue_media_parts(media_uri) {
-        Some((_, uri, _, _)) => library::file_media_path(&uri),
-        None => library::file_media_path(media_uri),
-    }
-}
-
-fn cached_bundle(cached: &library::LyricsCacheRow) -> Option<LyricsBundle> {
-    decode_cached_bundle(&cached.lyrics)
-}
-
-fn decode_cached_bundle(payload: &str) -> Option<LyricsBundle> {
-    let cached = serde_json::from_str::<CachedBundle>(payload).ok()?;
-    (cached.version == LYRICS_CACHE_PAYLOAD_VERSION).then_some(cached.bundle)
 }
 
 fn cache_write(
@@ -1824,10 +1705,7 @@ fn cache_write(
         role,
         language,
         script,
-        serde_json::to_string(&CachedBundle {
-            version: LYRICS_CACHE_PAYLOAD_VERSION,
-            bundle: document.clone(),
-        })?,
+        document.cache_payload()?,
         unix_seconds(),
     ))
 }
@@ -1911,6 +1789,11 @@ mod tests {
             artwork::Artwork::new(directory.path().join("artwork"), runtime.clone()).unwrap(),
             Arc::new(database.clone()),
             downloads::Downloads::new(
+                artwork::Artwork::new(
+                    (directory.path().join("downloads")).join("artwork"),
+                    (runtime.clone()).clone(),
+                )
+                .unwrap(),
                 directory.path().join("downloads"),
                 database.clone(),
                 runtime.clone(),
@@ -1926,14 +1809,17 @@ mod tests {
                 events: async_channel::unbounded().0,
                 discovery: async_channel::unbounded().0,
             },
-        )
-        .owner;
+        );
         let service = LyricsService::new(
             database.clone(),
             source_owner,
             tokio::runtime::Handle::current(),
             Settings {
-                external_lyrics_enabled: false,
+                preferences: lyrics::UserPreferences {
+                    external_lyrics_enabled: false,
+                    ..lyrics::UserPreferences::default()
+                },
+
                 ..Settings::default()
             },
             false,
@@ -1949,22 +1835,33 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let occurrence = library::OccurrenceId::new(index.to_string());
             let media_id = CurrentMediaId {
                 run: None,
-                occurrence: occurrence.clone(),
+                media_uri: media_uri.as_str().into(),
             };
             service.set_current(Some(LyricsContext {
                 media: Arc::new(CurrentMedia {
+                    stream: None,
                     id: media_id.clone(),
-                    occurrence: Arc::new(library::QueueOccurrence {
-                        occurrence,
-                        item: library::QueueItem::direct(
-                            media_uri, title, "Artist", "Album", 3_000,
-                        ),
-                        canonical_position: 0,
-                        source_index: None,
-                        playlist_entry_id: None,
+                    row: Arc::new(library::QueueRow {
+                        occurrence_id: None,
+                        track: library::TrackView {
+                            track_key: library::TrackKey::from_raw(1),
+                            source_key: None,
+                            source_id: None,
+                            object_id: None,
+                            media_uri: media_uri.to_string(),
+                            metadata: library::TrackReference::direct(
+                                media_uri, title, "Artist", "Album", 3_000,
+                            )
+                            .metadata,
+                            state: Default::default(),
+                            access: Default::default(),
+                            links: Default::default(),
+                            artwork_binding: None,
+                        },
+                        position: index,
+                        received_from_connect: false,
                         provenance: playback::Provenance::Manual,
                     }),
                 }),
@@ -1990,10 +1887,144 @@ mod tests {
         }
         assert_eq!(
             database
-                .original_file_path(&downloaded_uri)
+                .original_file(&downloaded_uri)
                 .await
-                .expect("original path"),
+                .expect("original path")
+                .map(|file| file.path),
             Some(original.to_string_lossy().into_owned())
+        );
+        let (_, source, _) = sources::Source::connect(
+            SourceId::new("local"),
+            sources::SourceSetup::Local {
+                roots: vec![directory.path().to_path_buf()],
+            },
+            "",
+        )
+        .await
+        .expect("local source")
+        .into_parts();
+        assert!(
+            source
+                .cached_lyrics(&database, &cue_uri, [0; 32])
+                .await
+                .expect("CUE without stored title")
+                .is_none()
+        );
+        database
+            .reconcile_source(&library::SourceId::new("local"), "local", "Local")
+            .await
+            .unwrap();
+        database
+            .catalog("local", None)
+            .await
+            .expect("store CUE title")
+            .apply_catalog(
+                &library::CatalogBatch {
+                    tracks: (&[library::TrackObservation {
+                        metadata: library::TrackMetadata {
+                            title: "Segment".into(),
+                            duration_millis: 2_000,
+                            ..Default::default()
+                        },
+                        object_id: "segment".into(),
+                        media_uri: Some(file_uri.clone()),
+                        cue_path: Some(
+                            directory
+                                .path()
+                                .join("album.cue")
+                                .to_string_lossy()
+                                .into_owned(),
+                        ),
+                        cue_start_millis: Some(1_000),
+                        cue_end_millis: Some(3_000),
+                        ..Default::default()
+                    }])
+                        .to_vec(),
+                    ..Default::default()
+                },
+                true,
+            )
+            .await
+            .expect("store CUE title");
+        let cue = source
+            .cached_lyrics(&database, &cue_uri, [0; 32])
+            .await
+            .expect("cache CUE title sidecar")
+            .expect("CUE lyrics");
+        assert_eq!(cue.origin, LyricsOrigin::Native);
+        assert_eq!(cue.documents()[0].lines[0].text, "Segment lyrics");
+        std::fs::remove_file(directory.path().join("Segment.lrc")).expect("offline CUE sidecar");
+        let cue_media_id = CurrentMediaId {
+            run: None,
+            media_uri: cue_uri.clone(),
+        };
+        service.set_current(Some(LyricsContext {
+            media: Arc::new(CurrentMedia {
+                stream: None,
+                id: cue_media_id.clone(),
+                row: Arc::new(library::QueueRow {
+                    occurrence_id: None,
+                    track: library::TrackView {
+                        track_key: library::TrackKey::from_raw(1),
+                        source_key: None,
+                        source_id: None,
+                        object_id: None,
+                        media_uri: cue_uri.clone(),
+                        metadata: library::TrackReference::direct(
+                            &cue_uri, "Segment", "Artist", "Album", 2_000,
+                        )
+                        .metadata,
+                        state: Default::default(),
+                        access: Default::default(),
+                        links: Default::default(),
+                        artwork_binding: None,
+                    },
+                    position: 0,
+                    received_from_connect: false,
+                    provenance: playback::Provenance::Manual,
+                }),
+            }),
+            input_digest: [0; 32],
+        }));
+        service.handle().load(cue_media_id.clone());
+        let document = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let LyricsEvent::Current(CurrentLyrics::Ready {
+                    media_id,
+                    content: Some(CurrentLyricsContent::Document { document, .. }),
+                    origin: Some(LyricsOrigin::Native),
+                }) = received.recv().await.expect("cached CUE event")
+                    && media_id == cue_media_id
+                {
+                    break document;
+                }
+            }
+        })
+        .await
+        .expect("cached CUE lyrics remain displayable");
+        assert_eq!(document.lines[0].text, "Segment lyrics");
+        let cached = source
+            .cached_lyrics(&database, &file_uri, [0; 32])
+            .await
+            .expect("cache native local lyrics")
+            .expect("sidecar lyrics");
+        std::fs::write(audio.with_extension("lrc"), "[00:01.00]Updated file lyrics")
+            .expect("change sidecar");
+        assert_eq!(
+            source
+                .cached_lyrics(&database, &file_uri, [0; 32])
+                .await
+                .expect("reuse source cache"),
+            Some(cached),
+        );
+        let refreshed = source
+            .cached_lyrics(&database, &file_uri, [1; 32])
+            .await
+            .expect("new source input")
+            .expect("updated sidecar");
+        assert_eq!(
+            refreshed.documents()[0].lines[0].text,
+            "Updated file lyrics"
         );
     }
 
@@ -2012,7 +2043,11 @@ mod tests {
     #[test]
     fn karaoke_requires_word_timing_for_every_lyrics_origin() {
         let plan = Settings {
-            karaoke_mode: true,
+            preferences: lyrics::UserPreferences {
+                karaoke_mode: true,
+                ..lyrics::UserPreferences::default()
+            },
+
             ..Settings::default()
         }
         .automatic_lyrics_plan(false, "track");
@@ -2087,9 +2122,4 @@ mod tests {
             }],
         )
     }
-}
-
-fn embedded_lyrics_from_audio(path: &std::path::Path) -> Option<LyricsBundle> {
-    let content = sources::read_embedded_lyrics(path).ok().flatten()?;
-    lyrics_from_edited_text(&content)
 }

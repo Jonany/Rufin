@@ -343,7 +343,6 @@ fn connect_fullscreen_player_switcher(
 
 use crate::{bottom::BOTTOM_PLAYER_HEIGHT, state::NowPlayingPresentation};
 use gtk::glib;
-use gtk_widgets::artwork::cover_fetch_size_for_display;
 
 fn present_fullscreen_settings(shell: &Rc<crate::PlayerUi>) {
     let Some(window) = shell.window.upgrade() else {
@@ -382,10 +381,10 @@ fn present_fullscreen_settings(shell: &Rc<crate::PlayerUi>) {
     );
     let settings = shell.settings.current.borrow();
     let active = [
-        settings.fullscreen_lyrics_visible,
-        settings.fullscreen_visualizer_visible,
-        settings.fullscreen_dynamic_background,
-        settings.fullscreen_background_image,
+        settings.player_display.fullscreen_lyrics_visible,
+        settings.player_display.fullscreen_visualizer_visible,
+        settings.player_display.fullscreen_dynamic_background,
+        settings.player_display.fullscreen_background_image,
     ];
     drop(settings);
     let weak = Rc::downgrade(shell);
@@ -429,10 +428,10 @@ fn present_fullscreen_settings(shell: &Rc<crate::PlayerUi>) {
                 .settings
                 .update_app_settings("fullscreen display", |settings| {
                     let value = match index {
-                        0 => &mut settings.fullscreen_lyrics_visible,
-                        1 => &mut settings.fullscreen_visualizer_visible,
-                        2 => &mut settings.fullscreen_dynamic_background,
-                        _ => &mut settings.fullscreen_background_image,
+                        0 => &mut settings.player_display.fullscreen_lyrics_visible,
+                        1 => &mut settings.player_display.fullscreen_visualizer_visible,
+                        2 => &mut settings.player_display.fullscreen_dynamic_background,
+                        _ => &mut settings.player_display.fullscreen_background_image,
                     };
                     if *value == row.is_active() {
                         return false;
@@ -645,7 +644,7 @@ impl crate::PlayerUi {
                 .transport
                 .current
                 .as_ref()
-                .map(|track| track.media_uri.clone())
+                .map(|track| track.row.track.media_uri.clone())
         });
         if *parts.related_seed.borrow() == seed {
             return;
@@ -667,7 +666,7 @@ impl crate::PlayerUi {
             return;
         };
         let cancellation = library::ReadCancellation::new();
-        let candidates = self.playback_handles.radio.candidates(
+        let candidates = self.playback_owner.candidates(
             library::RadioSeed::Track(seed.clone()),
             20,
             cancellation.clone(),
@@ -675,11 +674,19 @@ impl crate::PlayerUi {
         let database = self.database.clone();
         let read_cancellation = cancellation.clone();
         let task = self.runtime.spawn(async move {
-            let uris = candidates.await?;
-            database
-                .track_rows_by_uri(&uris, &read_cancellation)
-                .await
-                .map_err(|error| error.to_string())
+            let keys = candidates.await?;
+            library::CatalogQuery::keys(
+                library::CatalogKind::Track,
+                None,
+                keys.iter().map(|key| key.raw()).collect(),
+            )
+            .rows(&database, 0, keys.len(), &read_cancellation)
+            .await
+            .map(|rows| match rows {
+                library::CatalogRows::Tracks(rows) => rows,
+                _ => unreachable!("typed catalog projection"),
+            })
+            .map_err(|error| error.to_string())
         });
         *parts.related_task.borrow_mut() = Some((cancellation, task.abort_handle()));
         let task_id = task.id();
@@ -742,10 +749,12 @@ impl crate::PlayerUi {
                 .library_list(rufin_core::settings::LibraryListKey::FullscreenTracks)
                 .display,
         );
-        parts.lyrics_enabled.set(settings.fullscreen_lyrics_visible);
+        parts
+            .lyrics_enabled
+            .set(settings.player_display.fullscreen_lyrics_visible);
         parts
             .visualizer_enabled
-            .set(settings.fullscreen_visualizer_visible);
+            .set(settings.player_display.fullscreen_visualizer_visible);
         drop(settings);
         parts.apply_mode();
         self.apply_fullscreen_responsive_layout();
@@ -759,13 +768,13 @@ impl crate::PlayerUi {
             return;
         }
         let settings = self.settings.current.borrow();
-        let dynamic = settings.fullscreen_dynamic_background;
+        let dynamic = settings.player_display.fullscreen_dynamic_background;
         parts.background.set_visible(dynamic);
         if dynamic {
             parts.root.add_css_class("artwork-background");
             parts.background.update(
                 parts.cover.drag_paintable_source().paintable(),
-                settings.fullscreen_background_image,
+                settings.player_display.fullscreen_background_image,
             );
         } else {
             parts.root.remove_css_class("artwork-background");
@@ -921,12 +930,10 @@ impl crate::PlayerUi {
             .cover
             .set_square_size(cover_size);
         if presentation.current {
-            let fetch_size = cover_fetch_size_for_display(512);
             self.artwork.bind_playback_artwork_tile(
                 &self.views.fullscreen_player.cover,
                 presentation.artwork.clone(),
-                512,
-                fetch_size,
+                cover_size,
             );
         } else {
             self.clear_fullscreen_player_cover();
@@ -1125,9 +1132,8 @@ fn update_fullscreen_meta_row(row: &gtk::FlowBox, parts: &[String]) {
 mod playback_refresh_tests {
     use super::*;
     use playback::{
-        ControlsView, CurrentMedia, CurrentMediaId, OccurrenceId, PlaybackOutput, Provenance,
-        QueueItem, QueueOccurrence, QueueSummaryView, RepeatMode, RunId, TransportStatus,
-        TransportView,
+        ControlsView, CurrentMedia, CurrentMediaId, PlaybackOutput, Provenance, QueueRow,
+        QueueSummaryView, RepeatMode, RunId, TrackReference, TransportStatus, TransportView,
     };
     use std::sync::Arc;
 
@@ -1152,7 +1158,7 @@ mod playback_refresh_tests {
         );
 
         let mut current_change = previous.clone();
-        current_change.transport.current = Some(Arc::new(current_media("Next", source)));
+        current_change.transport.current = Some(current_media("Next", source));
         assert_eq!(
             fullscreen_playback_refresh(Some(&previous), &current_change),
             FullscreenPlaybackRefresh::Static
@@ -1162,45 +1168,97 @@ mod playback_refresh_tests {
         assert_eq!(presentation.title, "Next");
         assert_eq!(presentation.artist, "Artist");
         assert_eq!(presentation.album, "Album");
-        assert_eq!(presentation.meta, ["MP3", "2026"]);
+        assert_eq!(
+            presentation.meta,
+            ["2026", "FLAC", "24 bit", "96 kHz", "Local"]
+        );
+        let mut streaming = current_change.clone();
+        let current = streaming.transport.current.as_mut().unwrap();
+        current.stream = Some(playback::CurrentStream {
+            local: false,
+            format: Some("audio/mpeg".into()),
+            transcoded: true,
+        });
+        assert_eq!(
+            NowPlayingPresentation::new(Some(&streaming)).meta,
+            ["2026", "MP3", "Streaming"]
+        );
+        assert_eq!(
+            rufin_core::settings::presentation::now_playing_labels(
+                streaming.transport.current.as_ref(),
+                Some("Living room")
+            ),
+            ["2026", "MP3", "Living room", "Streaming"]
+        );
+        assert_eq!(
+            fullscreen_playback_refresh(Some(&current_change), &streaming),
+            FullscreenPlaybackRefresh::Static
+        );
     }
 
     fn current_media(title: &str, _source: library::SourceKey) -> CurrentMedia {
-        let occurrence = OccurrenceId::new(format!("queue:{title}"));
+        let media_uri =
+            library::source_entity_uri(&library::SourceId::new("source"), "track", title);
         CurrentMedia {
+            stream: Some(playback::CurrentStream {
+                local: true,
+                format: Some("audio/flac".into()),
+                transcoded: false,
+            }),
             id: CurrentMediaId {
                 run: Some(RunId::new(1)),
-                occurrence: occurrence.clone(),
+                media_uri: media_uri.into(),
             },
-            occurrence: Arc::new(QueueOccurrence {
-                occurrence,
-                item: QueueItem {
-                    media_uri: library::source_entity_uri(
-                        &library::SourceId::new("source"),
-                        "track",
-                        title,
-                    ),
-                    title: title.to_string(),
-                    artist: "Artist".to_string(),
-                    album: "Album".to_string(),
-                    album_display_artist: None,
-                    artwork_binding: None,
-                    duration_millis: 180_000,
-                    disc_number: None,
-                    track_number: None,
-                    year: Some(2026),
-                    release_date: None,
-                    source_format: Some("audio/mpeg".to_string()),
-                    musicbrainz_recording_id: None,
-                    musicbrainz_release_track_id: None,
-                    musicbrainz_album_id: None,
-                    musicbrainz_release_group_id: None,
-                    primary_artist_musicbrainz_id: None,
-                },
-                canonical_position: 0,
-                source_index: None,
-                playlist_entry_id: None,
+            row: Arc::new(QueueRow {
+                occurrence_id: None,
+                position: 0,
+                received_from_connect: false,
                 provenance: Provenance::Manual,
+                track: {
+                    let reference = TrackReference {
+                        media_uri: library::source_entity_uri(
+                            &library::SourceId::new("source"),
+                            "track",
+                            title,
+                        ),
+                        artwork_binding: None,
+                        metadata: library::TrackMetadata {
+                            audio_properties: library::AudioProperties {
+                                bit_depth: Some(24),
+                                sample_rate_hz: Some(96_000),
+                                ..Default::default()
+                            },
+                            title: title.to_string(),
+                            artist: "Artist".to_string(),
+                            album: "Album".to_string(),
+                            album_display_artist: None,
+                            duration_millis: 180_000,
+                            disc_number: 0,
+                            track_number: 0,
+                            year: Some(2026),
+                            release_date: None,
+                            source_format: Some("audio/flac".to_string()),
+                            musicbrainz_recording_id: None,
+                            musicbrainz_release_track_id: None,
+                            musicbrainz_album_id: None,
+                            musicbrainz_release_group_id: None,
+                            primary_artist_musicbrainz_id: None,
+                            ..Default::default()
+                        },
+                    };
+                    library::TrackView {
+                        track_key: library::TrackKey::from_raw(1),
+                        source_key: None,
+                        source_id: None,
+                        object_id: None,
+                        media_uri: reference.media_uri,
+                        metadata: reference.metadata,
+                        artwork_binding: reference.artwork_binding,
+                        state: Default::default(),
+                        access: Default::default(),
+                        links: Default::default(),
+                    }
+                },
             }),
         }
     }
@@ -1210,20 +1268,18 @@ mod playback_refresh_tests {
         current: Option<CurrentMedia>,
         position_millis: u64,
     ) -> PlaybackView {
-        let current_occurrence = current.as_ref().map(|media| media.id.occurrence.clone());
         PlaybackView {
             queue_loading: false,
             queue_window: Vec::new(),
             queue: QueueSummaryView {
                 revision: 1,
                 total: usize::from(current.is_some()),
-                current_occurrence,
                 current_index: current.as_ref().map(|_| 0),
-                next_occurrence: None,
+                next_index: None,
                 can_next: false,
             },
             transport: TransportView {
-                current: current.map(Arc::new),
+                current,
                 state: TransportStatus::Playing,
                 desired_playing: true,
                 position_millis,

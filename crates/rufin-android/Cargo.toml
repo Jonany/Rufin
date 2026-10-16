@@ -20,7 +20,7 @@ development = ["app-identity/development"]
 
 [dependencies]
 app-identity.workspace = true
-uniffi = "=0.32.1"
+uniffi.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
 backup.workspace = true
@@ -36,8 +36,7 @@ localization.workspace = true
 lyrics.workspace = true
 playback.workspace = true
 playback-gstreamer.workspace = true
-pulldown-cmark = { workspace = true, features = ["html"] }
-rufin-core.workspace = true
+rufin-core = { workspace = true, features = ["bindings"] }
 rufin-connect.workspace = true
 rustls-platform-verifier = "0.7.0"
 secrets.workspace = true
@@ -46,7 +45,7 @@ sources.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-web.workspace = true
+web = { workspace = true, features = ["bindings"] }
 
 [lints]
 workspace = true

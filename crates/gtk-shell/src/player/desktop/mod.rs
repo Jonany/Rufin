@@ -13,7 +13,7 @@ use adw::prelude::*;
 #[cfg(target_os = "linux")]
 use ashpd::desktop::background::Background;
 use gtk::glib;
-use playback::{CurrentMedia, PlaybackView, PositionDiscontinuity, TransportHandle};
+use playback::{CurrentMedia, PlaybackView, PositionDiscontinuity};
 use tracing::{info, warn};
 
 use crate::Settings as UiSettings;
@@ -44,7 +44,10 @@ pub(crate) struct DesktopState {
 }
 
 impl DesktopState {
-    pub(crate) fn new(application: &adw::Application, transport: TransportHandle) -> Self {
+    pub(crate) fn new(
+        application: &adw::Application,
+        transport: std::sync::Arc<rufin_core::playback::PlaybackOwner>,
+    ) -> Self {
         let weak = application.downgrade();
         Self {
             media_controls: desktop_integration::MediaControls::start(transport, move |uri| {
@@ -89,7 +92,7 @@ impl Shell {
         self.chrome.window.set_visible(false);
         self.shutdown_tray();
 
-        let transport = self.products.playback.transport.clone();
+        let transport = self.products.playback.clone();
         let scrobbling = self.products.scrobbling.clone();
         let (completed, completion) = channel();
         if let Err(error) = std::thread::Builder::new()
@@ -150,7 +153,7 @@ impl Shell {
         refresh_current: bool,
     ) {
         let artwork = player.and_then(|player| {
-            player.transport.current.as_deref().and_then(|media| {
+            player.transport.current.as_ref().and_then(|media| {
                 self.artwork
                     .current_playback_cached_artwork_path(media, THUMB_COVER_SIZE)
                     .map(|artwork| artwork.path)
@@ -178,7 +181,7 @@ impl Shell {
             playback
                 .transport
                 .current
-                .as_deref()
+                .as_ref()
                 .and_then(|media| self.current_art_url(media))
         });
         self.desktop
@@ -351,7 +354,7 @@ impl Shell {
         if self.desktop.tray.borrow().is_some() {
             return true;
         }
-        let private_mode = self.settings.current.borrow().private_mode;
+        let private_mode = self.settings.current.borrow().application.private_mode;
         let (tray, receiver) = match desktop_integration::Tray::start(private_mode) {
             Ok(started) => started,
             Err(error) => {
@@ -374,7 +377,7 @@ impl Shell {
     }
 
     pub(crate) fn refresh_tray_private_mode(&self) {
-        let private_mode = self.settings.current.borrow().private_mode;
+        let private_mode = self.settings.current.borrow().application.private_mode;
         if let Some(tray) = self.desktop.tray.borrow().as_ref() {
             tray.set_private_mode(private_mode);
         }
@@ -394,16 +397,16 @@ impl Shell {
                 match intent {
                     desktop_integration::TrayIntent::Present => shell.present_from_tray(),
                     desktop_integration::TrayIntent::PlayPause => {
-                        shell.products.playback.transport.play_pause();
+                        shell.products.playback.play_pause();
                     }
                     desktop_integration::TrayIntent::PreviousTrack => {
-                        shell.products.playback.transport.previous();
+                        shell.products.playback.previous();
                     }
                     desktop_integration::TrayIntent::NextTrack => {
-                        shell.products.playback.transport.next();
+                        shell.products.playback.next();
                     }
                     desktop_integration::TrayIntent::TogglePrivateMode => {
-                        let enabled = !shell.settings.current.borrow().private_mode;
+                        let enabled = !shell.settings.current.borrow().application.private_mode;
                         shell.preferences.set_private_mode(enabled);
                     }
                     desktop_integration::TrayIntent::Quit => {

@@ -22,7 +22,7 @@
     <input type="hidden" name="payload" value="{{ row.selection(kind) }}" />
 
   <div class="cover-wrap">
-    {% if kind == "track" %}<button type="submit" name="mode" value="replace" class="cover-open" data-action="open" aria-label="{{ row.title() }}">{% else %}<a href="{{ row.href(kind) }}" class="cover-open" data-action="open" aria-label="{{ row.title() }}">{% endif %}<div class="cover">{% call icon("cover-fallback") %}{% endcall %}<noscript><img src="{{ row.artwork(kind) }}" loading="lazy" alt="" /></noscript></div>{% if kind == "track" %}</button>{% else %}</a>{% endif %}
+    {% if kind == "track" %}<button type="submit" name="mode" value="replace" class="cover-open" data-action="open" aria-label="{{ row.title() }}">{% else %}<a href="{{ row.href(kind) }}" class="cover-open" data-action="open" aria-label="{{ row.title() }}">{% endif %}<div class="cover{% if row.number("artwork_count") > 1 %} cover-mosaic{% endif %}">{% for preview in row.preview_tiles() %}{% if row.number("artwork_count") > 1 %}<span class="cover-quadrant">{% endif %}{% if preview != "" %}<img src="{{ preview }}" alt="" />{% else %}{% call icon("cover-fallback") %}{% endcall %}{% endif %}{% if row.number("artwork_count") > 1 %}</span>{% endif %}{% endfor %}<noscript><img src="{{ row.artwork(kind) }}" loading="lazy" alt="" /></noscript></div>{% if kind == "track" %}</button>{% else %}</a>{% endif %}
     <div class="cover-controls">
       <button type="submit" name="mode" value="next" data-action="next" class="cover-next" aria-label="{{ localization::tr("Play Next") }}">{% call icon("play-next") %}{% endcall %}</button>
       <button type="submit" name="mode" value="replace" data-action="replace" class="cover-play" aria-label="{{ localization::tr("Play") }}">{% call icon("play") %}{% endcall %}</button>
@@ -44,4 +44,22 @@
   <button type="button" data-step="-1" aria-label="{{ localization::tr("Decrease") }}"{% if disabled %} disabled{% endif %}>{% call icon("remove") %}{% endcall %}</button>
   <button type="button" data-step="1" aria-label="{{ localization::tr("Increase") }}"{% if disabled %} disabled{% endif %}>{% call icon("add") %}{% endcall %}</button>
 </div>
+{% endmacro %}
+
+{% macro track_sort_options(selected) %}
+<option value="title" {% if selected == "title" %}selected{% endif %}>{{ localization::tr("Title") }}</option>
+<option value="artist" {% if selected == "artist" %}selected{% endif %}>{{ localization::tr("Artist") }}</option>
+<option value="album_artist" {% if selected == "album_artist" %}selected{% endif %}>{{ localization::tr("Album artist") }}</option>
+<option value="album" {% if selected == "album" %}selected{% endif %}>{{ localization::tr("Album") }}</option>
+<option value="track_number" {% if selected == "track_number" %}selected{% endif %}>{{ localization::tr("Track number") }}</option>
+<option value="year" {% if selected == "year" %}selected{% endif %}>{{ localization::tr("Year") }}</option>
+<option value="release_date" {% if selected == "release_date" %}selected{% endif %}>{{ localization::tr("Release date") }}</option>
+<option value="date_added" {% if selected == "date_added" %}selected{% endif %}>{{ localization::tr("Date added") }}</option>
+<option value="last_played" {% if selected == "last_played" %}selected{% endif %}>{{ localization::tr("Last played") }}</option>
+<option value="play_count" {% if selected == "play_count" %}selected{% endif %}>{{ localization::tr("Plays") }}</option>
+<option value="rating" {% if selected == "rating" %}selected{% endif %}>{{ localization::tr("Rating") }}</option>
+<option value="genre" {% if selected == "genre" %}selected{% endif %}>{{ localization::tr("Genre") }}</option>
+<option value="bpm" {% if selected == "bpm" %}selected{% endif %}>{{ localization::tr("BPM") }}</option>
+<option value="duration" {% if selected == "duration" %}selected{% endif %}>{{ localization::tr("Duration") }}</option>
+<option value="favorite" {% if selected == "favorite" %}selected{% endif %}>{{ localization::tr("Favorite") }}</option>
 {% endmacro %}

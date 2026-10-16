@@ -13,7 +13,7 @@
     "GET /api/pins": "Read shared sidebar pins and their resolved items in saved order.",
     "POST /api/pins": "Set a pin with {pin,pinned}. Pin is Album {source_id,album_id}, Artist {source_id,artist_id,album_artist}, Genre {source_id,genre_id}, Playlist {source_id,playlist_id}, or SmartPlaylist {playlist_id}, wrapped in its type name. IDs are object_id values, not numeric database keys; omit source_id for a local playlist.",
     "PATCH /api/pins": "Reorder with {moved,target}, each a pin identity. Uses the desktop drag order: before when moving upward, after when moving downward.",
-    "Queue drop position": "POST /api/queue and its collection routes accept mode insert with before or after (queue occurrence ID). Omit both to insert at the end. Uses the desktop drop operation without starting playback. POST /api/queue/reorder also accepts before or after.",
+    "Queue drop position": "POST /api/queue and its collection routes accept mode insert with before or after (zero-based queue position). Omit both to insert at the end. Uses the desktop drop operation without starting playback. POST /api/queue/reorder also accepts before or after.",
     "GET /api/playback/events": "Follow playback changes",
     "POST /api/playback/play": {},
     "POST /api/playback/pause": {},
@@ -48,7 +48,7 @@
       "block": "Explore | MostPlayed | NewlyAdded | RecentlyPlayed | RecentlyReleased"
     },
     "GET /api/appearance": "The app's theme and colors.",
-    "POST /api/sources": "Add a source and scan its music. See source_setup for examples. Returns the source ID when finished.",
+    "POST /api/sources": "Connect, save and select a source, then scan its music in the background. Returns the source ID after selection. Follow /api/sources/events for scan progress. See source_setup for examples.",
     "PATCH /api/sources": "Change source settings. See source_update for examples.",
     "POST /api/sources/local": {
       "paths": ["/path/to/music"]
@@ -59,7 +59,12 @@
     "POST /api/sources/refresh": {
       "id": "source ID"
     },
-    "GET /api/sources/progress": "Check progress while adding, switching or refreshing a source.",
+    "POST /api/sources/download-artwork": "Start downloading artwork from the selected source library with {id:source ID}. Uses the source's artwork and the configured music-folder scope. Does not search external services.",
+    "POST /api/sources/download-lyrics": "Start downloading lyrics from the selected source library with {id:source ID}. Uses embedded, sidecar or source-provided lyrics. Does not search external services.",
+    "POST /api/sources/cancel-download": "Cancel the source artwork or lyrics download with {id:source ID}. Completed downloads are kept.",
+    "POST /api/downloads/clear-artwork-cache": "Clear the artwork cache across sources. Keeps artwork for completed and active music downloads, authored playlist artwork and source files. Takes no body and returns after clearing.",
+    "POST /api/downloads/clear-lyrics-cache": "Clear cached lyrics across sources. Keeps lyrics for completed and active music downloads, edited lyrics and source files. Takes no body and returns after clearing.",
+    "GET /api/sources/progress": "Check progress while adding, switching, refreshing or downloading source artwork and lyrics.",
     "GET /api/sources/events": "Follow source progress, starting with the current status.",
     "POST /api/sources/login/plex": {
       "method": "browser"
@@ -104,7 +109,7 @@
     "POST /api/playlists/export": "Export {id,path,source,path_mode,linked}. The filename selects M3U/M3U8/PLS/XSPF. source is optional; without it path is on the Rufin host. linked defaults to false.",
     "PATCH /api/playlists/file": "Edit with {id,name,auto_refresh,auto_save,path_mode}. auto_save is null to inherit the source default, false, or true. path_mode is automatic, relative, or absolute.",
     "POST /api/playlists/file": "Run {id,action,force,path,source}. Actions are save, reload, unlink, delete, link, or rename. rename takes a sibling filename in path. link loads the file unless force is true, which writes the playlist. source is optional; without it path is on the Rufin host. force explicitly overwrites external file changes for save or discards unsaved playlist edits for reload.",
-    "GET /api/playlists/entries?id=...": "Browse tracks in a playlist, up to 256 at a time. You can set offset, limit, q, sort and descending. To filter by folder, include source too.",
+    "GET /api/playlists/entries?id=...": "Browse tracks in a playlist, up to 256 at a time. You can set offset, limit, q, sort and descending. Sort accepts track_sort choices or position for playlist order, the default. To filter by folder, include source too.",
     "POST /api/playlists/remove-unavailable?id=...": "Remove confirmed missing tracks from a Rufin global or file playlist. A failed availability check leaves the playlist unchanged. Returns {removed}. Does not delete media files.",
     "POST /api/playlists/entries": {
       "id": 1,
@@ -148,28 +153,28 @@
     "POST /api/favorite": "Set favorite with {kind: track, album or artist, uri, favorite: true or false}. Returns the effective favorite state.",
     "POST /api/queue/radio": "Play radio with {kind: track, uri} or {kind: album, artist, album_artist or playlist, id}.",
     "POST /api/queue/activate": {
-      "id": "queue track ID"
+      "position": 0
     },
-    "POST /api/queue/item": "Remove a queue occurrence with {id}, including from a browser form.",
-    "DELETE /api/queue/item?id=...": "Remove a track from the queue",
+    "POST /api/queue/item": "Remove a queue row with {position}, including from a browser form.",
+    "DELETE /api/queue/item?position=...": "Remove a track from the queue",
     "GET /api/lyrics": "Lyrics for the current track, with line and word timings when available.",
     "POST /api/lyrics": "Load lyrics for the current track using your lyrics settings.",
-    "GET /api/lyrics/events": "Follow lyrics updates. The id matches the current queue track ID.",
-    "GET /api/artwork?uri=...": "Track or album cover as PNG. Add original=true for the original format, including animation. Returns 404 if unavailable.",
+    "GET /api/lyrics/events": "Follow lyrics updates. The media_uri and run match the current playback media.",
+    "GET /api/artwork?uri=...": "Track or album cover as PNG. Set size to the displayed physical pixel size. Add original=true for the original format, including animation. Returns 404 if unavailable.",
     "POST /api/queue/reorder": {
-      "ids": ["queue track ID"],
-      "before": "queue track ID, or null for the end"
+      "positions": [0],
+      "before": "zero-based queue position, or null for the end"
     },
     "POST /api/queue/next": {
-      "id": "queue track ID"
+      "position": 0
     },
-    "GET /api/events": "Follow playback, source progress and lyrics together on one connection.",
+    "GET /api/events": "Follow playback, source progress, catalog changes and lyrics together on one connection.",
     "GET /api/artists?source=...": "Browse artists. Use offset, limit (up to 128), q, sort, descending, favorites and album_artists.",
     "GET /api/artists/tracks?id=...": "Browse an artist’s tracks, up to 256 at a time. Use q, sort, descending and album_artists.",
     "GET /api/genres/tracks?id=...": "Browse tracks in a genre. Use q, sort, descending, offset and limit. To filter by library folder, include source and folder.",
     "POST /api/queue/genre": { "id": 1, "mode": "replace | next | append" },
     "GET /api/smart-playlists?source=...": "Browse saved smart playlists, up to 64 at a time. Source is optional; use q, sort and descending.",
-    "GET /api/smart-playlists/tracks?id=...": "Browse tracks selected by the saved playlist rules and order. Use source, q, offset and limit (up to 256).",
+    "GET /api/smart-playlists/tracks?id=...": "Browse tracks selected by the saved playlist rules and limit. Use source, q, offset, limit (up to 256), sort and descending. Sort accepts track_sort choices or definition for the saved playlist order, the default.",
     "POST /api/queue/artist": {
       "id": 1,
       "mode": "replace"
@@ -177,6 +182,8 @@
     "POST /api/queue/smart-playlist": {
       "id": 1,
       "source": null,
+      "sort": "definition or a track_sort choice",
+      "descending": false,
       "mode": "replace"
     },
     "POST /api/playback/auto-dj": "Toggle Auto DJ using the app’s existing settings.",
@@ -316,7 +323,6 @@
       "favorite"
     ],
     "playlist_sort": ["position", "title", "track_count", "duration"],
-    "playlist_entry_sort": ["position", "title", "artist", "album"],
     "artist_sort": [
       "title",
       "album_count",

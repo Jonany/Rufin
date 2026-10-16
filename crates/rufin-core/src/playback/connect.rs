@@ -1,8 +1,12 @@
 //! A Rufin receiver owns playback and its queue; this device observes and controls it.
 use super::*;
 use crate::connect::{ConnectOwner, Control, casting::ReceiverState};
-use playback::{ExternalPlayback, PlaybackOutput, RemoteOutputProtocol};
-use std::sync::atomic::AtomicBool;
+use crate::playback::{
+    actor::Playback,
+    state::{Command, ExternalPlayback},
+};
+use playback::{PlaybackOutput, RemoteOutputProtocol};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Default)]
 struct VolumeRequests {
@@ -20,7 +24,6 @@ pub(super) struct RufinPlayback {
     volume: Mutex<VolumeRequests>,
     volume_changed: Arc<tokio::sync::Notify>,
     revision: Mutex<Option<u64>>,
-    content_id: Mutex<String>,
     cancelled: AtomicBool,
     observer: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -45,63 +48,63 @@ impl RufinPlayback {
     }
 
     async fn refresh(&self) -> Result<(), String> {
-        let mut state = self.connection()?.receiver_state(&self.peer).await?;
+        let state = self.connection()?.receiver_state(&self.peer).await?;
         if self.cancelled.load(Ordering::Acquire) {
             return Ok(());
         }
         let previous = self.playback.projection().map_err(string_error)?.view;
-        let current = previous
-            .transport
-            .current
-            .as_ref()
-            .map(|media| &media.id.occurrence);
         let changed = *self.revision.lock().unwrap_or_else(|p| p.into_inner())
             != Some(state.revision)
-            || current != state.current.as_ref()
+            || previous.queue.current_index != state.current
             || previous
                 .queue_window
                 .iter()
-                .map(|row| &row.occurrence)
-                .ne(state.rows.iter().map(|row| &row.occurrence));
-        if changed {
-            let uris = state
-                .rows
-                .iter()
-                .map(|row| row.media_uri.clone())
-                .collect::<Vec<_>>();
-            let bindings = self
+                .map(|row| (&row.track.media_uri, row.position))
+                .ne(state
+                    .rows
+                    .iter()
+                    .map(|row| (&row.item.media_uri, row.position)));
+        let restore = if changed {
+            let mut page = self
                 .database
-                .queue_artwork_for_uris(&uris)
+                .queue_entries(
+                    library::QueueLoad::items(
+                        state
+                            .rows
+                            .iter()
+                            .map(|row| (row.item.clone(), row.provenance.clone()))
+                            .collect(),
+                    ),
+                    None,
+                )
                 .await
-                .map_err(string_error)?
-                .into_iter()
-                .collect::<std::collections::HashMap<_, _>>();
-            for row in &mut state.rows {
-                row.item.artwork_binding = bindings.get(&row.media_uri).cloned().flatten();
+                .map_err(string_error)?;
+            for (entry, row) in page.entries.iter_mut().zip(&state.rows) {
+                entry.received_from_connect = row.received_from_connect;
             }
-        }
-        let restore = changed.then(|| library::QueueRestore {
-            entries: state
-                .rows
-                .iter()
-                .map(|row| library::QueueEntry {
-                    occurrence: row.occurrence.clone(),
-                    media_uri: row.media_uri.clone().into(),
-                    playlist_entry_id: row.playlist_entry_id.clone().map(Into::into),
-                    provenance: row.provenance.clone(),
-                })
-                .collect(),
-            order: (0..state.rows.len() as u32).collect(),
-            current_index: state
-                .current
-                .as_ref()
-                .and_then(|current| state.rows.iter().position(|row| &row.occurrence == current)),
-            occurrences: state.rows.iter().cloned().map(Arc::new).collect(),
-            progress_millis: state.position.min(i64::MAX as u64) as i64,
-            repeat_mode: state.repeat,
-            shuffled: state.shuffle,
-            next_id: 0,
-        });
+            let rows = self
+                .database
+                .queue_rows_for_entries(
+                    &page.entries.iter().cloned().enumerate().collect::<Vec<_>>(),
+                    &ReadCancellation::new(),
+                )
+                .await
+                .map_err(string_error)?;
+            Some(library::QueueRestore {
+                ids: Arc::from([]),
+                entries: page.entries.into(),
+                order: (0..state.rows.len() as u32).collect(),
+                current_index: state
+                    .current
+                    .and_then(|position| position.checked_sub(state.offset)),
+                rows,
+                progress_millis: state.position.min(i64::MAX as u64) as i64,
+                repeat_mode: state.repeat,
+                shuffled: state.shuffle,
+            })
+        } else {
+            None
+        };
         self.playback
             .observe_external(
                 self.output.clone(),
@@ -120,26 +123,18 @@ impl RufinPlayback {
             )
             .map_err(string_error)?;
         self.playback
-            .command(SessionCommand::SetAutoDj {
+            .command(Command::SetAutoDj {
                 enabled: state.auto_dj,
                 refill_threshold: state.auto_dj_threshold,
             })
             .map_err(string_error)?;
         *self.revision.lock().unwrap_or_else(|p| p.into_inner()) = Some(state.revision);
-        *self.content_id.lock().unwrap_or_else(|p| p.into_inner()) = state.content_id;
         Ok(())
     }
 
     pub(super) async fn snapshot(&self) -> Result<Option<playback::Continuation>, String> {
         let _command = self.commands.lock().await;
         self.connection()?.receiver_queue(&self.peer).await
-    }
-
-    pub(super) fn content_id(&self) -> String {
-        self.content_id
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
     }
 
     pub(super) async fn stop_continuation(
@@ -158,46 +153,32 @@ impl RufinPlayback {
 
     async fn input(
         &self,
-        input: library::QueueInput,
-        title: Option<Arc<library::QueueContextTitle>>,
-        anchor: usize,
-        shuffled: Option<u64>,
-        placement: library::QueuePlacement,
+        request: PlayRequest,
         target: Option<library::QueueReorderTarget>,
     ) -> Result<(), String> {
-        let page = self
-            .database
-            .read_queue(library::QueueReadRequest::Capture {
-                input: Box::new(input),
-                context_title: title,
-                anchor_index: anchor,
-                random_start: None,
-                shuffled,
-            })
+        let placement = request.placement;
+        let shuffled = self
+            .playback
+            .projection()
+            .is_ok_and(|projection| projection.view.controls.shuffle_enabled);
+        let page = request
+            .prepare(&self.database, shuffled, random_u64())
             .await
             .map_err(string_error)?;
         if page.entries.is_empty() {
             return Ok(());
         }
-        let namespace = page.entries[0]
-            .occurrence
-            .as_str()
-            .rsplit_once(':')
-            .map(|(prefix, _)| format!("{prefix}:"));
+        let current_index = page.current_index;
         let queue = library::QueueRestore {
             order: (0..page.entries.len() as u32).collect(),
             entries: page.entries.into(),
-            occurrences: page.occurrences,
-            current_index: Some(page.current_index),
+            current_index: Some(current_index),
             ..Default::default()
         };
         let result = self
             .connection()?
             .send_cast_input(&self.peer, queue, placement, target)
             .await;
-        if let Some(namespace) = namespace {
-            let _ = self.database.discard_queue_capture(&namespace).await;
-        }
         result?;
         self.refresh().await
     }
@@ -209,15 +190,17 @@ impl PlaybackOwner {
             stored.ui.auto_dj_enabled = enabled;
             Ok(())
         });
-        self.send(SessionCommand::SetAutoDj {
+        self.send(Command::SetAutoDj {
             enabled,
-            refill_threshold: usize::from(self.settings.load().ui.auto_dj_refill_threshold),
+            refill_threshold: usize::from(
+                self.settings.load().ui.application.auto_dj_refill_threshold,
+            ),
         });
     }
 
     pub(crate) async fn receiver_state(&self) -> Result<ReceiverState, String> {
         let active = self.active().ok_or("Playback is unavailable")?;
-        let view = active.playback.projection().map_err(string_error)?.view;
+        let view = active.projection().map_err(string_error)?.view;
         let offset = view
             .queue
             .current_index
@@ -235,8 +218,8 @@ impl PlaybackOwner {
             .into_iter()
             .enumerate()
             .map(|(index, row)| {
-                let mut row = (*row).clone();
-                row.canonical_position = offset + index;
+                let mut row = library::QueueTransferRow::from(row.as_ref());
+                row.position = offset + index;
                 row
             })
             .collect();
@@ -244,7 +227,7 @@ impl PlaybackOwner {
             revision: view.queue.revision,
             total: view.queue.total,
             offset,
-            current: view.queue.current_occurrence,
+            current: view.queue.current_index,
             rows,
             state: view.transport.effective_state(),
             position: view.transport.position_millis,
@@ -254,8 +237,9 @@ impl PlaybackOwner {
             repeat: view.controls.repeat_mode,
             shuffle: view.controls.shuffle_enabled,
             auto_dj: view.controls.auto_dj_enabled,
-            auto_dj_threshold: usize::from(self.settings.load().ui.auto_dj_refill_threshold),
-            content_id: active.playback.queue_content_id().map_err(string_error)?,
+            auto_dj_threshold: usize::from(
+                self.settings.load().ui.application.auto_dj_refill_threshold,
+            ),
         })
     }
 
@@ -264,70 +248,96 @@ impl PlaybackOwner {
         offset: u64,
         limit: u32,
         filter: String,
-    ) -> Result<playback::QueuePage, String> {
+    ) -> Result<crate::playback::QueuePage, String> {
         let limit = limit.min(library::QUEUE_CONTEXT_LIMIT as u32);
         let receiver = self.rufin.lock().unwrap_or_else(|p| p.into_inner()).clone();
         if let Some(receiver) = receiver {
             let _command = receiver.commands.lock().await;
-            let mut page = receiver
+            let page = receiver
                 .connection()?
                 .receiver_queue_page(&receiver.peer, offset, limit, filter)
                 .await?;
-            let uris = page
-                .rows
-                .iter()
-                .map(|row| row.media_uri.clone())
-                .collect::<Vec<_>>();
-            let bindings = self
+            let page_entries = self
                 .database
-                .queue_artwork_for_uris(&uris)
+                .queue_entries(
+                    library::QueueLoad::items(
+                        page.rows
+                            .iter()
+                            .map(|row| (row.item.clone(), row.provenance.clone()))
+                            .collect(),
+                    ),
+                    None,
+                )
                 .await
-                .map_err(string_error)?
+                .map_err(string_error)?;
+            let entries = page_entries
+                .entries
                 .into_iter()
-                .collect::<std::collections::HashMap<_, _>>();
-            for row in &mut page.rows {
-                Arc::make_mut(row).item.artwork_binding =
-                    bindings.get(&row.media_uri).cloned().flatten();
-            }
-            return Ok(page);
+                .zip(&page.rows)
+                .map(|(mut entry, row)| {
+                    entry.received_from_connect = row.received_from_connect;
+                    (row.position, entry)
+                })
+                .collect::<Vec<_>>();
+            let rows = self
+                .database
+                .queue_rows_for_entries(&entries, &ReadCancellation::new())
+                .await
+                .map_err(string_error)?;
+            return Ok(crate::playback::QueuePage {
+                rows,
+                total: page.total,
+                window_offset: page.window_offset,
+            });
         }
         let Some(active) = self.active() else {
-            return Ok(playback::QueuePage {
+            return Ok(crate::playback::QueuePage {
                 rows: Vec::new(),
                 total: 0,
                 window_offset: 0,
             });
         };
-        let (matches, filtered_total) = if filter.trim().is_empty() {
-            (None, None)
+        let (requested, total) = if filter.trim().is_empty() {
+            let (entries, total) = active
+                .page_entries(offset as usize, limit as usize)
+                .map_err(string_error)?;
+            (entries, total as u64)
         } else {
-            let (matches, total) = self
+            let queue = active.handoff_snapshot().map_err(string_error)?.0;
+            let (positions, total) = self
                 .database
-                .saved_queue_search_page(&filter, offset, limit)
+                .queue_search_page(&queue, &filter, offset, limit)
                 .await
                 .map_err(string_error)?;
-            (Some(matches), Some(total))
+            let entries = positions
+                .into_iter()
+                .map(|position| {
+                    let index = queue.order[position] as usize;
+                    (
+                        position,
+                        queue.ids.get(index).copied(),
+                        queue.entries[index].clone(),
+                    )
+                })
+                .collect();
+            (entries, total)
         };
-        let (entries, total, window_offset) = active
-            .playback
-            .queue_members(
-                offset.min(usize::MAX as u64) as usize,
-                limit as usize,
-                matches,
-            )
-            .map_err(string_error)?;
-        let page = self
+        let entries = requested
+            .iter()
+            .map(|(position, _, entry)| (*position, entry.clone()))
+            .collect::<Vec<_>>();
+        let mut rows = self
             .database
-            .read_queue(library::QueueReadRequest::Hydrate {
-                entries: entries.clone(),
-            })
+            .queue_rows_for_entries(&entries, &ReadCancellation::new())
             .await
             .map_err(string_error)?;
-        let page = self.import_missing_plex_queue_rows(entries, page).await?;
-        Ok(playback::QueuePage {
-            rows: page.occurrences,
-            total: filtered_total.unwrap_or(total as u64),
-            window_offset: window_offset as u64,
+        for (row, (_, id, _)) in rows.iter_mut().zip(requested) {
+            Arc::make_mut(row).occurrence_id = id;
+        }
+        Ok(crate::playback::QueuePage {
+            rows,
+            total,
+            window_offset: offset.min(total),
         })
     }
 
@@ -343,17 +353,14 @@ impl PlaybackOwner {
             return plex.cast_queue_snapshot().await;
         }
         let active = self.active().ok_or("Playback is unavailable")?;
-        if let Some(snapshot) = active.playback.continuation().map_err(string_error)? {
+        if let Some(snapshot) = active.continuation().map_err(string_error)? {
             return Ok(Some(snapshot));
         }
-        let queue = active.playback.handoff_snapshot().map_err(string_error)?.0;
-        let Some(current) = queue.current().cloned().or_else(|| {
-            queue
-                .order
-                .first()
-                .and_then(|index| queue.entries.get(*index as usize))
-                .map(|entry| entry.occurrence.clone())
-        }) else {
+        let queue = active.handoff_snapshot().map_err(string_error)?.0;
+        let Some(current) = queue
+            .current_index
+            .or_else(|| (!queue.entries.is_empty()).then_some(0))
+        else {
             return Ok(None);
         };
         let settings = self.settings.load().ui;
@@ -365,7 +372,9 @@ impl PlaybackOwner {
                 repeat: queue.repeat_mode,
                 shuffled: queue.shuffled,
                 auto_dj: settings.auto_dj_enabled,
-                auto_dj_refill_threshold: usize::from(settings.auto_dj_refill_threshold),
+                auto_dj_refill_threshold: usize::from(
+                    settings.application.auto_dj_refill_threshold,
+                ),
                 playback_rate: settings.playback.playback_rate,
                 desired_playing: false,
                 listen: None,
@@ -422,14 +431,13 @@ impl PlaybackOwner {
         let receiver = Arc::new(RufinPlayback {
             peer: remote.id.clone(),
             connect: Arc::downgrade(&connect),
-            playback: active.playback.clone(),
+            playback: active.clone(),
             database: self.database.clone(),
             output: output.clone(),
             commands: tokio::sync::Mutex::new(()),
             volume: Mutex::new(VolumeRequests::default()),
             volume_changed,
             revision: Mutex::new(None),
-            content_id: Mutex::new(String::new()),
             cancelled: AtomicBool::new(false),
             observer: Mutex::new(None),
         });
@@ -437,14 +445,7 @@ impl PlaybackOwner {
             connect
                 .select_receiver(
                     &receiver.peer,
-                    active
-                        .playback
-                        .projection()
-                        .map_err(string_error)?
-                        .view
-                        .queue
-                        .total
-                        > 0,
+                    active.projection().map_err(string_error)?.view.queue.total > 0,
                 )
                 .await?;
             if cancelled.load(Ordering::Acquire) {
@@ -513,9 +514,7 @@ impl PlaybackOwner {
                 }
                 .await;
                 if let Err(error) = result {
-                    let _ = receiver
-                        .playback
-                        .command(SessionCommand::OperationFailed(error));
+                    let _ = receiver.playback.command(Command::OperationFailed(error));
                 }
             }
         });
@@ -553,30 +552,11 @@ impl PlaybackOwner {
         let Some(receiver) = self.rufin.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
             return false;
         };
-        let mut request = request.clone();
-        request.shuffled_start &= request.placement == library::QueuePlacement::Now
-            && receiver
-                .playback
-                .projection()
-                .is_ok_and(|projection| projection.view.controls.shuffle_enabled);
-        let anchor = request.anchor_index;
-        let (batch, placement) = request.compact_batch(random_u64());
+        let request = request.clone();
         self.runtime.spawn(async move {
             let _command = receiver.commands.lock().await;
-            if let Err(error) = receiver
-                .input(
-                    batch.input().clone(),
-                    batch.context_title().cloned(),
-                    anchor,
-                    batch.shuffled_seed(),
-                    placement,
-                    None,
-                )
-                .await
-            {
-                let _ = receiver
-                    .playback
-                    .command(SessionCommand::OperationFailed(error));
+            if let Err(error) = receiver.input(request, None).await {
+                let _ = receiver.playback.command(Command::OperationFailed(error));
             }
         });
         true
@@ -591,12 +571,14 @@ impl PlaybackOwner {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
+        let selected = source.upgrade().and_then(|owner| owner.selected_library());
         let request = request.clone();
         self.runtime.spawn(async move {
             let result = async {
                 let candidates = crate::radio::radio_candidates(
                     &receiver.database,
                     source,
+                    selected,
                     request.seed,
                     20,
                     &ReadCancellation::new(),
@@ -605,23 +587,17 @@ impl PlaybackOwner {
                 let _command = receiver.commands.lock().await;
                 receiver
                     .input(
-                        library::QueueInput::MediaUris {
-                            order: candidates.into(),
-                            provenance: playback::Provenance::Radio,
-                        },
-                        None,
-                        0,
-                        None,
-                        request.placement,
+                        PlayRequest::from_input(
+                            library::QueueLoad::track_keys(candidates, playback::Provenance::Radio),
+                            request.placement,
+                        ),
                         None,
                     )
                     .await
             }
             .await;
             if let Err(error) = result {
-                let _ = receiver
-                    .playback
-                    .command(SessionCommand::OperationFailed(error));
+                let _ = receiver.playback.command(Command::OperationFailed(error));
             }
         });
         true
@@ -633,19 +609,18 @@ impl PlaybackOwner {
         };
         let Some(selected) = self
             .source_owner()
-            .and_then(|source| source.current_session())
-            .and_then(|session| session.resolve())
+            .and_then(|source| source.selected_library())
         else {
             return true;
         };
         let excluded = self
             .current_media()
-            .map(|media| vec![media.media_uri.clone()])
+            .map(|media| vec![media.row.track.track_key])
             .unwrap_or_default();
         let request = request.clone();
         self.runtime.spawn(async move {
             let result = async {
-                let candidates = selected
+                let candidates = receiver
                     .database
                     .random_candidates(
                         selected.source_key,
@@ -660,62 +635,53 @@ impl PlaybackOwner {
                 let _command = receiver.commands.lock().await;
                 receiver
                     .input(
-                        library::QueueInput::MediaUris {
-                            order: candidates.into(),
-                            provenance: playback::Provenance::Random,
-                        },
-                        None,
-                        0,
-                        None,
-                        request.placement,
+                        PlayRequest::from_input(
+                            library::QueueLoad::track_keys(
+                                candidates,
+                                playback::Provenance::Random,
+                            ),
+                            request.placement,
+                        ),
                         None,
                     )
                     .await
             }
             .await;
             if let Err(error) = result {
-                let _ = receiver
-                    .playback
-                    .command(SessionCommand::OperationFailed(error));
+                let _ = receiver.playback.command(Command::OperationFailed(error));
             }
         });
         true
     }
 
-    pub(super) fn send_rufin(&self, command: SessionCommand) -> Option<SessionCommand> {
+    pub(super) fn send_rufin(&self, command: Command) -> Option<Command> {
         let Some(receiver) = self.rufin.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
             return Some(command);
         };
-        if let SessionCommand::Insert { input, target } = command {
+        if let Command::Insert { input, target } = command {
             self.runtime.spawn(async move {
                 let _command = receiver.commands.lock().await;
                 if let Err(error) = receiver
                     .input(
-                        input,
-                        None,
-                        0,
-                        None,
-                        library::QueuePlacement::End,
+                        PlayRequest::from_input(input, library::QueuePlacement::End),
                         Some(target),
                     )
                     .await
                 {
-                    let _ = receiver
-                        .playback
-                        .command(SessionCommand::OperationFailed(error));
+                    let _ = receiver.playback.command(Command::OperationFailed(error));
                 }
             });
             return None;
         }
         let control = match command {
-            SessionCommand::PlayPause => Control::PlayPause,
-            SessionCommand::Play => Control::Play,
-            SessionCommand::Pause => Control::Pause,
-            SessionCommand::Stop => Control::Stop,
-            SessionCommand::Next => Control::Next,
-            SessionCommand::Previous => Control::Previous,
-            SessionCommand::Seek(millis) => Control::Seek { millis },
-            SessionCommand::SetVolume(value) => {
+            Command::PlayPause => Control::PlayPause,
+            Command::Play => Control::Play,
+            Command::Pause => Control::Pause,
+            Command::Stop => Control::Stop,
+            Command::Next => Control::Next,
+            Command::Previous => Control::Previous,
+            Command::Seek(millis) => Control::Seek { millis },
+            Command::SetVolume(value) => {
                 receiver
                     .volume
                     .lock()
@@ -724,7 +690,7 @@ impl PlaybackOwner {
                 receiver.volume_changed.notify_one();
                 return None;
             }
-            SessionCommand::PersistVolume(value) => {
+            Command::PersistVolume(value) => {
                 receiver
                     .volume
                     .lock()
@@ -733,26 +699,23 @@ impl PlaybackOwner {
                 receiver.volume_changed.notify_one();
                 return None;
             }
-            SessionCommand::SetMuted(muted) => Control::Mute { muted },
-            SessionCommand::SetRepeat(mode) => Control::Repeat { mode },
-            SessionCommand::SetShuffle { enabled, .. } => Control::Shuffle { enabled },
-            SessionCommand::SetAutoDj { enabled, .. } => Control::AutoDj { enabled },
-            SessionCommand::Activate(occurrence) => Control::Activate { occurrence },
-            SessionCommand::Remove(occurrence) => Control::Remove {
-                occurrences: vec![occurrence],
+            Command::SetMuted(muted) => Control::Mute { muted },
+            Command::SetRepeat(mode) => Control::Repeat { mode },
+            Command::SetShuffle { enabled, .. } => Control::Shuffle { enabled },
+            Command::SetAutoDj { enabled, .. } => Control::AutoDj { enabled },
+            Command::Activate(position) => Control::Activate { position },
+            Command::Remove(position) => Control::Remove {
+                positions: vec![position],
             },
-            SessionCommand::RemoveMany(occurrences) | SessionCommand::Forget(occurrences) => {
-                Control::Remove { occurrences }
+            Command::RemoveMany(crate::playback::QueueSelection::Positions(positions)) => {
+                Control::Remove { positions }
             }
-            SessionCommand::Reorder {
-                occurrences,
+            Command::Reorder {
+                selection: crate::playback::QueueSelection::Positions(positions),
                 target,
-            } => Control::Reorder {
-                occurrences,
-                target,
-            },
-            SessionCommand::MoveAfterCurrent(occurrence) => Control::MoveNext { occurrence },
-            SessionCommand::Clear { include_current } => Control::Clear { include_current },
+            } => Control::Reorder { positions, target },
+            Command::MoveAfterCurrent(position) => Control::MoveNext { position },
+            Command::Clear { include_current } => Control::Clear { include_current },
             command => return Some(command),
         };
         self.runtime.spawn(async move {
@@ -766,9 +729,7 @@ impl PlaybackOwner {
             }
             .await;
             if let Err(error) = result {
-                let _ = receiver
-                    .playback
-                    .command(SessionCommand::OperationFailed(error));
+                let _ = receiver.playback.command(Command::OperationFailed(error));
             }
         });
         None

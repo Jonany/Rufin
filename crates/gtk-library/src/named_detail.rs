@@ -1,24 +1,23 @@
+use rufin_core::browse::{DetailContent, DetailPage, DetailSummary};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
-    sync::Arc,
 };
 
 use adw::prelude::*;
 use artwork::ArtworkBinding;
-use library::{Database, GenreKey, GenreRow, MoodKey, MoodRow, RadioSeed, ReadCancellation};
+use library::{GenreKey, GenreView, MoodKey, MoodView, RadioSeed, ReadCancellation};
 use localization::{msgid, track_count_text};
-use playback::RadioPlayRequest;
+use rufin_core::playback::RadioPlayRequest;
 
 use crate::CatalogUi;
-use crate::{LibraryListKey, LibraryListSettings};
+use crate::LibraryListKey;
 use gtk_widgets::artwork::presentation::stable_seed;
 use gtk_widgets::format_duration_units;
 use gtk_widgets::mounted_route::MountedRoute;
 
 use super::detail_showcase::detail_radio_button;
 use super::grouped_detail::GroupedDetailData;
-use crate::track_model::PreparedTrackProjection;
 use gtk_media_menus::media_menus::CollectionPlay;
 use gtk_media_menus::media_menus::{present_genre_context_menu, present_mood_context_menu};
 
@@ -30,8 +29,8 @@ pub enum NamedDetailId {
 
 #[derive(Clone)]
 pub enum NamedDetailSummary {
-    Genre(GenreRow),
-    Mood(MoodRow),
+    Genre(GenreView),
+    Mood(MoodView),
 }
 
 pub struct NamedOrderLane {
@@ -122,22 +121,22 @@ impl NamedDetailId {
 impl NamedDetailSummary {
     fn name(&self) -> &str {
         match self {
-            Self::Genre(row) => &row.name,
-            Self::Mood(row) => &row.name,
+            Self::Genre(row) => &row.metadata.name,
+            Self::Mood(row) => &row.metadata.name,
         }
     }
 
     fn track_count(&self) -> i64 {
         match self {
-            Self::Genre(row) => row.track_count,
-            Self::Mood(row) => row.track_count,
+            Self::Genre(row) => row.summary.track_count,
+            Self::Mood(row) => row.summary.track_count,
         }
     }
 
     fn duration_millis(&self) -> i64 {
         match self {
-            Self::Genre(row) => row.duration_millis,
-            Self::Mood(row) => row.duration_millis,
+            Self::Genre(row) => row.summary.duration_millis,
+            Self::Mood(row) => row.summary.duration_millis,
         }
     }
 
@@ -171,15 +170,23 @@ impl CatalogUi {
     pub fn named_detail_view(
         self: &Rc<Self>,
         id: NamedDetailId,
-        detail: Option<(NamedDetailSummary, library::TrackRoutePage)>,
+        detail: Option<DetailPage>,
     ) -> MountedRoute {
-        let Some((summary, page)) = detail else {
+        let Some(DetailPage {
+            summary,
+            content: DetailContent::Tracks(page),
+        }) = detail
+        else {
             return MountedRoute::static_widget(crate::route_layout::placeholder_view(
                 id.kind(),
                 id.missing_body(),
             ));
         };
-        let query = page.query.clone();
+        let summary = match summary {
+            DetailSummary::Genre(row) => NamedDetailSummary::Genre(row),
+            DetailSummary::Mood(row) => NamedDetailSummary::Mood(row),
+            _ => unreachable!("named detail"),
+        };
         let current = Rc::new(RefCell::new(summary));
         let borrowed = current.borrow();
         let title = borrowed.name().to_string();
@@ -208,30 +215,7 @@ impl CatalogUi {
             play_label: id.play_label(),
         });
         let tracks = Rc::new(grouped.tracks().clone());
-        let database = Arc::clone(&self.library);
-        let refresh = tracks.connect_read(
-            self,
-            |request| request,
-            move |request, cancellation| {
-                let database = Arc::clone(&database);
-                let query = query.clone();
-                async move {
-                    let page = database
-                        .query_track_route_page(
-                            &query,
-                            &request.query,
-                            request.settings.sort_key.track_sort(),
-                            request.settings.descending,
-                            library::RouteSeedWindow::top(),
-                            &cancellation,
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    Ok(PreparedTrackProjection::from_page(page, request))
-                }
-            },
-            "mounted named detail",
-        );
+        let refresh = tracks.connect_read(self, "mounted named detail");
         let resume = {
             let shell = Rc::downgrade(self);
             let projection = Rc::clone(&tracks);
@@ -239,9 +223,9 @@ impl CatalogUi {
             Rc::new(move || {
                 let Some(shell) = shell.upgrade() else { return };
                 let settings = shell.settings.current.borrow().library_list(id.key());
-                let previous = projection.projection_request();
+                let previous = projection.query();
                 projection.apply_library_list_settings(id.key(), &settings);
-                if !previous.same_query(&projection.projection_request()) {
+                if previous != projection.query() {
                     refresh();
                 }
             })
@@ -252,10 +236,18 @@ impl CatalogUi {
                 NamedDetailSummary::Genre(row)
                     if identity == format!("genre:{}", row.genre_key) =>
                 {
-                    row.downloaded_count = if downloaded { row.track_count } else { 0 };
+                    row.summary.downloaded_count = if downloaded {
+                        row.summary.track_count
+                    } else {
+                        0
+                    };
                 }
                 NamedDetailSummary::Mood(row) if identity == format!("mood:{}", row.mood_key) => {
-                    row.downloaded_count = if downloaded { row.track_count } else { 0 };
+                    row.summary.downloaded_count = if downloaded {
+                        row.summary.track_count
+                    } else {
+                        0
+                    };
                 }
                 _ => {}
             }
@@ -271,80 +263,6 @@ impl CatalogUi {
                 let tracks = Rc::clone(&tracks);
                 Rc::new(move || tracks.resume_initial_demand())
             })
-    }
-}
-
-pub async fn load_named_detail(
-    database: &Database,
-    id: NamedDetailId,
-    settings: &LibraryListSettings,
-    window: library::RouteSeedWindow,
-    cancellation: &ReadCancellation,
-) -> Result<Option<(NamedDetailSummary, library::TrackRoutePage)>, String> {
-    let collection = match id {
-        NamedDetailId::Genre(key) => library::QueueCollection::Genre(key),
-        NamedDetailId::Mood(key) => library::QueueCollection::Mood(key),
-    };
-    let Some(source) = database
-        .collection_source(&collection, cancellation)
-        .await
-        .map_err(|error| error.to_string())?
-    else {
-        return Ok(None);
-    };
-    let sort = settings.sort_key.track_sort();
-    let descending = settings.descending;
-    match id {
-        NamedDetailId::Genre(key) => {
-            let detail = database
-                .genre_detail(source, key, None, cancellation)
-                .await
-                .map_err(|error| error.to_string())?;
-            let detail = detail.map(NamedDetailSummary::Genre);
-            let page = database
-                .query_track_route_page(
-                    &library::TrackQuery {
-                        source: source,
-                        collection: Some(library::QueueCollection::Genre(key)),
-                        folder: None,
-                        downloaded_only: false,
-                        favorites_only: false,
-                    },
-                    "",
-                    sort,
-                    descending,
-                    window,
-                    cancellation,
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(detail.map(|detail| (detail, page)))
-        }
-        NamedDetailId::Mood(key) => {
-            let detail = database
-                .mood_detail(source, key, None, cancellation)
-                .await
-                .map_err(|error| error.to_string())?;
-            let detail = detail.map(NamedDetailSummary::Mood);
-            let page = database
-                .query_track_route_page(
-                    &library::TrackQuery {
-                        source: source,
-                        collection: Some(library::QueueCollection::Mood(key)),
-                        folder: None,
-                        downloaded_only: false,
-                        favorites_only: false,
-                    },
-                    "",
-                    sort,
-                    descending,
-                    window,
-                    cancellation,
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(detail.map(|detail| (detail, page)))
-        }
     }
 }
 
@@ -380,7 +298,7 @@ fn named_kind_controls(shell: &Rc<CatalogUi>, id: NamedDetailId) -> Vec<gtk::Wid
     let mut controls = Vec::new();
     if let NamedDetailId::Genre(key) = id {
         let radio = detail_radio_button();
-        let controller = shell.radio.clone();
+        let controller = shell.playback.clone();
         radio.connect_clicked(move |_| {
             controller.play_radio(RadioPlayRequest::now(RadioSeed::Genre(key)));
         });

@@ -1,5 +1,6 @@
 package io.github.screwys.rufin.browse
 
+import io.github.screwys.rufin.shared.rufin_core.Route
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
@@ -63,7 +64,7 @@ internal fun SearchContent(
             val artwork = rememberArtwork(item.row.artworkIdentity, player, pixels)
             BrowseSwipeActions(item, true) {
             ListItem(
-                headlineContent = { BrowseTitle(item.row, player = player) },
+                headlineContent = { BrowseTitle(item, player = player) },
                 supportingContent = {
                     Text(listOf(item.row.subtitle, translate(when (item.row.kind) {
                         "album" -> "Album"

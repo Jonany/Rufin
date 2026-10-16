@@ -1,6 +1,6 @@
 use super::*;
 use crate::policy::raw_item_id;
-use crate::remote_json::{field, id, items};
+use crate::remote_json::{id, items};
 
 impl PlexSource {
     pub(crate) async fn image_bytes(
@@ -69,7 +69,7 @@ impl PlexSource {
                 .join(",")
         )
     }
-    pub(crate) async fn create_playlist(&self, name: &str, ids: &[String]) -> SourceResult<String> {
+    pub async fn create_playlist(&self, name: &str, ids: &[String]) -> SourceResult<String> {
         let response: Value = remote_http::json(
             self.request(
                 Method::POST,
@@ -92,7 +92,7 @@ impl PlexSource {
             .map(|id| plex_id("playlist", &id))
             .ok_or(SourceError::NotFound)
     }
-    pub(crate) async fn rename_playlist(&self, playlist: &str, name: &str) -> SourceResult<()> {
+    pub async fn rename_playlist(&self, playlist: &str, name: &str) -> SourceResult<()> {
         self.unit(
             Method::PUT,
             &format!("/playlists/{}", raw_item_id(playlist)),
@@ -100,7 +100,7 @@ impl PlexSource {
         )
         .await
     }
-    pub(crate) async fn delete_playlist(&self, playlist: &str) -> SourceResult<()> {
+    pub async fn delete_playlist(&self, playlist: &str) -> SourceResult<()> {
         self.unit(
             Method::DELETE,
             &format!("/playlists/{}", raw_item_id(playlist)),
@@ -108,11 +108,7 @@ impl PlexSource {
         )
         .await
     }
-    pub(crate) async fn add_playlist_tracks(
-        &self,
-        playlist: &str,
-        ids: &[String],
-    ) -> SourceResult<()> {
+    pub async fn add_playlist_tracks(&self, playlist: &str, ids: &[String]) -> SourceResult<()> {
         self.unit(
             Method::PUT,
             &format!("/playlists/{}/items", raw_item_id(playlist)),
@@ -120,7 +116,7 @@ impl PlexSource {
         )
         .await
     }
-    pub(crate) async fn remove_playlist_entries(
+    pub async fn remove_playlist_entries(
         &self,
         playlist: &str,
         occurrences: &[String],
@@ -139,7 +135,7 @@ impl PlexSource {
         }
         Ok(())
     }
-    pub(crate) async fn move_playlist_entry(
+    pub async fn move_playlist_entry(
         &self,
         playlist: &str,
         occurrence: &str,
@@ -242,26 +238,48 @@ impl PlexSource {
             .map(|id| plex_id("track", &id))
             .collect())
     }
-    pub(crate) async fn stage_collection(
+    pub(crate) async fn acquire_collection(
         &self,
-        scan: &mut library::Scan,
+        catalog: &mut library::Catalog<'_>,
         collection: &crate::SourceCollection,
+        header: Option<&serde_json::Value>,
+        complete_membership: bool,
+        cancelled: &(dyn Fn() -> bool + Send + Sync),
     ) -> SourceResult<()> {
+        let database = catalog.database;
+        let source_id = catalog.source_id;
+        let stamp = catalog.observed;
+
+        let stamp = if complete_membership && stamp.is_none() {
+            Some(catalog.start_observation().await?)
+        } else {
+            stamp
+        };
         let object = match collection {
             crate::SourceCollection::Album(id) | crate::SourceCollection::Artist(id) => id,
         };
-        match self.metadata(object).await {
-            Ok(metadata) => item::stage_item(scan, &metadata).await?,
-            Err(error) => crate::source::optional_collection_error(error)?,
+        let fetched = if header.is_none() {
+            match self.metadata(object).await {
+                Ok(metadata) => Some(metadata),
+                Err(error) => {
+                    crate::source::optional_collection_error(error)?;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(metadata) = header.or(fetched.as_ref()) {
+            for batch in item::read_items(
+                source_id,
+                std::iter::once((metadata, item::ItemResponse::Complete)),
+            )? {
+                if cancelled() {
+                    return Err(crate::SourceError::Cancelled);
+                }
+                catalog.apply_catalog(&batch, true).await?;
+            }
         }
-        self.stage_collection_contents(scan, collection).await
-    }
-
-    pub(super) async fn stage_collection_contents(
-        &self,
-        scan: &mut library::Scan,
-        collection: &crate::SourceCollection,
-    ) -> SourceResult<()> {
         let (object, suffix) = match collection {
             crate::SourceCollection::Album(id) => (id, "children"),
             crate::SourceCollection::Artist(id) => (id, "allLeaves"),
@@ -278,76 +296,64 @@ impl PlexSource {
                 )
                 .await?;
             let entries = items(&response["MediaContainer"]["Metadata"]);
-            scan.begin_batch().await?;
-            for entry in entries {
-                item::stage_item(scan, entry).await?;
-            }
-            scan.finish_batch().await?;
+            let finished = super::catalog::page_finished(&response, offset, entries.len())?;
+            self.acquire_metadata_page(catalog, entries, None, cancelled)
+                .await?;
+
             offset += entries.len();
-            let total = field::<usize>(&response["MediaContainer"], "totalSize");
-            if entries.is_empty() && total.is_some_and(|total| offset < total) {
-                return Err(SourceError::Other("Plex omitted a collection page".into()));
-            }
-            if entries.is_empty() || total.map_or(entries.len() < 512, |total| offset >= total) {
+            if finished {
                 break;
             }
         }
-        if let crate::SourceCollection::Album(id) = collection {
-            scan.replace_album_membership(id).await?;
+        if complete_membership && let crate::SourceCollection::Album(id) = collection {
+            let mut after = None;
+            loop {
+                let missing = database
+                    .omitted_album_track_page(source_id, id, stamp.unwrap(), after.as_deref(), 100)
+                    .await?;
+                if missing.is_empty() {
+                    break;
+                }
+                after = missing.last().cloned();
+                let ids = missing
+                    .iter()
+                    .map(|id| raw_item_id(id).to_owned())
+                    .collect();
+                Box::pin(self.acquire_items(catalog, ids, Vec::new(), cancelled)).await?;
+            }
+            if cancelled() {
+                return Err(crate::SourceError::Cancelled);
+            }
+            catalog
+                .complete_album_observation(&id, stamp.unwrap())
+                .await?;
         }
         Ok(())
     }
     pub(crate) async fn live_search(
         &self,
-        source_id: &crate::SourceId,
-        database: &library::Database,
+        source_id: &str,
         query: &str,
         limit: usize,
-    ) -> SourceResult<(library::SearchResults, Option<library::ScanOutcome>)> {
+    ) -> SourceResult<library::CatalogBatch> {
         let response = self
             .get(
                 "/hubs/search",
                 &[
                     ("query", query.into()),
-                    ("limit", limit.min(100).to_string()),
+                    ("limit", limit.clamp(1, 100).to_string()),
                     ("includeCollections", "0".into()),
                 ],
             )
             .await?;
-        let mut scan = library::Scan::begin_items(database, source_id.as_str()).await?;
-        let source = scan.existing_source().ok_or(SourceError::NotFound)?;
-        let (mut tracks, mut albums, mut artists) = (Vec::new(), Vec::new(), Vec::new());
-        scan.begin_batch().await?;
-        for hub in items(&response["MediaContainer"]["Hub"]) {
-            for entry in items(&hub["Metadata"]).iter().take(limit.min(100)) {
-                let Some(raw) = id(&entry["ratingKey"]) else {
-                    continue;
-                };
-                match entry["type"].as_str() {
-                    Some("track") => tracks.push(plex_id("track", &raw)),
-                    Some("album") => albums.push(plex_id("album", &raw)),
-                    Some("artist") => artists.push(plex_id("artist", &raw)),
-                    _ => continue,
-                }
-                item::stage_item(&mut scan, entry).await?;
-            }
-        }
-        scan.finish_batch().await?;
-        let outcome = scan.finish().await?;
-        Ok((
-            database
-                .search_rows_by_objects(
-                    source,
-                    None,
-                    false,
-                    &tracks,
-                    &albums,
-                    &artists,
-                    &library::ReadCancellation::new(),
-                )
-                .await?,
-            Some(outcome),
-        ))
+        let native = items(&response["MediaContainer"]["Hub"])
+            .iter()
+            .flat_map(|hub| items(&hub["Metadata"]).iter().take(limit.clamp(1, 100)))
+            .map(|item| (item, item::ItemResponse::Summary));
+        Ok(item::read_items(source_id, native)?
+            .into_iter()
+            .next()
+            .unwrap_or_default())
     }
     pub(crate) async fn browse_folder(
         &self,

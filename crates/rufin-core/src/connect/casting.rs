@@ -1,14 +1,13 @@
 //! Peer playback uses the same authenticated requests and paged queue transfer as Connect.
 use super::*;
-use playback::QueueCommandPort;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct ReceiverState {
     pub revision: u64,
     pub total: usize,
     pub offset: usize,
-    pub current: Option<library::OccurrenceId>,
-    pub rows: Vec<library::QueueOccurrence>,
+    pub current: Option<usize>,
+    pub rows: Vec<library::QueueTransferRow>,
     pub state: playback::TransportStatus,
     pub position: u64,
     pub duration: u64,
@@ -18,7 +17,13 @@ pub(crate) struct ReceiverState {
     pub shuffle: bool,
     pub auto_dj: bool,
     pub auto_dj_threshold: usize,
-    pub content_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ReceiverQueuePage {
+    pub rows: Vec<library::QueueTransferRow>,
+    pub total: u64,
+    pub window_offset: u64,
 }
 
 impl ConnectOwner {
@@ -48,7 +53,7 @@ impl ConnectOwner {
         offset: u64,
         limit: u32,
         filter: String,
-    ) -> Result<playback::QueuePage, String> {
+    ) -> Result<ReceiverQueuePage, String> {
         serde_json::from_value(
             self.request(
                 peer,
@@ -84,7 +89,7 @@ impl ConnectOwner {
             let page: library::QueueTransferPage =
                 serde_json::from_value(self.request(peer, Request::Queue { offset }).await?)
                     .map_err(error)?;
-            if page.occurrences.is_empty() {
+            if page.rows.is_empty() {
                 return Err("The source queue changed during transfer".into());
             }
             self.database
@@ -94,7 +99,7 @@ impl ConnectOwner {
         }
         let mut queue = self
             .database
-            .prepare_queue_transfer(&transfer, header.total, &header.current)
+            .prepare_queue_transfer(&transfer, header.total, header.current)
             .await
             .map_err(error)?;
         self.database
@@ -114,7 +119,7 @@ impl ConnectOwner {
         placement: library::QueuePlacement,
         target: Option<library::QueueReorderTarget>,
     ) -> Result<(), String> {
-        let Some(current) = queue.current().cloned() else {
+        let Some(current) = queue.current_index else {
             return Ok(());
         };
         let header = playback::ContinuationHeader {
@@ -173,25 +178,25 @@ impl ConnectOwner {
                 let page: library::QueueTransferPage =
                     serde_json::from_value(self.request(peer, Request::Queue { offset }).await?)
                         .map_err(error)?;
-                if page.occurrences.is_empty() {
+                if page.rows.is_empty() {
                     return Err("The source queue changed during transfer".into());
                 }
-                offset += page.occurrences.len();
+                offset += page.rows.len();
                 self.playback
                     .stage_continuation_page(&transfer, &page)
                     .await?;
             }
-            let input = self
+            let (input, anchor_index) = self
                 .database
-                .queue_input_from_transfer(&transfer, header.total, &header.current)
+                .queue_from_transfer(&transfer, header.total, header.current)
                 .await
                 .map_err(error)?;
             let playback = Arc::clone(&self.playback);
             tokio::task::spawn_blocking(move || match target {
-                Some(target) => playback.insert(input, target),
-                None => playback::QueueCommandPort::play(
-                    playback.as_ref(),
-                    playback::PlayRequest::ordered(input, 0, placement, false),
+                Some(target) => playback.insert_load(input, target),
+                None => playback.play_selection(
+                    crate::playback::PlayRequest::from_input(input, placement)
+                        .with_anchor_index(anchor_index),
                 ),
             })
             .await

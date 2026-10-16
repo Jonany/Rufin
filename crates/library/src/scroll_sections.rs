@@ -1,5 +1,3 @@
-use sqlx::{Execute, QueryBuilder, Sqlite, SqliteConnection};
-
 use crate::LibraryResult;
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -115,64 +113,25 @@ pub(crate) fn decode_sections(rows: Vec<String>) -> LibraryResult<Vec<ScrollSect
         .collect()
 }
 
-pub(crate) async fn builder_sections(
-    mut query: QueryBuilder<Sqlite>,
-    text: &str,
-    connection: &mut SqliteConnection,
-) -> LibraryResult<Vec<ScrollSection>> {
-    let sql = section_sql(query.sql().as_str(), text);
-    let arguments = query
-        .build()
-        .take_arguments()
-        .map_err(sqlx::Error::Encode)?
-        .unwrap_or_default();
-    decode_sections(
-        sqlx::query_scalar_with(sqlx::AssertSqlSafe(sql), arguments)
-            .persistent(false)
-            .fetch_all(connection)
-            .await?,
-    )
-}
-
-pub(crate) async fn builder_rows<T>(
-    mut query: QueryBuilder<Sqlite>,
-    sections: bool,
-    connection: &mut SqliteConnection,
-) -> LibraryResult<Vec<T>>
-where
-    for<'r> T: sqlx::Decode<'r, Sqlite> + sqlx::Type<Sqlite> + Send + Unpin,
-{
-    let sql = if sections {
-        section_sql(query.sql().as_str(), "")
-    } else {
-        query.sql().as_str().to_string()
-    };
-    let arguments = query
-        .build()
-        .take_arguments()
-        .map_err(sqlx::Error::Encode)?
-        .unwrap_or_default();
-    Ok(sqlx::query_scalar_with(sqlx::AssertSqlSafe(sql), arguments)
-        .persistent(false)
-        .fetch_all(connection)
-        .await?)
-}
-
-pub(crate) fn text_sort(sort: crate::TrackSort) -> bool {
+pub(crate) fn text_sort(sort: crate::CatalogSort) -> bool {
     matches!(
         sort,
-        crate::TrackSort::Title
-            | crate::TrackSort::Artist
-            | crate::TrackSort::AlbumArtist
-            | crate::TrackSort::Album
-            | crate::TrackSort::Genre
+        crate::CatalogSort::Title
+            | crate::CatalogSort::Artist
+            | crate::CatalogSort::AlbumArtist
+            | crate::CatalogSort::Album
+            | crate::CatalogSort::Genre
     )
 }
 
 pub(crate) fn order_text(order: &str) -> &str {
     let order = order.strip_suffix(" NULLS LAST").unwrap_or(order);
-    order
+    let order = order
         .strip_suffix(" ASC")
         .or_else(|| order.strip_suffix(" DESC"))
+        .unwrap_or(order);
+    order
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(" IS NULL)"))
         .unwrap_or(order)
 }

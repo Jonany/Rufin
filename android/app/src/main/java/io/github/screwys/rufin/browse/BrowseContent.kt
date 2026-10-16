@@ -1,5 +1,10 @@
 package io.github.screwys.rufin.browse
 
+import io.github.screwys.rufin.shared.rufin_core.LibraryField
+import io.github.screwys.rufin.shared.rufin_core.LibraryLayout
+import io.github.screwys.rufin.shared.rufin_core.DisplaySize
+
+import io.github.screwys.rufin.shared.rufin_core.Route
 import io.github.screwys.rufin.ui.PlayerArtwork
 import io.github.screwys.rufin.ui.Artwork
 import io.github.screwys.rufin.ui.rememberArtwork
@@ -65,6 +70,7 @@ import io.github.screwys.rufin.core.translate
 import io.github.screwys.rufin.core.trackCountText
 import io.github.screwys.rufin.core.AndroidScrollSection
 import io.github.screwys.rufin.core.AndroidSortField
+import io.github.screwys.rufin.core.AndroidBrowseItem
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.collect
@@ -76,7 +82,7 @@ internal fun BrowseContent(
     onSectionPlay: (String, Boolean) -> Unit, onRefreshSection: (String) -> Unit,
     onFavorite: (BrowseItem) -> Unit, onAddToPlaylist: (BrowseItem) -> Unit,
     onScrolled: (Boolean) -> Unit, scrollSections: List<AndroidScrollSection> = emptyList(),
-    displaySize: String = "Default", gridSpacing: String = "Default", onPlayItem: (BrowseItem, Boolean) -> Unit = { item, _ -> onActivate(item) },
+    displaySize: DisplaySize = DisplaySize.DEFAULT, gridSpacing: DisplaySize = DisplaySize.DEFAULT, onPlayItem: (BrowseItem, Boolean) -> Unit = { item, _ -> onActivate(item) },
     detailFields: List<AndroidSortField> = emptyList(),
     letterIndex: Boolean = false,
     onLetterPosition: suspend (String) -> ULong? = { null },
@@ -86,8 +92,8 @@ internal fun BrowseContent(
     onRadio: (BrowseItem) -> Unit,
     emptyIcon: String? = null,
 ) {
-    val coverWidth = when (displaySize) { "Compact" -> 104.dp; "Large" -> 176.dp; else -> 128.dp }
-    val spacing = when (gridSpacing) { "Small" -> 4.dp; "Wide" -> 16.dp; else -> 12.dp }
+    val coverWidth = when (displaySize) { DisplaySize.COMPACT -> 104.dp; DisplaySize.LARGE -> 176.dp; else -> 128.dp }
+    val spacing = when (gridSpacing) { DisplaySize.COMPACT -> 4.dp; DisplaySize.LARGE -> 16.dp; else -> 12.dp }
     if (home) {
         HomeContent(homeRows, player, onActivate, onMenu, onSectionPlay, onRefreshSection, onFavorite, onScrolled, onRadio)
     } else {
@@ -155,8 +161,8 @@ internal fun BrowseContent(
                     else if (item.row.kind == "album_header") HomeShowcase(item, player, onActivate, onMenu, onFavorite,
                         { _, shuffled -> onPlayItem(item, shuffled) }, onRadio)
                     else if (detailFields.isNotEmpty() && item.row.kind == "track")
-                        DetailTrackRow(item.copy(displaySettings = item.displaySettings?.copy(size = displaySize)), player,
-                            detailFields.any { it.id == "Image" || it.id == "TitleMerged" }, detailFields,
+                        DetailTrackRow(item.copy(displaySettings = item.displaySettings?.let { it.copy(settings = it.settings.copy(display = it.settings.display.copy(size = displaySize))) }), player,
+                            detailFields.any { it.id == LibraryField.IMAGE || it.id == LibraryField.TITLE_MERGED }, detailFields,
                             onActivate, onMenu, onFavorite, onAddToPlaylist)
                     else BrowseTrackRow(item, player, onActivate, onMenu, onFavorite, onAddToPlaylist, displaySize)
                 }
@@ -357,25 +363,31 @@ internal fun favoriteItem(model: io.github.screwys.rufin.app.RufinConnection, it
             if (settlement.kind == kind && settlement.mediaUri == item.row.mediaUri) effective = settlement.effective
         }
     }
-    return item.copy(row = item.row.copy(favorite = model.projectedFavorite(kind, item.row.mediaUri, effective)))
+    return item.copy(row = item.row.withFavorite(model.projectedFavorite(kind, item.row.mediaUri, effective)))
 }
 
 @Composable
-internal fun BrowseTitle(row: io.github.screwys.rufin.core.AndroidBrowseRow, modifier: Modifier = Modifier,
+internal fun BrowseTitle(item: BrowseItem, modifier: Modifier = Modifier,
     maxLines: Int = 1, style: androidx.compose.ui.text.TextStyle = MaterialTheme.typography.bodyLarge,
-    player: PlayerConnection? = null, marquee: Boolean = false, showDownloadBadge: Boolean = true) {
-    val playing by remember(row.kind, row.mediaUri, row.playbackContextId, player) { derivedStateOf {
-        player?.playback?.let { playback ->
-            playback.desiredPlaying && if (row.kind == "track") playback.mediaUri == row.mediaUri else {
+    player: PlayerConnection? = null, marquee: Boolean = false, showDownloadBadge: Boolean = true,
+    title: String = item.row.title) {
+    val row = item.row
+    val occurrence = row.item is AndroidBrowseItem.PlaylistEntry
+    val queryContext = remember(item.query, occurrence) { if (occurrence) item.query?.contextId() else null }
+    val playing by remember(row.kind, row.mediaUri, row.playbackContextId, occurrence, item.index, queryContext, player) { derivedStateOf {
+        player != null && player.playingMediaUri != null &&
+            if (row.kind == "track") {
+                player.playingMediaUri == row.mediaUri && (!occurrence ||
+                    queryContext != null && queryContext == player.currentContextId && item.index == player.currentSourceRank)
+            } else {
                 val target = row.playbackContextId
-                val context = playback.contextId
+                val context = player.currentContextId
                 target != null && context != null && (context == target || context.startsWith("$target|query="))
             }
-        } == true
     } }
     Row(modifier, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
         if (playing) PlayingIndicator()
-        Text(row.title, Modifier.weight(1f, fill = false).then(if (marquee) Modifier.rufinMarquee() else Modifier),
+        Text(title, Modifier.weight(1f, fill = false).then(if (marquee) Modifier.rufinMarquee() else Modifier),
             maxLines = maxLines, overflow = TextOverflow.Ellipsis, style = style,
             color = if (playing) MaterialTheme.colorScheme.secondary else LocalContentColor.current)
         if (showDownloadBadge) io.github.screwys.rufin.ui.DownloadBadge(row)
@@ -461,7 +473,7 @@ internal fun CoverCard(item: BrowseItem, player: PlayerConnection, modifier: Mod
             Box(Modifier.fillMaxWidth().aspectRatio(1f)) {
                 BrowseCover(item, artwork, Modifier.fillMaxSize())
             }
-            BrowseTitle(item.row, Modifier.fillMaxWidth().padding(top = 6.dp),
+            BrowseTitle(item, Modifier.fillMaxWidth().padding(top = 6.dp),
                 maxLines = if (marquee) 1 else 2, style = MaterialTheme.typography.titleSmall, player = player, marquee = marquee)
             val subtitle = listOf(item.row.subtitle, item.row.year?.takeIf { item.row.kind != "track" }?.toString().orEmpty())
                 .filter(String::isNotBlank).joinToString(" · ")
@@ -505,7 +517,7 @@ private fun HomeShowcase(item: BrowseItem, player: PlayerConnection, onActivate:
                             PlayerIconButton("rufin-audio-only-symbolic", "Play radio", { onRadio(item) }, Modifier.size(32.dp), iconSize = 16.dp)
                         }
                     }
-                    BrowseTitle(item.row, Modifier.fillMaxWidth(), style = MaterialTheme.typography.titleLarge, player = player, marquee = true)
+                    BrowseTitle(item, Modifier.fillMaxWidth(), style = MaterialTheme.typography.titleLarge, marquee = true)
                     Text(item.row.subtitle, Modifier.rufinMarquee(), style = MaterialTheme.typography.bodyMedium, maxLines = 1)
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         item.row.year?.let { SummaryFact("rufin-x-office-calendar-symbolic", "Year", it.toString()) }
@@ -538,18 +550,18 @@ private fun SummaryFact(icon: String, label: String, value: String) {
 @Composable
 private fun BrowseTrackRow(item: BrowseItem, player: PlayerConnection,
     onActivate: (BrowseItem) -> Unit, onMenu: (BrowseItem) -> Unit,
-    onFavorite: (BrowseItem) -> Unit, onAddToPlaylist: (BrowseItem) -> Unit, displaySize: String,
+    onFavorite: (BrowseItem) -> Unit, onAddToPlaylist: (BrowseItem) -> Unit, displaySize: DisplaySize,
 ) {
-    val imageSize = when (displaySize) { "Compact" -> 36.dp; "Large" -> 64.dp; else -> 50.dp }
-    val rowPadding = if (displaySize == "Compact") 0.dp else 6.dp
+    val imageSize = when (displaySize) { DisplaySize.COMPACT -> 36.dp; DisplaySize.LARGE -> 64.dp; else -> 50.dp }
+    val rowPadding = if (displaySize == DisplaySize.COMPACT) 0.dp else 6.dp
     val artwork = rememberBrowseArtwork(item, player, imageSize)
     BrowseSwipeActions(item, true) {
-    Row(Modifier.fillMaxWidth().heightIn(min = if (displaySize == "Compact") 48.dp else 64.dp)
+    Row(Modifier.fillMaxWidth().heightIn(min = if (displaySize == DisplaySize.COMPACT) 48.dp else 64.dp)
         .combinedClickable(onClick = { onActivate(item) }, onLongClick = { onMenu(item) }).padding(start = 16.dp, end = 8.dp, top = rowPadding, bottom = rowPadding),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         BrowseCover(item, artwork, Modifier.size(imageSize))
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            BrowseTitle(item.row, player = player)
+            BrowseTitle(item, player = player)
             Text(item.row.subtitle, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }

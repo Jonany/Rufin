@@ -1,4 +1,7 @@
 //! Streaming semantic backups. Archive framing is staged before any live owner is changed.
+#[cfg(feature = "bindings")]
+uniffi::setup_scaffolding!();
+
 use chrono::{Datelike, TimeZone};
 use library::{BackupRestoreReport, Database, LibraryError, StateGroups};
 use serde::{Deserialize, Serialize};
@@ -13,6 +16,7 @@ fn invalid(message: impl Into<String>) -> BackupError {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct BackupContents {
     pub settings: bool,
     pub saved_logins: bool,
@@ -71,6 +75,7 @@ impl BackupContents {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct BackupManifest {
     pub version: u32,
     pub created_at: i64,
@@ -104,7 +109,11 @@ impl StagedBackup {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Error))]
+#[cfg_attr(feature = "bindings", uniffi(flat_error))]
 pub enum BackupError {
+    #[error("{0}")]
+    Operation(String),
     #[error(transparent)]
     Library(#[from] LibraryError),
     #[error(transparent)]
@@ -239,7 +248,10 @@ fn write_archive(
     Ok(())
 }
 
-pub fn stage_backup(input: impl Read, passphrase: Option<&str>) -> BackupResult<StagedBackup> {
+pub fn stage_backup(
+    input: impl Read,
+    passphrase: impl FnOnce() -> Option<String>,
+) -> BackupResult<StagedBackup> {
     let mut input = BufReader::new(input);
     let mut prefix = [0; 22];
     input.read_exact(&mut prefix)?;
@@ -248,10 +260,9 @@ pub fn stage_backup(input: impl Read, passphrase: Option<&str>) -> BackupResult<
     let mut tar_file = tempfile::tempfile()?;
     if encrypted {
         let passphrase =
-            passphrase.ok_or_else(|| invalid("this backup requires its passphrase"))?;
+            passphrase().ok_or_else(|| invalid("this backup requires its passphrase"))?;
         let decryptor = age::Decryptor::new(input).map_err(|error| invalid(error.to_string()))?;
-        let identity =
-            age::scrypt::Identity::new(age::secrecy::SecretString::from(passphrase.to_owned()));
+        let identity = age::scrypt::Identity::new(age::secrecy::SecretString::from(passphrase));
         let decrypted = decryptor
             .decrypt(std::iter::once(&identity as &dyn age::Identity))
             .map_err(|error| invalid(error.to_string()))?;
@@ -336,6 +347,7 @@ fn playlist_member_number(name: &str) -> Option<u64> {
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum BackupFrequency {
     #[default]
     Off,
@@ -344,12 +356,13 @@ pub enum BackupFrequency {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct BackupSchedule {
     pub frequency: BackupFrequency,
     pub hour: u8,
     /// Monday is zero.
     pub weekday: u8,
-    pub retention: usize,
+    pub retention: RetentionCount,
     pub last_successful_at: Option<i64>,
     pub schedule_id: String,
 }
@@ -466,15 +479,20 @@ mod tests {
         let source = database(directory.path(), "source").await;
         let bytes = archive(&source, Some("correct passphrase")).await;
         assert!(bytes.starts_with(b"age-encryption.org/v1\n"));
-        assert!(stage_backup(Cursor::new(&bytes), None).is_err());
-        assert!(stage_backup(Cursor::new(&bytes), Some("wrong")).is_err());
-        assert!(stage_backup(Cursor::new(&bytes), Some("correct passphrase")).is_ok());
+        assert!(stage_backup(Cursor::new(&bytes), || None).is_err());
+        assert!(stage_backup(Cursor::new(&bytes), || Some("wrong".into())).is_err());
+        assert!(stage_backup(Cursor::new(&bytes), || Some("correct passphrase".into())).is_ok());
         let mut damaged = bytes;
         damaged.pop();
-        assert!(stage_backup(Cursor::new(damaged), Some("correct passphrase")).is_err());
+        assert!(stage_backup(Cursor::new(damaged), || Some("correct passphrase".into())).is_err());
         let mut gzip = archive(&source, None).await;
         gzip.truncate(gzip.len() - 4);
-        assert!(stage_backup(Cursor::new(gzip), None).is_err());
+        assert!(
+            stage_backup(Cursor::new(gzip), || panic!(
+                "plain archives do not request a password"
+            ))
+            .is_err()
+        );
     }
     #[tokio::test]
     async fn unknown_members_are_ignored_but_duplicate_and_traversal_members_are_rejected() {
@@ -504,7 +522,7 @@ mod tests {
                 flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
             compressed.write_all(&modified).unwrap();
             assert_eq!(
-                stage_backup(Cursor::new(compressed.finish().unwrap()), None).is_ok(),
+                stage_backup(Cursor::new(compressed.finish().unwrap()), || None).is_ok(),
                 name == "unrecognized.json",
                 "member {name}"
             );
@@ -627,7 +645,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let staged = stage_backup(Cursor::new(bytes), None).unwrap();
+            let staged = stage_backup(Cursor::new(bytes), || None).unwrap();
             let mut requested = BackupContents::default();
             requested.favorites = !present;
             restore_backup(&target, &staged, requested).await.unwrap();
@@ -663,7 +681,7 @@ mod tests {
         source.set_rating(&favorite, Some(7)).await.unwrap();
         target.set_rating(&favorite, Some(2)).await.unwrap();
         let bytes = archive(&source, None).await;
-        let staged = stage_backup(Cursor::new(bytes), None).unwrap();
+        let staged = stage_backup(Cursor::new(bytes), || None).unwrap();
         assert_eq!(staged.settings().unwrap(), br#"{"sources":[]}"#);
         assert_eq!(staged.saved_logins().unwrap(), b"{}");
         assert_eq!(staged.playlist_pins().unwrap(), b"{}");
@@ -680,3 +698,11 @@ mod tests {
         );
     }
 }
+
+pub type RetentionCount = usize;
+#[cfg(feature = "bindings")]
+uniffi::custom_type!(RetentionCount, u64, {
+    remote,
+    lower: |value| value as u64,
+    try_lift: |value| Ok(usize::try_from(value)?),
+});

@@ -8,12 +8,10 @@ mod backup;
 mod diagnostics;
 mod events;
 mod inputs;
-mod release_update;
-mod scrobbling;
+pub mod release_update;
+pub mod scrobbling;
 pub mod source;
 mod waveform;
-
-pub use ::playback::PlaybackHandles;
 pub use backup::{BackupHandle, BackupPreview, BackupSettings};
 pub use diagnostics::DiagnosticsHandle;
 pub use downloads::{
@@ -21,16 +19,15 @@ pub use downloads::{
 };
 pub use events::ProductReceivers;
 pub use inputs::{
-    CatalogChange, CatalogPublication, FavoriteSettlement, RuntimeInputs, SelectedLibrary,
-    SourceEvent, SourceNotice, SourceNoticeKind, VisualizerPublication,
+    CatalogChange, CatalogPublication, CatalogRevision, FavoriteSettlement, RuntimeInputs,
+    SelectedLibrary, SourceEvent, SourceNotice, SourceNoticeKind, VisualizerPublication,
 };
 pub use release_update::{ReleaseHistory, ReleaseNote, ReleaseUpdate, ReleaseUpdateHandle};
 pub use scrobbling::{
     LastFmPreferences, LibreFmPreferences, ListenBrainzPreferences, ScrobblingConnection,
     ScrobblingConnectionEvent, ScrobblingHandle, ScrobblingPreferences,
 };
-pub use source::LibraryRefreshTrigger;
-pub use source::{SelectedSourceHandle, SourceHandle};
+pub use source::SourceHandle;
 pub use waveform::WaveformProjection;
 
 #[derive(Clone)]
@@ -43,7 +40,7 @@ pub struct ProductHandles {
     pub runtime: tokio::runtime::Handle,
     pub source: SourceHandle,
     pub downloads: downloads::Downloads,
-    pub playback: PlaybackHandles,
+    pub playback: std::sync::Arc<crate::playback::PlaybackOwner>,
     pub artwork: artwork::Artwork,
     pub lyrics: crate::lyrics::LyricsHandle,
     pub release_updates: ReleaseUpdateHandle,

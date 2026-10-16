@@ -1,5 +1,5 @@
 use super::*;
-use library::{PlaylistEntryKey, PlaylistEntrySort, PlaylistKey, PlaylistSort};
+use library::{CatalogSort, PlaylistEntryKey, PlaylistKey};
 
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -23,56 +23,63 @@ enum MediaSelection {
     },
 }
 
-async fn selected_uris(
+async fn playlist_selection(
     products: &ProductHandles,
     uris: Vec<String>,
     selection: Option<MediaSelection>,
     source: Option<String>,
     folder: Option<String>,
-) -> Result<Vec<String>, Error> {
+) -> Result<library::TrackSelection, Error> {
     let Some(selection) = selection else {
-        return Ok(uris);
+        return Ok(library::CatalogQuery::uris(library::CatalogKind::Track, uris).selection());
     };
-    let target = match selection {
-        MediaSelection::Album { id } => rufin_core::playback::PlaybackTarget::AlbumKey(id),
-        MediaSelection::Artist { id, album_artists } => {
-            rufin_core::playback::PlaybackTarget::ArtistKey(id, album_artists)
-        }
-        MediaSelection::Playlist { id } => rufin_core::playback::PlaybackTarget::Playlist(id),
-        MediaSelection::Genre { id } => rufin_core::playback::PlaybackTarget::Genre(id),
-        MediaSelection::SmartPlaylist { id } => {
-            rufin_core::playback::PlaybackTarget::SmartPlaylist(id)
-        }
-    };
-    let (source, folder) = if let Some(source) = source {
-        let mut parameters = HashMap::from([("source".into(), source)]);
-        if let Some(folder) = folder {
-            parameters.insert("folder".into(), folder);
-        }
-        let (source, folder) = catalog::scope(products, &parameters).await?;
-        (Some(source), folder)
+    let (source, folder) = if source.is_some() {
+        (source, folder)
     } else {
         products
             .source
             .selected_library()
             .map_or((None, None), |selected| {
-                (Some(selected.source_key), selected.music_folder_key)
+                (
+                    Some(selected.source_id.to_string()),
+                    selected.music_folder_object_id,
+                )
             })
     };
-    target
-        .resolve_media_uris(&products.library, source, folder)
-        .await
-        .map_err(bad_request)
-}
-
-pub(super) fn entry_sort(value: &str) -> Result<PlaylistEntrySort, Error> {
-    match value {
-        "position" => Ok(PlaylistEntrySort::Position),
-        "title" => Ok(PlaylistEntrySort::Title),
-        "artist" => Ok(PlaylistEntrySort::Artist),
-        "album" => Ok(PlaylistEntrySort::Album),
-        _ => Err(bad_request("Unknown playlist entry sort")),
+    let (source, folder) = match source.as_deref() {
+        Some(source)
+            if folder.is_some() || matches!(selection, MediaSelection::SmartPlaylist { .. }) =>
+        {
+            let (source, folder) = catalog::scope(products, source, folder.as_deref()).await?;
+            (Some(source), folder)
+        }
+        _ => (None, None),
+    };
+    let scope = match selection {
+        MediaSelection::Album { id } => library::TrackScope::Album(id),
+        MediaSelection::Artist { id, album_artists } => library::TrackScope::Artist {
+            key: id,
+            album_artist: album_artists,
+        },
+        MediaSelection::Playlist { id } => library::TrackScope::Playlist(id),
+        MediaSelection::Genre { id } => library::TrackScope::Genre(id),
+        MediaSelection::SmartPlaylist { id } => library::TrackScope::Smart {
+            key: id,
+            source,
+            now: catalog::now(),
+        },
+    };
+    let mut query = library::CatalogQuery::tracks(scope);
+    if matches!(
+        query.subject,
+        library::CatalogSubject::Tracks {
+            scope: library::TrackScope::Smart { .. },
+            ..
+        }
+    ) {
+        query.folder = folder;
     }
+    Ok(query.selection())
 }
 
 pub(super) fn routes() -> Router<ProductHandles> {
@@ -337,7 +344,12 @@ pub(super) async fn list_data(
 ) -> Result<Value, Error> {
     let cancellation = library::ReadCancellation::new();
     let (source, folder) = if parameters.contains_key("source") {
-        let (source, folder) = catalog::scope(products, parameters).await?;
+        let (source, folder) = catalog::scope(
+            products,
+            required(parameters, "source")?,
+            parameters.get("folder").map(String::as_str),
+        )
+        .await?;
         (Some(source), folder)
     } else {
         (None, None)
@@ -347,31 +359,37 @@ pub(super) async fn list_data(
         .map(String::as_str)
         .unwrap_or("position")
     {
-        "position" => PlaylistSort::Position,
-        "title" => PlaylistSort::Title,
-        "track_count" => PlaylistSort::TrackCount,
-        "duration" => PlaylistSort::Duration,
+        "position" => CatalogSort::Position,
+        "title" => CatalogSort::Title,
+        "track_count" => CatalogSort::TrackCount,
+        "duration" => CatalogSort::Duration,
         _ => return Err(bad_request("Unknown playlist sort")),
     };
     let offset = number(parameters, "offset", 0)?;
     let limit = number(parameters, "limit", 100)?.min(128);
-    let rows = products
-        .library
-        .playlist_page(
-            source,
-            folder,
-            sort,
-            boolean(parameters, "descending")?,
-            parameters.get("q").map(String::as_str).unwrap_or(""),
-            offset,
-            limit,
-            &cancellation,
-        )
+    let query = library::CatalogQuery {
+        subject: library::CatalogSubject::Playlists {
+            source: (source).into(),
+            sort: sort,
+        },
+        folder: folder,
+        filter: (parameters.get("q").map(String::as_str).unwrap_or("")).to_string(),
+        descending: boolean(parameters, "descending")?,
+        favorites_only: false,
+        downloaded_only: false,
+        activity: false,
+    };
+    let rows = query
+        .rows(&products.library, offset, limit, &cancellation)
         .await
+        .map(|rows| match rows {
+            library::CatalogRows::Playlists(rows) => rows,
+            _ => unreachable!("catalog page projection"),
+        })
         .map_err(internal)?;
-    let total = catalog::page_total(products, parameters, "playlists").await?;
+    let total = catalog::page_total(products, parameters, &query).await?;
     Ok(
-        json!({"total":total,"offset":offset,"limit":limit,"playlists":rows.iter().map(|row| json!({"id":row.playlist_key,"object_id":row.object_id,"source":row.source_id,"name":row.name,"writable":row.writable,"metadata_writable":row.metadata_writable,"can_remove_unavailable":rufin_core::playlists::can_remove_unavailable(&products.source, row),"track_count":row.track_count,"duration_ms":row.duration_millis,"artwork_count":rufin_core::playlists::playlist_artwork_bindings(row).len()})).collect::<Vec<_>>()}),
+        json!({"activity_sensitive":query.activity_sensitive(),"total":total,"offset":offset,"limit":limit,"playlists":rows.iter().map(|row| json!({"id":row.playlist_key,"object_id":row.object_id,"source":row.source_id,"name":row.name,"writable":row.writable,"metadata_writable":row.metadata_writable,"can_remove_unavailable":rufin_core::playlists::can_remove_unavailable(&products.source, row),"track_count":row.track_count,"duration_ms":row.duration_millis,"artwork_count":row.artwork_binding.as_slice().len(),"artwork_previews":artwork_previews(products, row.artwork_binding.as_slice())})).collect::<Vec<_>>()}),
     )
 }
 
@@ -391,38 +409,25 @@ pub(super) async fn entries_data(
     products: &ProductHandles,
     parameters: &HashMap<String, String>,
 ) -> Result<Value, Error> {
-    let cancellation = library::ReadCancellation::new();
-    let id = key(parameters, "id")?;
-    let sort = entry_sort(
-        parameters
-            .get("sort")
-            .map(String::as_str)
-            .unwrap_or("position"),
-    )?;
-    let folder = if parameters.contains_key("folder") {
-        catalog::scope(products, parameters).await?.1
-    } else {
-        None
-    };
+    let query = catalog::track_query(products, parameters, "entries").await?;
     let offset = number(parameters, "offset", 0)?;
     let limit = number(parameters, "limit", 100)?.min(256);
-    let rows = products
-        .library
-        .playlist_entries_page(
-            id,
-            folder,
-            sort,
-            boolean(parameters, "descending")?,
-            parameters.get("q").map(String::as_str).unwrap_or(""),
+    let rows = (&query)
+        .rows(
+            &products.library,
             offset,
             limit,
-            &cancellation,
+            &library::ReadCancellation::new(),
         )
         .await
+        .map(|rows| match rows {
+            library::CatalogRows::PlaylistEntries(rows) => rows,
+            _ => unreachable!("typed song projection"),
+        })
         .map_err(internal)?;
-    let total = catalog::page_total(products, parameters, "entries").await?;
+    let total = catalog::track_total(products, parameters, &query).await?;
     Ok(
-        json!({"total":total,"offset":offset,"limit":limit,"entries":rows.iter().map(|row| json!({"id":row.playlist_entry_key,"position":row.position,"uri":row.media_uri,"title":row.title,"artist":row.artist,"album":row.album,"favorite":row.favorite,"duration_ms":row.duration_millis})).collect::<Vec<_>>()}),
+        json!({"activity_sensitive":query.activity_sensitive(),"total":total,"offset":offset,"limit":limit,"entries":rows.iter().map(|row| json!({"id":row.playlist_entry_key,"position":row.position,"uri":row.track.media_uri,"title":row.track.metadata.title,"artist":row.track.metadata.artist,"album":row.track.metadata.album,"favorite":row.track.state.favorite,"duration_ms":row.track.metadata.duration_millis})).collect::<Vec<_>>()}),
     )
 }
 
@@ -446,7 +451,7 @@ async fn create(
     }
     let input: Input = body(request).await?;
     let source = input.source.clone();
-    let uris = selected_uris(
+    let selection = playlist_selection(
         products,
         input.uris,
         input.selection,
@@ -456,26 +461,21 @@ async fn create(
         input.folder,
     )
     .await?;
-    let object_id = completion(rufin_core::playlists::create_playlist(
+    let created = rufin_core::playlists::create_playlist(
         &products.source,
         input.source,
         input.name,
-        uris,
+        selection.into(),
         input.public,
-    ))
-    .await?;
-    let mut settings_error = None;
-    let id = if let Some(object) = object_id.as_deref() {
-        let settings = products.settings.clone();
-        let playlist_source = source.clone();
-        let playlist_id = object.to_owned();
-        settings_error = tokio::task::spawn_blocking(move || {
-            settings.remember_created_playlist(playlist_source, playlist_id, input.current)
-        })
-        .await
-        .map_err(|error| error.to_string())
-        .and_then(|result| result)
-        .err();
+        input.current,
+    )
+    .await
+    .map_err(bad_request)?;
+    let settings_error = created
+        .as_ref()
+        .and_then(|created| created.settings_error.as_ref());
+    let object_id = created.as_ref().map(|created| created.object_id.as_str());
+    let id = if let Some(object) = object_id {
         products
             .library
             .playlist_key_by_identity(source.as_ref(), object, &cancellation)
@@ -503,14 +503,15 @@ async fn rename(
         public: Option<bool>,
     }
     let input: Input = body(request).await?;
-    let changed = completion(rufin_core::playlists::update_playlist(
+    let changed = rufin_core::playlists::update_playlist(
         &products.source,
         input.id,
         input.name,
         input.public,
         None,
-    ))
-    .await?;
+    )
+    .await
+    .map_err(bad_request)?;
     Ok(json_response(StatusCode::OK, json!({"changed":changed})))
 }
 
@@ -521,11 +522,9 @@ async fn delete(
     let products = &products;
     let parameters = &parameters;
 
-    let changed = completion(rufin_core::playlists::delete_playlist(
-        &products.source,
-        key(parameters, "id")?,
-    ))
-    .await?;
+    let changed = rufin_core::playlists::delete_playlist(&products.source, key(parameters, "id")?)
+        .await
+        .map_err(bad_request)?;
     Ok(json_response(StatusCode::OK, json!({"changed":changed})))
 }
 
@@ -547,7 +546,7 @@ async fn add_entries(
         skip_duplicates: bool,
     }
     let input: Input = body(request).await?;
-    let uris = selected_uris(
+    let selection = playlist_selection(
         products,
         input.uris,
         input.selection,
@@ -555,13 +554,14 @@ async fn add_entries(
         input.folder,
     )
     .await?;
-    let added = completion(rufin_core::playlists::add_playlist_tracks(
+    let added = rufin_core::playlists::add_playlist_tracks(
         &products.source,
         input.id,
-        uris,
+        selection.into(),
         input.skip_duplicates,
-    ))
-    .await?;
+    )
+    .await
+    .map_err(bad_request)?;
     Ok(json_response(StatusCode::OK, json!({"added":added})))
 }
 
@@ -580,10 +580,13 @@ async fn remove_entries(
     let changed = completion(rufin_core::playlists::remove_playlist_entries(
         &products.source,
         input.id,
-        input.entries,
+        library::CatalogQuery::playlist_entries((input.entries).to_vec()).selection(),
     ))
     .await?;
-    Ok(json_response(StatusCode::OK, json!({"changed":changed})))
+    Ok(json_response(
+        StatusCode::OK,
+        json!({"changed":!changed.is_empty()}),
+    ))
 }
 
 async fn move_entry(

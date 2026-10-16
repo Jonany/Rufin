@@ -1,51 +1,109 @@
+use std::sync::Arc;
+
 use crate::runtime::SelectedLibrary;
 use library::{FolderKey, LibraryError, LibraryResult, ReadCancellation};
 
+#[derive(Clone)]
 pub enum FolderProjection {
     Live {
-        folders: Vec<sources::LiveFolder>,
-        candidates: Vec<String>,
+        folders: Arc<[sources::LiveFolder]>,
+        objects: Arc<[String]>,
     },
     Cached(Option<FolderKey>),
 }
 
+impl FolderProjection {
+    pub fn track_query(&self, source: library::SourceKey) -> library::CatalogQuery {
+        let mut query = library::CatalogQuery::tracks(match self {
+            Self::Live { objects, .. } => library::TrackScope::Objects {
+                source,
+                ids: Arc::clone(objects),
+            },
+            Self::Cached(_) => library::TrackScope::Tracks(source),
+        });
+        if let Self::Cached(folder) = self {
+            query.folder = *folder;
+        }
+        query
+    }
+
+    pub fn live_folders<'a>(
+        &'a self,
+        filter: &'a str,
+        descending: bool,
+    ) -> impl Iterator<Item = &'a sources::LiveFolder> {
+        let folders = match self {
+            Self::Live { folders, .. } => folders.as_ref(),
+            Self::Cached(_) => &[],
+        };
+        let filter = filter.trim().to_lowercase();
+        (0..folders.len())
+            .map(move |index| {
+                &folders[if descending {
+                    folders.len() - 1 - index
+                } else {
+                    index
+                }]
+            })
+            .filter(move |folder| folder.name.to_lowercase().contains(&filter))
+    }
+}
+
 pub async fn resolve_folder(
+    owner: &super::SourceOwner,
+    database: &library::Database,
     selected: &SelectedLibrary,
     folder_object_id: Option<&str>,
     cancellation: &ReadCancellation,
 ) -> LibraryResult<FolderProjection> {
-    let live = selected.operations.folder(
-        folder_object_id.map(str::to_owned),
-        selected.music_folder_object_id.clone(),
-    );
-    match live.recv().await {
-        Ok(Ok(page)) => {
-            let candidates = selected
-                .database
-                .track_media_uris_by_objects(selected.source_key, &page.tracks, cancellation)
-                .await?;
-            if candidates.len() == page.tracks.len() {
+    let live = async {
+        let source = owner
+            .cached_client(&selected.source_id)
+            .ok_or(sources::SourceError::NotFound)?;
+        source
+            .browse_folder(
+                database,
+                folder_object_id,
+                selected.music_folder_object_id.as_deref(),
+            )
+            .await
+    };
+    let live = tokio::select! {
+        result = live => result,
+        () = cancellation.cancelled() => return Err(LibraryError::ReadCancelled),
+    };
+    match live {
+        Ok(page) => {
+            let known = library::CatalogQuery::tracks(library::TrackScope::Objects {
+                source: selected.source_key,
+                ids: page.tracks.clone().into(),
+            })
+            .count(database, cancellation)
+            .await?;
+            if known as usize == page.tracks.len() {
+                let mut folders = page.folders;
+                folders.sort_by_cached_key(|folder| folder.name.to_lowercase());
                 return Ok(FolderProjection::Live {
-                    folders: page.folders,
-                    candidates,
+                    folders: folders.into(),
+                    objects: page.tracks.into(),
                 });
             }
             tracing::debug!("live Folder is newer than its accepted cache; using fallback");
         }
-        Ok(Err(error)) => {
-            tracing::debug!(%error, "live Folder unavailable; using exact cached Folder");
-        }
         Err(error) => {
-            tracing::debug!(%error, "live Folder ended; using exact cached Folder");
+            tracing::debug!(%error, "live Folder unavailable; using exact cached Folder");
         }
     }
     let resolved = match folder_object_id {
-        Some(object) => {
-            selected
-                .database
-                .folder_key_by_object(selected.source_key, object, cancellation)
-                .await?
-        }
+        Some(object) => database
+            .catalog_keys(
+                library::CatalogKind::Folder,
+                Some(selected.source_key),
+                &[(object).to_owned()],
+                cancellation,
+            )
+            .await
+            .map(|keys| keys.into_iter().next().map(library::FolderKey::from_raw))?,
         None => None,
     };
     exact_cached_folder_scope(

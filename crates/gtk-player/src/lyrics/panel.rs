@@ -125,7 +125,8 @@ impl PlayerUi {
     fn render_lyrics_contents(self: &Rc<Self>) {
         let local_readings_enabled = {
             let settings = self.settings.current.borrow();
-            settings.lyrics.show_furigana || settings.lyrics.show_romanization
+            settings.lyrics.preferences.show_furigana
+                || settings.lyrics.preferences.show_romanization
         };
         if !local_readings_enabled {
             release_japanese_reader();
@@ -152,8 +153,9 @@ impl PlayerUi {
         let settings = self.settings.current.borrow();
         let current_media = current_playback_media_id(self.selected_playback().as_deref());
         let current_track_id = current_playback_track_id(self.selected_playback().as_deref());
-        let dictionary_status = if (settings.lyrics.show_furigana
-            || settings.lyrics.show_romanization && self.visible_lyrics_pronunciation().is_none())
+        let dictionary_status = if (settings.lyrics.preferences.show_furigana
+            || settings.lyrics.preferences.show_romanization
+                && self.visible_lyrics_pronunciation().is_none())
             && self
                 .visible_lyrics()
                 .as_deref()
@@ -223,7 +225,7 @@ impl PlayerUi {
         gtk::glib::spawn_future_local(async move {
             let dialog = gtk::FileDialog::builder()
                 .title(tr("Save Lyrics"))
-                .initial_name(lyrics_save_filename(&current.title))
+                .initial_name(lyrics_save_filename(&current.row.track.metadata.title))
                 .build();
             let Some(window) = shell.window.upgrade() else {
                 return;
@@ -241,7 +243,12 @@ impl PlayerUi {
     }
 
     fn should_save_lyrics_to_source(&self, media_id: &playback::CurrentMediaId) -> bool {
-        self.settings.current.borrow().lyrics.save_lyrics_to_source
+        self.settings
+            .current
+            .borrow()
+            .lyrics
+            .preferences
+            .save_lyrics_to_source
             && self.lyrics_service.current_writable(media_id)
     }
 
@@ -425,7 +432,7 @@ impl PlayerUi {
         let Some(media_id) = current_playback_media_id(self.selected_playback().as_deref()) else {
             return;
         };
-        if self.settings.current.borrow().private_mode {
+        if self.settings.current.borrow().application.private_mode {
             return;
         }
 
@@ -442,8 +449,8 @@ impl PlayerUi {
         dialog.set_content_height(lyrics_popup_content_height(
             self.window.upgrade().map_or(0, |window| window.height()),
         ));
-        artist_entry.set_text(&current.artist);
-        title_entry.set_text(&current.title);
+        artist_entry.set_text(&current.row.track.metadata.artist);
+        title_entry.set_text(&current.row.track.metadata.title);
         for entry in [&artist_entry, &title_entry] {
             entry.set_icon_sensitive(gtk::EntryIconPosition::Secondary, !entry.text().is_empty());
             entry.connect_changed(|entry| {
@@ -514,8 +521,8 @@ impl PlayerUi {
         drop(lyrics);
         if dialog.media_id != media_id {
             debug!(
-                dialog_occurrence = %dialog.media_id.occurrence,
-                response_occurrence = %media_id.occurrence,
+                dialog_media_uri = %dialog.media_id.media_uri,
+                response_media_uri = %media_id.media_uri,
                 "ignored lyric search response for another track"
             );
             return;
@@ -652,8 +659,8 @@ impl PlayerUi {
         drop(lyrics);
         if dialog.media_id != media_id {
             debug!(
-                dialog_occurrence = %dialog.media_id.occurrence,
-                response_occurrence = %media_id.occurrence,
+                dialog_media_uri = %dialog.media_id.media_uri,
+                response_media_uri = %media_id.media_uri,
                 "ignored lyric search failure for another track"
             );
             return;

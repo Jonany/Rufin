@@ -1,9 +1,11 @@
 //! Owns the fixed SQLite writer, bounded read pool, and read cancellation.
 //! It creates no runtime and contains no product query policy.
 
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use sqlx::pool::PoolConnection;
@@ -49,7 +51,7 @@ impl ReadCancellation {
         self.0.cancelled.load(Ordering::Acquire)
     }
 
-    pub(crate) async fn cancelled(&self) {
+    pub async fn cancelled(&self) {
         loop {
             let notified = self.0.notify.notified();
             if self.is_cancelled() {
@@ -60,30 +62,97 @@ impl ReadCancellation {
     }
 }
 
+type CatalogObserver = dyn Fn(
+        Option<(crate::SourceId, crate::SourceKey)>,
+        crate::CatalogUpdate,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>>
+    + Send
+    + Sync;
+
 struct DatabaseInner {
     writer: Arc<Mutex<Option<SqliteConnection>>>,
     readers: SqlitePool,
     export_readers: SqlitePool,
     export_read: tokio::sync::Mutex<()>,
     general_read: Arc<Semaphore>,
-    active_scan: AtomicU64,
-    next_scan: AtomicU64,
     distinct_track_covers: AtomicBool,
-    _temporary_catalog: Option<tempfile::TempDir>,
+    catalog_observer: std::sync::Mutex<Option<Arc<CatalogObserver>>>,
+    lyrics_writes: tokio::sync::watch::Sender<()>,
 }
 
 /// Final ownership of one fixed writer and the bounded read-only pool.
 #[derive(Clone)]
 pub struct Database {
     inner: Arc<DatabaseInner>,
-    fresh_start: bool,
 }
 
 impl Database {
-    pub fn set_distinct_track_covers(&self, enabled: bool) {
+    pub fn subscribe_lyrics_cache_writes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.inner.lyrics_writes.subscribe()
+    }
+
+    pub(crate) fn lyrics_cache_written(&self) {
+        self.inner.lyrics_writes.send_replace(());
+    }
+
+    pub fn observe_catalog<F, Work>(&self, observer: F)
+    where
+        F: Fn(Option<(crate::SourceId, crate::SourceKey)>, crate::CatalogUpdate) -> Work
+            + Send
+            + Sync
+            + 'static,
+        Work: Future<Output = ()> + Send + 'static,
+    {
+        *self.inner.catalog_observer.lock().unwrap() = Some(Arc::new(move |source, update| {
+            Box::pin(observer(source, update))
+        }));
+    }
+
+    pub(crate) async fn catalog_updated(
+        &self,
+        source: Option<(crate::SourceId, crate::SourceKey)>,
+        update: crate::CatalogUpdate,
+    ) {
+        let changed = update.metadata || update.artwork || update.playlists;
+        if (changed || update.activity)
+            && let Err(error) = self.mark_playlist_artwork_pending(None, !changed).await
+        {
+            tracing::warn!(%error, "could not update incomplete playlist artwork");
+        }
+        let observer = self.inner.catalog_observer.lock().unwrap().clone();
+        if let Some(observer) = observer {
+            observer(source, update).await;
+        }
+    }
+
+    pub async fn set_distinct_track_covers(&self, enabled: bool) -> LibraryResult<()> {
+        let mut writer = self.writer().await?;
+        let changed:Vec<(crate::SourceKey,String)>=sqlx::query_as("UPDATE sources SET distinct_track_covers=?1 WHERE distinct_track_covers<>?1 RETURNING source_key,object_id").bind(enabled).fetch_all(writer.as_mut().ok_or(LibraryError::WriterUnavailable)?).await?;
         self.inner
             .distinct_track_covers
             .store(enabled, Ordering::Release);
+        let connection = writer.as_mut().ok_or(LibraryError::WriterUnavailable)?;
+        for (source, _) in &changed {
+            let mut after = 0;
+            loop {
+                let keys: Vec<i64> = sqlx::query_scalar("SELECT track_key FROM tracks WHERE source_key=?1 AND track_key>?2 ORDER BY track_key LIMIT 128")
+                    .bind(source).bind(after).fetch_all(&mut *connection).await?;
+                let Some(last) = keys.last() else { break };
+                after = *last;
+                if crate::catalog::artwork::refresh_track_choices(connection, &keys, &[], &[])
+                    .await?
+                {
+                    crate::artwork::refresh_mosaics(connection, &keys, &[], &[]).await?;
+                }
+            }
+        }
+        drop(writer);
+        for (_source, id) in changed {
+            let mut update = crate::CatalogUpdate::default();
+            update.artwork = true;
+            self.publish_catalog_update(&id, update).await;
+        }
+        Ok(())
     }
 
     pub fn distinct_track_covers(&self) -> bool {
@@ -133,7 +202,7 @@ impl Database {
         selected: Option<&crate::SourceId>,
     ) -> LibraryResult<Self> {
         let path = path.as_ref();
-        Self::open_with_catalog(
+        Self::open_with_legacy_catalog(
             path,
             path.with_extension("catalog.sqlite"),
             configured,
@@ -142,7 +211,7 @@ impl Database {
         .await
     }
 
-    pub async fn open_with_catalog(
+    pub async fn open_with_legacy_catalog(
         path: impl AsRef<Path>,
         catalog: impl AsRef<Path>,
         configured: &[crate::SourceId],
@@ -151,19 +220,9 @@ impl Database {
         let path = path.as_ref();
         let catalog = catalog.as_ref();
         if path.exists() {
-            let migrated = Self::migrate_released(path, path, catalog, configured, selected).await;
-            if let Err(error) = migrated {
-                if !is_corrupt_store(&error) {
-                    return Err(error);
-                }
-                tracing::warn!(%error, "could not migrate released Store; opening fresh state");
-                preserve_store(path)?;
-                let mut database = Self::open_final(path, catalog).await?;
-                database.fresh_start = true;
-                return Ok(database);
-            }
+            Self::migrate_released(path, path, catalog, configured, selected).await?;
         }
-        Self::open_final(path, catalog).await
+        Self::open_final(path).await
     }
 
     pub async fn open_installation(
@@ -174,19 +233,9 @@ impl Database {
         selected: Option<&crate::SourceId>,
     ) -> LibraryResult<Self> {
         if !path.exists() && legacy.exists() {
-            if let Err(error) =
-                Self::migrate_released(legacy, path, catalog, configured, selected).await
-            {
-                if !is_corrupt_store(&error) {
-                    return Err(error);
-                }
-                tracing::warn!(%error, "could not migrate old Store; original retained");
-                let mut database = Self::open_final(path, catalog).await?;
-                database.fresh_start = true;
-                return Ok(database);
-            }
+            Self::migrate_released(legacy, path, catalog, configured, selected).await?;
         }
-        Self::open_with_catalog(path, catalog, configured, selected).await
+        Self::open_with_legacy_catalog(path, catalog, configured, selected).await
     }
 
     async fn migrate_released(
@@ -200,18 +249,24 @@ impl Database {
             SqliteConnection::connect_with(&base_options(input).read_only(true)).await?;
         let version = schema::pragma(&mut reader, "user_version").await;
         reader.close().await?;
-        let version = version?;
-        if (1..=43).contains(&version) {
-            crate::migration::import_released(input, destination, catalog, configured, selected)
-                .await?;
-        } else if input != destination {
-            Self::relocate(input, destination).await?;
+        match version? {
+            1..=43 => {
+                crate::migration::import_released(input, destination, catalog, configured, selected)
+                    .await?
+            }
+            44..=46 => crate::migration::import_current(input, destination, catalog).await?,
+            0 | 47 => {
+                if input != destination {
+                    Self::relocate(input, destination).await?;
+                }
+            }
+            version => {
+                return Err(LibraryError::Migration(format!(
+                    "unsupported library schema {version}"
+                )));
+            }
         }
         Ok(())
-    }
-
-    pub fn fresh_start(&self) -> bool {
-        self.fresh_start
     }
 
     pub async fn close(self) -> LibraryResult<()> {
@@ -225,28 +280,23 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) async fn open_final(path: &Path, catalog: &Path) -> LibraryResult<Self> {
-        async fn open_store(path: &Path) -> LibraryResult<SqliteConnection> {
-            let mut writer = open_writer(path).await?;
-            if let Err(error) = schema::initialize_durable(&mut writer).await {
-                writer.close().await?;
-                return Err(error);
-            }
-            Ok(writer)
+    pub(crate) async fn open_final(path: &Path) -> LibraryResult<Self> {
+        let mut writer = open_writer(path).await?;
+        let initialized = async {
+            schema::initialize_durable(&mut writer).await?;
+            crate::connect::initialize(&mut writer).await?;
+            sqlx::raw_sql("PRAGMA optimize=0x10002")
+                .execute(&mut writer)
+                .await?;
+            LibraryResult::Ok(())
         }
-        let (writer, fresh_start) = match open_store(path).await {
-            Ok(writer) => (writer, false),
-            Err(error) if is_store_content_failure(&error) => {
-                tracing::warn!(%error, "could not use Store; opening fresh state");
-                preserve_store(path)?;
-                (open_store(path).await?, true)
-            }
-            Err(error) => return Err(error),
-        };
-        writer.close().await?;
-        let (catalog, temporary_catalog, writer) = prepare_catalog(path, catalog).await?;
-        let readers = open_readers(path, &catalog, MIN_READERS, MAX_READERS).await?;
-        let export_readers = open_readers(path, &catalog, 0, 1).await?;
+        .await;
+        if let Err(error) = initialized {
+            writer.close().await?;
+            return Err(error);
+        }
+        let readers = open_readers(path, MIN_READERS, MAX_READERS, ROW_BUFFER).await?;
+        let export_readers = open_readers(path, 0, 1, 1).await?;
         Ok(Self {
             inner: Arc::new(DatabaseInner {
                 writer: Arc::new(Mutex::new(Some(writer))),
@@ -254,12 +304,10 @@ impl Database {
                 export_readers,
                 export_read: tokio::sync::Mutex::new(()),
                 general_read: Arc::new(Semaphore::new(1)),
-                active_scan: AtomicU64::new(0),
-                next_scan: AtomicU64::new(1),
                 distinct_track_covers: AtomicBool::new(false),
-                _temporary_catalog: temporary_catalog,
+                catalog_observer: std::sync::Mutex::new(None),
+                lyrics_writes: tokio::sync::watch::channel(()).0,
             }),
-            fresh_start,
         })
     }
 
@@ -267,9 +315,9 @@ impl Database {
         &self,
         source_id: &crate::SourceId,
     ) -> LibraryResult<Option<crate::SourceKey>> {
-        let (_permit, mut connection) = self.acquire_general(&ReadCancellation::new()).await?;
+        let mut connection = self.acquire_reader().await?;
         Ok(
-            sqlx::query_scalar("SELECT source_key FROM catalog.sources WHERE object_id=?1")
+            sqlx::query_scalar("SELECT source_key FROM sources WHERE object_id=?1")
                 .bind(source_id.as_str())
                 .fetch_optional(&mut *connection)
                 .await?,
@@ -280,17 +328,18 @@ impl Database {
         let mut writer = self.writer().await?;
         let connection = writer.as_mut().ok_or(LibraryError::WriterUnavailable)?;
         let mut transaction = connection.begin().await?;
-        let source = sqlx::query_scalar::<_, i64>(
-            "SELECT source_key FROM catalog.sources WHERE object_id=?1",
-        )
-        .bind(source_id.as_str())
-        .fetch_optional(&mut *transaction)
-        .await?;
-        for kind in ["track", "album", "artist"] {
+        let source =
+            sqlx::query_scalar::<_, i64>("SELECT source_key FROM sources WHERE object_id=?1")
+                .bind(source_id.as_str())
+                .fetch_optional(&mut *transaction)
+                .await?;
+        sqlx::query("UPDATE sources SET observation_stamp=observation_stamp+1,freshness=NULL WHERE object_id=?1").bind(source_id.as_str()).execute(&mut *transaction).await?;
+        for kind in ["track", "album", "artist", "genre", "mood", "folder"] {
             let prefix = crate::keys::source_entity_prefix(source_id, kind);
             for query in [
                 "DELETE FROM lyrics_cache WHERE substr(media_uri,1,length(?1))=?1 OR media_uri IN (SELECT media_uri FROM tracks WHERE source_key=?2)",
                 "DELETE FROM user_media_state WHERE substr(media_uri,1,length(?1))=?1 OR media_uri IN (SELECT media_uri FROM tracks WHERE source_key=?2)",
+                "DELETE FROM native_media_state WHERE substr(media_uri,1,length(?1))=?1 OR media_uri IN (SELECT media_uri FROM tracks WHERE source_key=?2)",
                 "DELETE FROM favorite_outbox WHERE substr(media_uri,1,length(?1))=?1 OR media_uri IN (SELECT media_uri FROM tracks WHERE source_key=?2)",
             ] {
                 sqlx::query(query)
@@ -300,38 +349,34 @@ impl Database {
                     .await?;
             }
         }
-        sqlx::query("DELETE FROM catalog.local_access_metadata WHERE access_uri IN (SELECT access_uri FROM main.local_locators locator JOIN main.source_ids identity USING(source_key) WHERE identity.object_id=?1)").bind(source_id.as_str()).execute(&mut *transaction).await?;
-        // Accepted listens and global Playlist snapshots have no source foreign key.
+        sqlx::query("DELETE FROM local_access_metadata WHERE access_uri IN (SELECT access_uri FROM main.local_locators locator JOIN sources identity USING(source_key) WHERE identity.object_id=?1) AND NOT EXISTS(SELECT 1 FROM local_locators other WHERE other.access_uri=local_access_metadata.access_uri AND other.source_key IS NOT ?2)").bind(source_id.as_str()).bind(source).execute(&mut *transaction).await?;
+        // Referenced metadata survives source removal.
+        sqlx::query("UPDATE tracks SET indexed=0,artwork_kind=CASE WHEN native_artwork IS NULL THEN 0 ELSE 1 END,artwork_artist_key=NULL WHERE source_key=?1")
+            .bind(source)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("UPDATE albums SET indexed=0 WHERE source_key=?1")
+            .bind(source)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("UPDATE artists SET indexed=0 WHERE source_key=?1")
+            .bind(source)
+            .execute(&mut *transaction)
+            .await?;
         let removed = sqlx::query("DELETE FROM sources WHERE source_key=?1")
             .bind(source)
             .execute(&mut *transaction)
             .await?
             .rows_affected()
             == 1;
-        let durable_removed = sqlx::query("DELETE FROM main.source_ids WHERE object_id=?1")
-            .bind(source_id.as_str())
-            .execute(&mut *transaction)
-            .await?
-            .rows_affected()
-            == 1;
         transaction.commit().await?;
-        Ok(removed || durable_removed)
+        Ok(removed)
     }
 
     pub(crate) async fn writer(
         &self,
     ) -> LibraryResult<tokio::sync::MutexGuard<'_, Option<SqliteConnection>>> {
         let writer = self.inner.writer.lock().await;
-        if writer.is_none() {
-            return Err(LibraryError::WriterUnavailable);
-        }
-        Ok(writer)
-    }
-
-    pub(crate) async fn writer_owned(
-        &self,
-    ) -> LibraryResult<tokio::sync::OwnedMutexGuard<Option<SqliteConnection>>> {
-        let writer = Arc::clone(&self.inner.writer).lock_owned().await;
         if writer.is_none() {
             return Err(LibraryError::WriterUnavailable);
         }
@@ -363,7 +408,7 @@ impl Database {
         Ok((permit, connection))
     }
 
-    // Playback point reads bypass the route-read permit.
+    // Point reads bypass the route-read permit.
     pub(crate) async fn acquire_reader(&self) -> LibraryResult<PoolConnection<Sqlite>> {
         Ok(self.inner.readers.acquire().await?)
     }
@@ -375,52 +420,33 @@ impl Database {
         Ok((permit, self.inner.export_readers.acquire().await?))
     }
 
-    pub(crate) fn begin_scan(&self) -> LibraryResult<u64> {
-        let token = self.inner.next_scan.fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .active_scan
-            .compare_exchange(0, token, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| LibraryError::ScanInProgress)?;
-        Ok(token)
-    }
-
-    pub(crate) fn scan_is_current(&self, token: u64) -> bool {
-        self.inner.active_scan.load(Ordering::Acquire) == token
-    }
-
-    pub(crate) fn release_scan(&self, token: u64) {
-        let _ =
-            self.inner
-                .active_scan
-                .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
-    }
-
-    pub(crate) fn writer_failed(&self) {
-        self.inner.active_scan.store(0, Ordering::Release);
-    }
-
     #[cfg(test)]
     pub(crate) fn reader_pool(&self) -> &SqlitePool {
         &self.inner.readers
     }
-
-    #[cfg(test)]
-    pub(crate) async fn fail_writer(&self) -> LibraryResult<()> {
-        let mut writer = self.inner.writer.lock().await;
-        if let Some(connection) = writer.take() {
-            connection.close().await?;
-        }
-        self.writer_failed();
-        Ok(())
-    }
 }
 
+#[allow(unsafe_code)]
 pub(crate) async fn open_writer(path: &Path) -> LibraryResult<SqliteConnection> {
     let options = base_options(path)
         .create_if_missing(true)
         .statement_cache_capacity(WRITER_STATEMENTS)
         .thread_name(|id| format!("rufin-library-writer-{id}"));
     let mut connection = SqliteConnection::connect_with(&options).await?;
+    {
+        let mut handle = connection.lock_handle().await?;
+        // Replanning each bound UPSERT recompiles all its update triggers for every source row.
+        // SAFETY: SQLx owns the live handle and excludes its worker while this guard is held.
+        let result = unsafe {
+            libsqlite3_sys::sqlite3_db_config(
+                handle.as_raw_handle().as_ptr(),
+                libsqlite3_sys::SQLITE_DBCONFIG_ENABLE_QPSG,
+                1,
+                std::ptr::null_mut::<i32>(),
+            )
+        };
+        debug_assert_eq!(result, libsqlite3_sys::SQLITE_OK);
+    }
     // Own the handle before configuring it so failures can await its release before replacement.
     let result = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "PRAGMA page_size={PAGE_SIZE_BYTES}; PRAGMA journal_mode=WAL;
@@ -458,11 +484,10 @@ fn base_options(path: &Path) -> SqliteConnectOptions {
 
 async fn open_readers(
     path: &Path,
-    catalog: &Path,
     minimum: u32,
     maximum: u32,
+    row_buffer: usize,
 ) -> LibraryResult<SqlitePool> {
-    let catalog = catalog.to_path_buf();
     let options = SqlitePoolOptions::new()
         .min_connections(minimum)
         .max_connections(maximum)
@@ -471,11 +496,7 @@ async fn open_readers(
         .max_lifetime(None)
         .test_before_acquire(true)
         .after_connect(move |connection, _| {
-            let catalog = catalog.clone();
             Box::pin(async move {
-                schema::attach_catalog(connection, &catalog)
-                    .await
-                    .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
                 sqlx::query("PRAGMA query_only=ON")
                     .execute(connection)
                     .await?;
@@ -489,77 +510,17 @@ async fn open_readers(
             })
         });
     if minimum == 0 {
-        Ok(options.connect_lazy_with(reader_options(path)))
+        Ok(options.connect_lazy_with(reader_options(path).row_buffer_size(row_buffer)))
     } else {
-        Ok(options.connect_with(reader_options(path)).await?)
+        Ok(options
+            .connect_with(reader_options(path).row_buffer_size(row_buffer))
+            .await?)
     }
-}
-
-async fn prepare_catalog(
-    store: &Path,
-    path: &Path,
-) -> LibraryResult<(
-    std::path::PathBuf,
-    Option<tempfile::TempDir>,
-    SqliteConnection,
-)> {
-    async fn open(store: &Path, path: &Path) -> LibraryResult<SqliteConnection> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut connection = open_writer(path).await?;
-        let result = schema::initialize_catalog(&mut connection).await;
-        connection.close().await?;
-        result?;
-        let mut writer = open_writer(store).await?;
-        let result = async {
-            schema::attach_catalog(&mut writer, path).await?;
-            sqlx::query("PRAGMA catalog.synchronous=NORMAL")
-                .execute(&mut writer)
-                .await?;
-            schema::initialize_local_activity(&mut writer).await?;
-            crate::connect::initialize(&mut writer).await?;
-            sqlx::raw_sql("PRAGMA optimize=0x10002")
-                .execute(&mut writer)
-                .await?;
-            LibraryResult::Ok(())
-        }
-        .await;
-        if let Err(error) = result {
-            writer.close().await?;
-            return Err(error);
-        }
-        Ok(writer)
-    }
-    match open(store, path).await {
-        Ok(writer) => return Ok((path.to_path_buf(), None, writer)),
-        Err(error) if is_store_content_failure(&error) => {
-            for suffix in ["", "-wal", "-shm"] {
-                let mut name = path.as_os_str().to_os_string();
-                name.push(suffix);
-                match std::fs::remove_file(name) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(_) => break,
-                }
-            }
-            if let Ok(writer) = open(store, path).await {
-                return Ok((path.to_path_buf(), None, writer));
-            }
-        }
-        Err(_) => {}
-    }
-    let directory = tempfile::Builder::new()
-        .prefix("rufin-catalog-")
-        .tempdir()?;
-    let path = directory.path().join("catalog.sqlite");
-    let writer = open(store, &path).await?;
-    Ok((path, Some(directory), writer))
 }
 
 pub(crate) fn preserve_store(path: &Path) -> std::io::Result<()> {
     let destination = path.with_extension(format!(
-        "unusable-{}",
+        "before-migration-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -575,24 +536,6 @@ pub(crate) fn preserve_store(path: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
-}
-
-fn is_corrupt_store(error: &LibraryError) -> bool {
-    matches!(error, LibraryError::Sqlite(sqlx::Error::Database(error))
-        if error.code().and_then(|code| code.parse::<i32>().ok())
-            .is_some_and(|code| matches!(code & 0xff, 11 | 26)))
-}
-
-fn is_store_content_failure(error: &LibraryError) -> bool {
-    match error {
-        LibraryError::InvalidStore(_) | LibraryError::Migration(_) | LibraryError::Json(_) => true,
-        LibraryError::Sqlite(sqlx::Error::Database(error)) => error
-            .code()
-            .as_deref()
-            .and_then(|code| code.parse::<i32>().ok())
-            .is_some_and(|code| matches!(code & 0xff, 1 | 11 | 19 | 20 | 26)),
-        _ => false,
-    }
 }
 
 #[cfg(test)]
@@ -693,14 +636,11 @@ mod tests {
         .await
         .expect("read fixed writer options");
         assert_eq!(writer_options, ("wal".to_string(), 1));
-        let sync_modes = sqlx::query_as::<_, (i64, i64)>(
-            "SELECT (SELECT synchronous FROM pragma_synchronous('main')),
-                    (SELECT synchronous FROM pragma_synchronous('catalog'))",
-        )
-        .fetch_one(&mut *writer)
-        .await
-        .expect("read both writer synchronous modes");
-        assert_eq!(sync_modes, (1, 1));
+        let synchronous = sqlx::query_scalar::<_, i64>("PRAGMA synchronous")
+            .fetch_one(&mut *writer)
+            .await
+            .expect("read writer synchronous mode");
+        assert_eq!(synchronous, 1);
         assert_eq!(
             sqlx::query_scalar::<_, i64>("PRAGMA mmap_size")
                 .fetch_one(&mut *writer)
@@ -713,6 +653,10 @@ mod tests {
     #[tokio::test]
     async fn playback_bypass_uses_second_slot_but_third_general_read_waits_fairly() {
         let (_directory, database) = database().await;
+        let mut writer = database.writer().await.unwrap();
+        sqlx::raw_sql("INSERT INTO sources(object_id,kind) VALUES('source','local'); INSERT INTO tracks(source_key,object_id,media_uri) SELECT source_key,'track','file:///point.flac' FROM sources WHERE object_id='source'")
+            .execute(writer.as_mut().unwrap()).await.unwrap();
+        drop(writer);
         let cancellation = ReadCancellation::new();
         let (permit, general) = database
             .acquire_general(&cancellation)
@@ -744,11 +688,34 @@ mod tests {
             "a third general read bypassed the permit"
         );
         drop(playback);
+        assert_eq!(
+            timeout(
+                Duration::from_secs(1),
+                database.playback_loudness("file:///not-present", &cancellation)
+            )
+            .await
+            .expect("cached gain bypasses the browsing permit")
+            .expect("cached gain read"),
+            (None, None)
+        );
         sleep(Duration::from_millis(50)).await;
         assert!(
             !waiting.is_finished(),
             "a free pool slot bypassed the permit"
         );
+
+        let listen: crate::ListenWrite = serde_json::from_value(serde_json::json!({
+            "external_id":"direct", "media_uri":"file:///point.flac",
+            "title":"Direct", "artist":"", "album":"", "duration_millis":1000,
+            "started_at":1_700_000_000,"local_period":"2023-11","listened_millis":1000,"skipped":false
+        })).unwrap();
+        timeout(
+            Duration::from_secs(1),
+            database.record_listen(&listen, Some(crate::TrackKey::from_raw(1)), &[]),
+        )
+        .await
+        .expect("accepted listen does not wait on the browsing permit")
+        .unwrap();
 
         drop(general);
         drop(permit);
@@ -905,14 +872,12 @@ pub(crate) async fn write_source_identity(
             "source identity cannot be empty".into(),
         ));
     }
-    sqlx::query(
-        "INSERT INTO main.source_ids(object_id) VALUES(?1) ON CONFLICT(object_id) DO NOTHING",
-    )
-    .bind(source_id)
-    .execute(&mut *connection)
-    .await?;
+    sqlx::query("INSERT INTO sources(object_id) VALUES(?1) ON CONFLICT(object_id) DO NOTHING")
+        .bind(source_id)
+        .execute(&mut *connection)
+        .await?;
     Ok(
-        sqlx::query_scalar("SELECT source_key FROM main.source_ids WHERE object_id=?1")
+        sqlx::query_scalar("SELECT source_key FROM sources WHERE object_id=?1")
             .bind(source_id)
             .fetch_one(connection)
             .await?,

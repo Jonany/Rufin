@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use library::{
     AlbumKey, ArtistKey, Database, FolderKey, GenreKey, HomeEntryInput, HomeEntryKind, MoodKey,
-    QueueOccurrence, QueueRepeatMode, Scan, ScanOutcome, SourceKey, TrackKey,
+    QueueRepeatMode, QueueTransferRow, SourceKey, TrackKey,
 };
 use sqlx::Connection;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
@@ -23,25 +23,45 @@ pub struct Fixture {
     pub folder: FolderKey,
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn persist_queue(
     database: &Database,
-    source: SourceKey,
-    occurrences: &[QueueOccurrence],
-    current: Option<&str>,
+    occurrences: &[QueueTransferRow],
+    current: Option<usize>,
     progress_millis: i64,
     repeat_mode: QueueRepeatMode,
     shuffled: bool,
 ) {
-    let _ = source;
-    let mut output=serde_json::to_vec(&serde_json::json!({"version":1,"current_occurrence":current,"progress_millis":progress_millis,"repeat_mode":repeat_mode,"shuffled":shuffled})).unwrap();
-    output.push(b'\n');
-    for occurrence in occurrences {
-        serde_json::to_writer(&mut output, occurrence).unwrap();
-        output.push(b'\n');
-    }
+    let captured = database
+        .queue_entries(
+            library::QueueLoad::items(
+                occurrences
+                    .iter()
+                    .map(|row| (row.item.clone(), row.provenance.clone()))
+                    .collect(),
+            ),
+            None,
+        )
+        .await
+        .expect("capture Queue metadata");
+    let state = library::QueueRestore {
+        entries: captured
+            .entries
+            .into_iter()
+            .zip(occurrences)
+            .map(|(mut entry, row)| {
+                entry.received_from_connect = row.received_from_connect;
+                entry
+            })
+            .collect(),
+        order: (0..occurrences.len() as u32).collect(),
+        current_index: current,
+        progress_millis,
+        repeat_mode,
+        shuffled,
+        ..Default::default()
+    };
     database
-        .import_queue_jsonl(std::io::Cursor::new(output))
+        .save_queue(&state)
         .await
         .expect("persist Queue records");
 }
@@ -50,199 +70,238 @@ pub async fn fixture() -> Fixture {
     let directory = tempfile::tempdir().expect("temporary Library directory");
     let path = directory.path().join("library.sqlite3");
     let database = Database::open(&path).await.expect("open Library");
-    let mut scan = Scan::begin(&database, "source", "Source", "source", None)
+    let source = database
+        .reconcile_source(&library::SourceId::new("source"), "subsonic", "Source")
         .await
-        .expect("begin fixture scan");
+        .unwrap()
+        .source;
+    let mut catalog = database.catalog("source", None).await.unwrap();
+    let observed = catalog.start_observation().await.unwrap();
+    let mut batch = library::CatalogBatch::default();
     for (id, title, artist, sort, date) in [
         ("album-a", "Album A", "Artist A", "album a", "2024-01-02"),
         ("album-b", "Album B", "Artist B", "album b", "2023-01-02"),
     ] {
-        scan.write_album(
-            id,
-            title,
-            sort,
-            artist,
-            sort,
-            Some(2024),
-            Some(date),
-            Some(date),
-            None,
-            Some(if id == "album-a" {
-                "group-a"
-            } else {
-                "group-b"
-            }),
-            Some(id == "album-a"),
-            None,
-            false,
-            None,
-            None,
-        )
-        .await
-        .expect("stage Album");
+        batch.albums.push(library::AlbumObservation {
+            object_id: id.into(),
+            metadata: library::AlbumMetadata {
+                title: title.into(),
+                artist: artist.into(),
+                sort_text: sort.into(),
+                year: Some(2024),
+                release_date: Some(date.into()),
+                date_added: Some(date.into()),
+                musicbrainz_release_group_id: Some(
+                    if id == "album-a" {
+                        "group-a"
+                    } else {
+                        "group-b"
+                    }
+                    .into(),
+                ),
+                is_compilation: Some(id == "album-a"),
+                album_artists: vec![library::ArtistCredit {
+                    object_id: if id == "album-a" {
+                        "artist-a"
+                    } else {
+                        "artist-b"
+                    }
+                    .into(),
+                    name: artist.into(),
+                    ..Default::default()
+                }],
+                genres: vec![library::TagReference {
+                    object_id: "genre".into(),
+                    name: "Rock".into(),
+                    ..Default::default()
+                }],
+                release_types: vec![if id == "album-a" { "Album" } else { "EP" }.into()],
+                ..Default::default()
+            },
+            user_data: library::NativeUserState {
+                favorite: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
     }
     for (id, name) in [("artist-a", "Artist A"), ("artist-b", "Artist B")] {
-        scan.write_artist(
-            id,
-            name,
-            &name.to_lowercase(),
-            Some(&name.to_lowercase()),
-            None,
-            None,
-            Some(false),
-            None,
-        )
-        .await
-        .expect("stage Artist");
+        batch.artists.push(library::ArtistObservation {
+            object_id: id.into(),
+            metadata: library::ArtistMetadata {
+                name: name.into(),
+                sort_text: Some(name.to_lowercase()),
+                ..Default::default()
+            },
+            user_data: library::NativeUserState {
+                favorite: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
     }
-    scan.write_genre("genre", "Rock", "rock", Some("rock"), None)
-        .await
-        .expect("stage Genre");
-    scan.write_mood("mood", "Energetic", "energetic", "energetic")
-        .await
-        .expect("stage Mood");
-    scan.write_folder("folder", "Music", "music", "music", None)
-        .await
-        .expect("stage Folder");
+    batch.genres.push(library::GenreObservation {
+        object_id: "genre".into(),
+        metadata: library::TagMetadata {
+            name: "Rock".into(),
+            sort_text: Some("rock".into()),
+        },
+        ..Default::default()
+    });
+    batch.moods.push(library::MoodObservation {
+        object_id: "mood".into(),
+        metadata: library::TagMetadata {
+            name: "Energetic".into(),
+            sort_text: Some("energetic".into()),
+        },
+    });
+    batch.folders.push(library::FolderObservation {
+        object_id: "folder".into(),
+        metadata: library::FolderMetadata {
+            name: Some("Music".into()),
+            sort_text: Some("music".into()),
+        },
+        ..Default::default()
+    });
     for (index, album, artist, title, favorite) in [
         (0, "album-a", "artist-a", "Alpha", false),
         (1, "album-a", "artist-a", "Beta", true),
         (2, "album-b", "artist-b", "Gamma", false),
         (3, "album-b", "artist-b", "Delta", false),
     ] {
-        let id = format!("track-{index}");
-        scan.write_track(
-            &id,
-            Some(album),
-            title,
-            &format!(
-                "{} {} {} note",
-                title.to_lowercase(),
-                if album == "album-a" {
-                    "album a"
+        batch.tracks.push(library::TrackObservation {
+            object_id: format!("track-{index}"),
+            album_object_id: Some(album.into()),
+            metadata: library::TrackMetadata {
+                title: title.into(),
+                album: if album == "album-a" {
+                    "Album A"
                 } else {
-                    "album b"
-                },
-                if artist == "artist-a" {
-                    "artist a"
-                } else {
-                    "artist b"
+                    "Album B"
                 }
-            ),
-            if album == "album-a" {
-                "Album A"
-            } else {
-                "Album B"
+                .into(),
+                artist: if artist == "artist-a" {
+                    "Artist A"
+                } else {
+                    "Artist B"
+                }
+                .into(),
+                sort_text: title.to_lowercase(),
+                duration_millis: 180000 + index * 1000,
+                disc_number: 1,
+                track_number: index + 1,
+                year: Some(2020 + index),
+                date_added: Some("2024-01-02".into()),
+                source_format: Some("FLAC".into()),
+                comment: Some("Note".into()),
+                bpm: Some(100 + index),
+                artists: vec![library::ArtistCredit {
+                    object_id: artist.into(),
+                    name: if artist == "artist-a" {
+                        "Artist A"
+                    } else {
+                        "Artist B"
+                    }
+                    .into(),
+                    ..Default::default()
+                }],
+                genres: vec![library::TagReference {
+                    object_id: "genre".into(),
+                    name: "Rock".into(),
+                    ..Default::default()
+                }],
+                moods: vec![library::TagReference {
+                    object_id: "mood".into(),
+                    name: "Energetic".into(),
+                    sort_text: Some("energetic".into()),
+                }],
+                ..Default::default()
             },
-            if artist == "artist-a" {
-                "Artist A"
-            } else {
-                "Artist B"
+            user_data: library::NativeUserState {
+                favorite: Some(favorite),
+                rating: (Some(Some(5 + index))).map(|rating| rating.map(|value| value * 10)),
+                ..Default::default()
             },
-            &title.to_lowercase(),
-            180_000 + index * 1_000,
-            1,
-            index + 1,
-            Some(2020 + index),
+            loudness_analysis_key: [index as u8 + 1; 32],
+            folders: Some(vec!["folder".into()]),
+            ..Default::default()
+        });
+    }
+    catalog.apply_catalog(&batch, true).await.unwrap();
+
+    catalog
+        .replace_source_home_section(
+            "featured",
             None,
-            Some("2024-01-02"),
-            None,
-            Some("FLAC"),
-            Some("Note"),
-            Some(100 + index),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            favorite,
-            Some(5 + index),
-            None,
-            None,
-            None,
-            None,
-            None,
-            [index as u8 + 1; 32],
-            &library::AudioProperties::default(),
+            &[HomeEntryInput {
+                position: 0,
+                kind: HomeEntryKind::Track,
+                entity_object_id: "track-0".into(),
+                title: "Featured Track".into(),
+                subtitle: "Featured".into(),
+            }],
         )
         .await
-        .expect("stage Track");
-        scan.write_track_relations(&[(&id, artist)], &[(&id, "genre")], &[(&id, "mood")])
-            .await
-            .expect("stage Track relations");
-        scan.write_track_folders(&[library::ScanLink::new(&id, "folder", 0)])
-            .await
-            .expect("stage Track Folder");
-    }
-    scan.write_album_relations(
-        &[("album-a", "artist-a"), ("album-b", "artist-b")],
-        &[("album-a", "genre"), ("album-b", "genre")],
-        &[("album-a", "Album"), ("album-b", "EP")],
-    )
-    .await
-    .expect("stage Album relations");
-    scan.write_home_entry(&HomeEntryInput {
-        section_id: "featured".to_string(),
-        position: 0,
-        kind: HomeEntryKind::Track,
-        entity_object_id: "track-0".to_string(),
-        title: "Featured Track".to_string(),
-        subtitle: "Featured".to_string(),
-    })
-    .await
-    .expect("stage provider Home entry");
-    let ScanOutcome::Changed(publication) = scan.finish().await.expect("publish fixture") else {
-        panic!("fixture must publish");
-    };
+        .unwrap();
+
+    catalog
+        .complete_source_observation(
+            observed,
+            &["track", "album", "artist", "genre", "mood", "folder"],
+            None,
+        )
+        .await
+        .unwrap();
+    let publication = catalog.into_changes();
+    database
+        .publish_catalog_update("source", publication.clone())
+        .await;
+    assert!(publication.metadata);
     let mut connection = connection(&path).await;
     let tracks =
         sqlx::query_scalar::<_, TrackKey>("SELECT track_key FROM tracks ORDER BY object_id")
             .fetch_all(&mut connection)
             .await
-            .expect("read Track keys");
-    let track_uris =
-        sqlx::query_scalar::<_, String>("SELECT media_uri FROM tracks ORDER BY object_id")
-            .fetch_all(&mut connection)
-            .await
-            .expect("read Track URIs");
+            .unwrap();
+    let track_uris = sqlx::query_scalar("SELECT media_uri FROM tracks ORDER BY object_id")
+        .fetch_all(&mut connection)
+        .await
+        .unwrap();
     let albums =
         sqlx::query_scalar::<_, AlbumKey>("SELECT album_key FROM albums ORDER BY object_id")
             .fetch_all(&mut connection)
             .await
-            .expect("read Album keys");
-    let album_uris =
-        sqlx::query_scalar::<_, String>("SELECT media_uri FROM albums ORDER BY object_id")
-            .fetch_all(&mut connection)
-            .await
-            .expect("read Album URIs");
+            .unwrap();
+    let album_uris = sqlx::query_scalar("SELECT media_uri FROM albums ORDER BY object_id")
+        .fetch_all(&mut connection)
+        .await
+        .unwrap();
     let artists =
         sqlx::query_scalar::<_, ArtistKey>("SELECT artist_key FROM artists ORDER BY object_id")
             .fetch_all(&mut connection)
             .await
-            .expect("read Artist keys");
-    let artist_uris =
-        sqlx::query_scalar::<_, String>("SELECT media_uri FROM artists ORDER BY object_id")
-            .fetch_all(&mut connection)
-            .await
-            .expect("read Artist URIs");
+            .unwrap();
+    let artist_uris = sqlx::query_scalar("SELECT media_uri FROM artists ORDER BY object_id")
+        .fetch_all(&mut connection)
+        .await
+        .unwrap();
     let genre = sqlx::query_scalar("SELECT genre_key FROM genres")
         .fetch_one(&mut connection)
         .await
-        .expect("read Genre key");
+        .unwrap();
     let mood = sqlx::query_scalar("SELECT mood_key FROM moods")
         .fetch_one(&mut connection)
         .await
-        .expect("read Mood key");
+        .unwrap();
     let folder = sqlx::query_scalar("SELECT folder_key FROM folders")
         .fetch_one(&mut connection)
         .await
-        .expect("read Folder key");
+        .unwrap();
     Fixture {
         _directory: directory,
         path,
         database,
-        source: publication.source,
+        source,
         tracks,
         track_uris,
         albums,
@@ -256,51 +315,42 @@ pub async fn fixture() -> Fixture {
 }
 
 pub async fn connection(path: &std::path::Path) -> SqliteConnection {
-    let mut connection = SqliteConnection::connect_with(
+    SqliteConnection::connect_with(
         &SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(false),
     )
     .await
-    .expect("open fixture connection");
-    let catalog = path.with_extension("catalog.sqlite");
-    if catalog.exists() {
-        super::production_schema::attach_catalog(&mut connection, &catalog)
-            .await
-            .expect("use production projections");
-    }
-    connection
+    .expect("open fixture connection")
 }
 
 /// Capture complete membership with a bounded metadata projection.
 pub async fn resolve_queue(
     database: &Database,
-    input: library::QueueInput,
+    input: library::QueueLoad,
     anchor_index: usize,
 ) -> library::QueueRestore {
-    let mut page = database
-        .read_queue(library::QueueReadRequest::Capture {
-            context_title: None,
-            input: Box::new(input),
-            anchor_index,
-            random_start: None,
-            shuffled: None,
-        })
+    let page = database.queue_entries(input, None).await.unwrap();
+    let start = anchor_index.saturating_sub(10);
+    let rows = database
+        .queue_rows_for_entries(
+            &page
+                .entries
+                .iter()
+                .cloned()
+                .enumerate()
+                .skip(start)
+                .take(100)
+                .collect::<Vec<_>>(),
+            &library::ReadCancellation::new(),
+        )
         .await
         .unwrap();
-    let start = page.current_index.saturating_sub(10);
-    page.occurrences = database
-        .read_queue(library::QueueReadRequest::Hydrate {
-            entries: page.entries[start..page.entries.len().min(start + 100)].to_vec(),
-        })
-        .await
-        .unwrap()
-        .occurrences;
     library::QueueRestore {
-        current_index: (!page.entries.is_empty()).then_some(page.current_index),
+        current_index: (!page.entries.is_empty()).then_some(anchor_index),
         order: (0..page.entries.len() as u32).collect(),
         entries: page.entries.into(),
-        occurrences: page.occurrences,
+        rows,
         ..Default::default()
     }
 }

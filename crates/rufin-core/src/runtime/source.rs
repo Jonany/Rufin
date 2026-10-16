@@ -4,11 +4,19 @@
 //! sees only form values, settings-derived summaries, and one operation state.
 
 use std::path::PathBuf;
+
+#[cfg(feature = "bindings")]
+uniffi::custom_type!(PathBuf, String, {
+    remote,
+    lower: |path| path.to_string_lossy().into_owned(),
+    try_lift: |path| Ok(PathBuf::from(path)),
+});
 use std::sync::Arc;
 
-use sources::SourceId;
+use sources::{CredentialPreset, SourceId};
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct LocalAccessStatus {
     pub total_track_count: usize,
     pub matched_track_count: usize,
@@ -16,6 +24,7 @@ pub struct LocalAccessStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct SourceSummary {
     pub id: SourceId,
     pub kind: String,
@@ -26,11 +35,13 @@ pub struct SourceSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct LocalFolder {
     pub path: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct SourceLocalAccess {
     pub source_id: SourceId,
     pub root_path: PathBuf,
@@ -39,23 +50,25 @@ pub struct SourceLocalAccess {
     pub sample_source_path: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct SourceLocalAccessSummary {
     pub source_id: SourceId,
     pub access: Option<SourceLocalAccess>,
-    pub status: LocalAccessStatus,
     pub selected_music_folder_name: Option<String>,
     pub album_count: usize,
     pub track_count: usize,
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct ConfiguredSources {
-    pub sources: Arc<[SourceSummary]>,
+    pub sources: Vec<SourceSummary>,
     pub selected_source_id: Option<SourceId>,
-    pub local_folders: Arc<[LocalFolder]>,
-    pub local_excluded_folders: Arc<[PathBuf]>,
-    pub local_access: Arc<[SourceLocalAccessSummary]>,
+    pub local_folders: Vec<LocalFolder>,
+    pub local_excluded_folders: Vec<PathBuf>,
+    pub local_access: Vec<SourceLocalAccessSummary>,
+    pub document_roots: Vec<sources::DocumentRoot>,
 }
 
 impl ConfiguredSources {
@@ -71,74 +84,10 @@ impl ConfiguredSources {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OpenSubsonicKind {
-    Navidrome,
-    OpenSubsonic,
-}
-
-pub use sources::SubsonicAuthentication as OpenSubsonicAuthentication;
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
-pub struct CredentialInput {
-    pub source_name: Option<String>,
-    pub server_url: String,
-    pub username: String,
-    pub secret: String,
-    pub trust_invalid_cert: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub enum SourceSetup {
-    EmbyConnect {
-        server: sources::EmbyConnectServer,
-        source_name: Option<String>,
-        use_instant_mix: bool,
-    },
-    JellyfinQuickConnect {
-        login: sources::JellyfinQuickConnectLogin,
-        source_name: Option<String>,
-        use_instant_mix: bool,
-    },
-    Plex(sources::PlexSetupInput),
-    WebDav {
-        name: String,
-        settings: sources::FileSourceSettings,
-        credentials: sources::FileCredentials,
-    },
-    Smb {
-        name: String,
-        settings: sources::FileSourceSettings,
-        credentials: sources::FileCredentials,
-    },
-    JellyfinEmby {
-        kind: sources::ServerKind,
-        credentials: CredentialInput,
-        use_instant_mix: bool,
-    },
-    OpenSubsonic {
-        kind: OpenSubsonicKind,
-        authentication: OpenSubsonicAuthentication,
-        credentials: CredentialInput,
-    },
-    Local {
-        roots: Vec<PathBuf>,
-    },
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
-pub struct CredentialPreset {
-    pub source_name: String,
-    pub server_url: String,
-    pub username: String,
-    pub trust_invalid_cert: bool,
-    pub open_subsonic_authentication: Option<OpenSubsonicAuthentication>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct EditableSource {
+    pub integration: bool,
     pub plex_settings: Option<sources::PlexSettingsInput>,
     pub file_settings: Option<sources::FileSourceSettings>,
     pub source: SourceSummary,
@@ -147,53 +96,9 @@ pub struct EditableSource {
     pub emby_connect: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub enum SourceSettingsChange {
-    Local {
-        source_id: SourceId,
-        roots: Vec<PathBuf>,
-        #[serde(default)]
-        excluded_folders: Option<Vec<PathBuf>>,
-    },
-    EmbyConnect {
-        source_id: SourceId,
-        server: sources::EmbyConnectServer,
-        source_name: Option<String>,
-        use_instant_mix: bool,
-    },
-    JellyfinQuickConnect {
-        source_id: SourceId,
-        login: sources::JellyfinQuickConnectLogin,
-        source_name: Option<String>,
-        use_instant_mix: bool,
-    },
-    Plex {
-        source_id: SourceId,
-        settings: sources::PlexSettingsInput,
-    },
-    Files {
-        source_id: SourceId,
-        name: String,
-        settings: sources::FileSourceSettings,
-        credentials: sources::FileCredentialsEdit,
-    },
-    JellyfinEmby {
-        connect_manually: bool,
-        source_id: SourceId,
-        credentials: CredentialInput,
-        use_instant_mix: bool,
-    },
-    OpenSubsonic {
-        source_id: SourceId,
-        kind: OpenSubsonicKind,
-        authentication: OpenSubsonicAuthentication,
-        credentials: CredentialInput,
-    },
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum SourceProgressStage {
     Connecting,
     Albums,
@@ -203,11 +108,13 @@ pub enum SourceProgressStage {
     Playlists,
     Home,
     Artwork,
+    Lyrics,
     Files,
     Finalizing,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct SourceProgress {
     pub stage: SourceProgressStage,
     pub completed: usize,
@@ -216,6 +123,7 @@ pub struct SourceProgress {
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum SourceOperation {
     Idle,
     Adding {
@@ -229,17 +137,15 @@ pub enum SourceOperation {
         source_id: SourceId,
         progress: SourceProgress,
     },
+    Downloading {
+        source_id: SourceId,
+        progress: SourceProgress,
+    },
     Failed {
         source_id: Option<SourceId>,
         message: String,
         add_form: bool,
     },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LibraryRefreshTrigger {
-    GlobalAction,
-    NewlyAdded,
 }
 
 impl SourceOperation {
@@ -260,6 +166,7 @@ pub fn source_progress_text(progress: &SourceProgress) -> String {
         SourceProgressStage::Playlists => "playlists",
         SourceProgressStage::Home => "Home",
         SourceProgressStage::Artwork => "artwork",
+        SourceProgressStage::Lyrics => "lyrics",
         SourceProgressStage::Files => "files",
         SourceProgressStage::Finalizing => return localization::tr("Preparing library..."),
     };
@@ -275,9 +182,22 @@ pub fn source_progress_text(progress: &SourceProgress) -> String {
     }
 }
 
+pub fn source_download_text(progress: &SourceProgress) -> String {
+    let message = match progress.stage {
+        SourceProgressStage::Artwork => {
+            localization::msgid("Downloading artwork... {count} checked")
+        }
+        SourceProgressStage::Lyrics => localization::msgid("Downloading lyrics... {count} checked"),
+        _ => return source_progress_text(progress),
+    };
+    localization::tr_with(message, &[("count", &progress.completed.to_string())])
+}
+
+#[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn source_operation_text(operation: &SourceOperation) -> Option<String> {
     match operation {
         SourceOperation::Idle => None,
+        SourceOperation::Downloading { progress, .. } => Some(source_download_text(progress)),
         SourceOperation::Adding { progress } | SourceOperation::Refreshing { progress, .. } => {
             Some(source_progress_text(progress))
         }
@@ -289,6 +209,7 @@ pub fn source_operation_text(operation: &SourceOperation) -> Option<String> {
 pub use sources::{DiscoveredServer, DiscoveryProvider};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum DiscoveryStatus {
     Idle,
     Searching,
@@ -298,17 +219,28 @@ pub enum DiscoveryStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct DiscoveryUpdate {
     pub provider: DiscoveryProvider,
-    pub servers: Arc<[DiscoveredServer]>,
+    pub servers: Vec<DiscoveredServer>,
     pub status: DiscoveryStatus,
 }
 
 #[derive(serde::Serialize)]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
-pub enum NextcloudLoginEvent {
+pub enum SourceLoginEvent {
+    Code {
+        code: String,
+        url: String,
+    },
     OpenBrowser(String),
-    Authorized {
+    Servers(Vec<sources::EmbyConnectServer>),
+    #[serde(rename = "authorized")]
+    Jellyfin(sources::JellyfinQuickConnectLogin),
+    #[serde(rename = "authorized")]
+    Plex(Box<sources::PlexLogin>),
+    #[serde(rename = "authorized")]
+    Files {
         settings: sources::FileSourceSettings,
         credentials: sources::FileCredentials,
     },
@@ -316,27 +248,15 @@ pub enum NextcloudLoginEvent {
 
 #[derive(serde::Deserialize)]
 #[serde(tag = "method", content = "data", rename_all = "snake_case")]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum EmbyConnectLoginMethod {
     Password { username: String, password: String },
     Pin,
 }
 
-#[derive(serde::Serialize)]
-#[serde(tag = "event", content = "data", rename_all = "snake_case")]
-pub enum EmbyConnectLoginEvent {
-    Code { code: String, url: String },
-    Servers(Vec<sources::EmbyConnectServer>),
-}
-
-#[derive(serde::Serialize)]
-#[serde(tag = "event", content = "data", rename_all = "snake_case")]
-pub enum JellyfinQuickConnectEvent {
-    Code { code: String, url: String },
-    Authorized(sources::JellyfinQuickConnectLogin),
-}
-
 #[derive(serde::Deserialize)]
 #[serde(tag = "method", content = "data", rename_all = "snake_case")]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum PlexLoginMethod {
     Browser,
     Password {
@@ -346,25 +266,12 @@ pub enum PlexLoginMethod {
     },
 }
 
-#[derive(serde::Serialize)]
-#[serde(tag = "event", content = "data", rename_all = "snake_case")]
-pub enum PlexLoginEvent {
-    OpenBrowser(String),
-    Authorized(Box<sources::PlexLogin>),
-}
-
 pub enum PlaylistExport {
     Playlist(library::PlaylistKey),
     Smart(library::SmartPlaylistKey),
 }
 
 pub type SourceHandle = Arc<crate::source::SourceOwner>;
-
-/// Commands whose validity is owned by one selected source session.
-///
-/// Rufin embeds this handle in the corresponding [`SelectedLibrary`](super::SelectedLibrary), so
-/// callers cannot pair an operation with a different source or session.
-pub type SelectedSourceHandle = Arc<crate::source::ActiveSource>;
 
 #[cfg(test)]
 mod tests {

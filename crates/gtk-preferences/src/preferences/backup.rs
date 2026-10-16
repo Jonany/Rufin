@@ -58,7 +58,7 @@ pub(super) fn groups(
         listenbrainz: gtk::ToggleButton, jsonl: gtk::ToggleButton, current_source: gtk::ToggleButton, current_source_label: gtk::Label,
         activity_export: gtk::Button,
     });
-    let settings = shell.settings.current.borrow().backup.clone();
+    let settings = shell.settings.current.borrow().application.backup.clone();
     enabled.set_active(settings.enabled);
     retention_count.set_value(f64::from(settings.retention_count));
     encrypt.set_active(settings.encrypt);
@@ -91,13 +91,15 @@ pub(super) fn groups(
     let encryption = encrypt.downgrade();
     enabled.connect_active_notify(move |row| {
         let Some(shell) = weak.upgrade() else { return };
-        if row.is_active() == shell.settings.current.borrow().backup.enabled {
+        if row.is_active() == shell.settings.current.borrow().application.backup.enabled {
             return;
         }
         if !row.is_active() {
             shell
                 .settings
-                .set_app_setting("automatic backups", false, |s| &mut s.backup.enabled);
+                .set_app_setting("automatic backups", false, |s| {
+                    &mut s.application.backup.enabled
+                });
             return;
         }
         row.set_sensitive(false);
@@ -111,10 +113,8 @@ pub(super) fn groups(
                         .products
                         .backup
                         .save_schedule_password(password)
-                        .recv()
                         .await
-                        .map_err(|error| error.to_string())
-                        .and_then(|result| result),
+                        .map_err(|error| error.to_string()),
                     None => Ok(()),
                 };
                 match saved {
@@ -122,15 +122,15 @@ pub(super) fn groups(
                         shell
                             .settings
                             .update_app_settings("automatic backups", |settings| {
-                                settings.backup.encrypt = encrypted;
-                                settings.backup.enabled = true;
+                                settings.application.backup.encrypt = encrypted;
+                                settings.application.backup.enabled = true;
                                 true
                             });
                     }
                     Err(error) => feedback(&shell, Err(error), ""),
                 }
             }
-            let settings = shell.settings.current.borrow().backup.clone();
+            let settings = shell.settings.current.borrow().application.backup.clone();
             if let Some(encryption) = encryption.upgrade() {
                 encryption.set_active(settings.encrypt);
             }
@@ -150,7 +150,7 @@ pub(super) fn groups(
             shell
                 .settings
                 .set_app_setting("backup encryption", row.is_active(), |s| {
-                    &mut s.backup.encrypt
+                    &mut s.application.backup.encrypt
                 });
         }
     });
@@ -164,10 +164,8 @@ pub(super) fn groups(
                 .products
                 .backup
                 .save_schedule_password(password)
-                .recv()
                 .await
-                .map_err(|e| e.to_string())
-                .and_then(|result| result);
+                .map_err(|error| error.to_string());
             if result.is_ok() {
                 if let Some(row) = row.upgrade() {
                     row.set_text("");
@@ -191,7 +189,7 @@ pub(super) fn groups(
                 } else {
                     BackupFrequency::Daily
                 },
-                |s| &mut s.backup.schedule.frequency,
+                |s| &mut s.application.backup.schedule.frequency,
             );
         }
     });
@@ -201,7 +199,7 @@ pub(super) fn groups(
             shell
                 .settings
                 .set_app_setting("backup weekday", row.selected() as u8, |s| {
-                    &mut s.backup.schedule.weekday
+                    &mut s.application.backup.schedule.weekday
                 });
         }
     });
@@ -211,7 +209,7 @@ pub(super) fn groups(
             shell
                 .settings
                 .set_app_setting("backup hour", row.selected() as u8, |s| {
-                    &mut s.backup.schedule.hour
+                    &mut s.application.backup.schedule.hour
                 });
         }
     });
@@ -222,6 +220,7 @@ pub(super) fn groups(
             .settings
             .current
             .borrow()
+            .application
             .backup
             .destination_uri
             .as_deref()
@@ -246,7 +245,7 @@ pub(super) fn groups(
                     .set_app_setting(
                         "backup destination",
                         Some(selected.uri().to_string()),
-                        |s| &mut s.backup.destination_uri,
+                        |s| &mut s.application.backup.destination_uri,
                     )
                     .is_some()
                 {
@@ -271,7 +270,7 @@ pub(super) fn groups(
         if shell
             .settings
             .set_app_setting("backup destination", None, |s| {
-                &mut s.backup.destination_uri
+                &mut s.application.backup.destination_uri
             })
             .is_some()
         {
@@ -356,7 +355,7 @@ pub(super) fn groups(
                 shell
                     .settings
                     .set_app_setting("backup contents", row.is_active(), |s| {
-                        CONTENT_FIELDS[index](&mut s.backup.contents)
+                        CONTENT_FIELDS[index](&mut s.application.backup.contents)
                     });
             }
         });
@@ -367,7 +366,7 @@ pub(super) fn groups(
             shell
                 .settings
                 .set_app_setting("backup retention", row.value() as u32, |s| {
-                    &mut s.backup.retention_count
+                    &mut s.application.backup.retention_count
                 });
         }
     });
@@ -477,11 +476,9 @@ pub fn import_dialog(shell: &Rc<Preferences>) {
         match shell
             .products
             .backup
-            .restore(preview)
-            .recv()
+            .restore(std::sync::Arc::new(preview))
             .await
-            .map_err(|e| e.to_string())
-            .and_then(|r| r)
+            .map_err(|error| error.to_string())
         {
             Ok(report) => {
                 shell.complete_add_server_dialog();

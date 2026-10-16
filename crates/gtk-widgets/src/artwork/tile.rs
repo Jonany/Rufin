@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
 use gtk::glib;
@@ -10,15 +10,30 @@ struct CoverReveal {
 }
 
 #[derive(Clone)]
+struct BoundRequest {
+    owner: Weak<super::ArtworkState>,
+    request: artwork::ArtworkRequest,
+    key: artwork::ArtworkKey,
+    playback: bool,
+    display_size: i32,
+}
+
+impl BoundRequest {
+    fn immediate(&self) -> bool {
+        self.playback || self.request.cache_only
+    }
+}
+
+#[derive(Clone)]
 pub struct ArtworkTile {
     pub area: gtk::Overlay,
     image: gtk::Picture,
     size: Rc<Cell<i32>>,
     request_complete: Rc<Cell<bool>>,
-    request_key: Rc<RefCell<Option<artwork::ArtworkKey>>>,
+    image_is_preview: Rc<Cell<bool>>,
     artwork_request: Rc<RefCell<Option<glib::JoinHandle<()>>>>,
     generation: Rc<Cell<u64>>,
-    request_cleanup_installed: Rc<Cell<bool>>,
+    bound_request: Rc<RefCell<Option<BoundRequest>>>,
     animation: Rc<RefCell<Option<super::animation::Lease>>>,
     transition_pending: Rc<Cell<bool>>,
     transition: Rc<RefCell<Option<CoverReveal>>>,
@@ -30,20 +45,13 @@ pub struct ArtworkTileWeak {
     image: glib::WeakRef<gtk::Picture>,
     size: Rc<Cell<i32>>,
     request_complete: Rc<Cell<bool>>,
-    request_key: Rc<RefCell<Option<artwork::ArtworkKey>>>,
+    image_is_preview: Rc<Cell<bool>>,
     artwork_request: Rc<RefCell<Option<glib::JoinHandle<()>>>>,
     generation: Rc<Cell<u64>>,
-    request_cleanup_installed: Rc<Cell<bool>>,
+    bound_request: Rc<RefCell<Option<BoundRequest>>>,
     animation: Rc<RefCell<Option<super::animation::Lease>>>,
     transition_pending: Rc<Cell<bool>>,
     transition: Rc<RefCell<Option<CoverReveal>>>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ArtworkBindOutcome {
-    pub generation: u64,
-    pub request_needed: bool,
-    pub request_changed: bool,
 }
 
 impl ArtworkTile {
@@ -94,24 +102,24 @@ impl ArtworkTile {
 
         let size = Rc::new(Cell::new(size));
         let request_complete = Rc::new(Cell::new(false));
-        let request_key = Rc::new(RefCell::new(None::<artwork::ArtworkKey>));
         let artwork_request = Rc::new(RefCell::new(None));
         let generation = Rc::new(Cell::new(0));
-        let request_cleanup_installed = Rc::new(Cell::new(false));
 
-        Self {
+        let tile = Self {
             area,
             image,
             size,
             request_complete,
-            request_key,
+            image_is_preview: Rc::new(Cell::new(false)),
             artwork_request,
             generation,
-            request_cleanup_installed,
+            bound_request: Rc::new(RefCell::new(None)),
             animation: Rc::new(RefCell::new(None)),
             transition_pending: Rc::new(Cell::new(false)),
             transition: Rc::new(RefCell::new(None)),
-        }
+        };
+        tile.install_lifecycle();
+        tile
     }
 
     pub fn widget(&self) -> gtk::Widget {
@@ -128,44 +136,62 @@ impl ArtworkTile {
             image: self.image.downgrade(),
             size: Rc::clone(&self.size),
             request_complete: Rc::clone(&self.request_complete),
-            request_key: Rc::clone(&self.request_key),
+            image_is_preview: Rc::clone(&self.image_is_preview),
             artwork_request: Rc::clone(&self.artwork_request),
             generation: Rc::clone(&self.generation),
-            request_cleanup_installed: Rc::clone(&self.request_cleanup_installed),
+            bound_request: Rc::clone(&self.bound_request),
             animation: Rc::clone(&self.animation),
             transition_pending: Rc::clone(&self.transition_pending),
             transition: Rc::clone(&self.transition),
         }
     }
 
-    pub fn install_request_cleanup_once(&self) {
-        if self.request_cleanup_installed.replace(true) {
-            return;
-        }
-
-        for mapped in [true, false] {
-            let animation = Rc::clone(&self.animation);
-            let refresh = move |_: &gtk::Overlay| {
-                let session = animation
-                    .borrow()
-                    .as_ref()
-                    .map(|lease| Rc::clone(&lease.session));
-                if let Some(session) = session {
-                    session.refresh();
-                }
-            };
-            if mapped {
-                // Mapping resumes an existing animation; artwork requests belong to bind.
-                // ast-grep-ignore: artwork-tile-must-not-admit-on-map
-                self.area.connect_map(refresh);
-            } else {
-                self.area.connect_unmap(refresh);
+    fn install_lifecycle(&self) {
+        let scale_watch = Rc::new(RefCell::new(
+            None::<(glib::WeakRef<gtk::gdk::Surface>, glib::SignalHandlerId)>,
+        ));
+        let mapped_scale_watch = Rc::clone(&scale_watch);
+        let tile = self.downgrade();
+        self.area.connect_map(move |area| {
+            if let Some(surface) = area.native().and_then(|native| native.surface()) {
+                let tile = tile.clone();
+                let handler = surface.connect_scale_notify(move |_| {
+                    if let Some(tile) = tile.upgrade() {
+                        tile.refresh_bound_artwork_size();
+                    }
+                });
+                mapped_scale_watch.replace(Some((surface.downgrade(), handler)));
             }
-        }
+            if let Some(tile) = tile.upgrade() {
+                tile.refresh_bound_artwork_size();
+                tile.start_artwork_request();
+                tile.refresh_animation();
+            }
+        });
+        let unmapped_scale_watch = Rc::clone(&scale_watch);
+        let tile = self.downgrade();
+        self.area.connect_unmap(move |_| {
+            if let Some((surface, handler)) = unmapped_scale_watch.borrow_mut().take()
+                && let Some(surface) = surface.upgrade()
+            {
+                surface.disconnect(handler);
+            }
+            if let Some(tile) = tile.upgrade() {
+                tile.release_unmapped_artwork();
+                tile.refresh_animation();
+            }
+        });
         let animation = Rc::clone(&self.animation);
         let artwork_request = Rc::clone(&self.artwork_request);
         let transition = Rc::clone(&self.transition);
+        let bound_request = Rc::clone(&self.bound_request);
         self.area.connect_destroy(move |area| {
+            if let Some((surface, handler)) = scale_watch.borrow_mut().take()
+                && let Some(surface) = surface.upgrade()
+            {
+                surface.disconnect(handler);
+            }
+            bound_request.borrow_mut().take();
             let transition = transition.borrow_mut().take();
             if let Some(transition) = transition {
                 transition.animation.pause();
@@ -181,39 +207,107 @@ impl ArtworkTile {
         });
     }
 
+    fn refresh_animation(&self) {
+        let session = self
+            .animation
+            .borrow()
+            .as_ref()
+            .map(|lease| Rc::clone(&lease.session));
+        if let Some(session) = session {
+            session.refresh();
+        }
+    }
+
+    fn start_artwork_request(&self) {
+        if self.request_complete.get() || self.has_artwork_request() {
+            return;
+        }
+        let request = self.bound_request.borrow().clone();
+        let Some(request) = request else { return };
+        if !self.area.is_mapped() && !request.immediate() {
+            return;
+        }
+        if let Some(owner) = request.owner.upgrade() {
+            owner.load_artwork_tile(
+                self,
+                self.generation.get(),
+                request.playback,
+                request.request,
+            );
+        }
+    }
+
+    fn release_unmapped_artwork(&self) {
+        if !self
+            .bound_request
+            .borrow()
+            .as_ref()
+            .is_some_and(|request| !request.immediate())
+        {
+            return;
+        }
+        self.stop_artwork_request();
+        self.finish_transition();
+        self.transition_pending.set(false);
+        if self.image.paintable().is_some() {
+            self.image.set_paintable(None::<&gtk::gdk::Paintable>);
+            self.request_complete.set(false);
+        }
+        if !self.request_complete.get() {
+            self.advance_generation();
+            self.image.set_visible(false);
+            self.area.remove_css_class("cover-fallback");
+            self.area.add_css_class("cover-pending");
+        }
+    }
+
     fn advance_generation(&self) {
         self.generation.set(self.generation.get().saturating_add(1));
     }
 
-    pub fn bind_selected_cover(
+    pub(super) fn bind_artwork_request(
         &self,
-        request_key: artwork::ArtworkKey,
-        keep_previous: bool,
-    ) -> ArtworkBindOutcome {
+        owner: Weak<super::ArtworkState>,
+        key: artwork::ArtworkKey,
+        request: artwork::ArtworkRequest,
+        playback: bool,
+        display_size: i32,
+    ) {
         let same_artwork = self
-            .request_key
+            .bound_request
             .borrow()
             .as_ref()
-            .is_some_and(|previous| previous.same_asset(&request_key));
-        let same_request = self.request_key.borrow().as_ref() == Some(&request_key);
+            .is_some_and(|previous| previous.key.same_asset(&key));
+        let same_request = self
+            .bound_request
+            .borrow()
+            .as_ref()
+            .is_some_and(|previous| {
+                previous.key == key && previous.request.binding == request.binding
+            });
         if same_request && self.request_complete.get() {
-            return ArtworkBindOutcome {
-                generation: self.generation.get(),
-                request_needed: false,
-                request_changed: false,
-            };
+            return;
         }
-
-        let request_changed = !same_artwork || !same_request;
-        if request_changed {
+        if !same_artwork {
+            self.image_is_preview.set(false);
+        }
+        if !same_request {
             self.finish_transition();
-            self.transition_pending.set(!same_artwork && keep_previous);
+            self.transition_pending.set(!same_artwork && playback);
             self.advance_generation();
-            *self.request_key.borrow_mut() = Some(request_key);
             self.request_complete.set(false);
         }
-
-        if !same_artwork && !keep_previous {
+        if !same_request || !self.has_artwork_request() {
+            self.cancel_artwork_request();
+            self.bound_request.replace(Some(BoundRequest {
+                owner,
+                key,
+                request,
+                playback,
+                display_size,
+            }));
+        }
+        if !same_artwork && !playback {
             self.image.set_paintable(Option::<&gtk::gdk::Texture>::None);
         }
         let has_texture = self.image.paintable().is_some();
@@ -226,12 +320,7 @@ impl ArtworkTile {
             self.area.set_opacity(1.0);
         }
         self.area.queue_draw();
-
-        ArtworkBindOutcome {
-            generation: self.generation.get(),
-            request_needed: !self.request_complete.get(),
-            request_changed,
-        }
+        self.start_artwork_request();
     }
 
     pub fn has_artwork_request(&self) -> bool {
@@ -243,7 +332,7 @@ impl ArtworkTile {
     }
 
     pub fn replace_artwork_request(&self, request: glib::JoinHandle<()>) {
-        self.cancel_artwork_request();
+        self.stop_artwork_request();
         self.artwork_request.replace(Some(request));
     }
 
@@ -277,8 +366,13 @@ impl ArtworkTile {
     }
 
     pub fn cancel_artwork_request(&self) {
+        self.bound_request.borrow_mut().take();
         let lease = self.animation.borrow_mut().take();
         drop(lease);
+        self.stop_artwork_request();
+    }
+
+    fn stop_artwork_request(&self) {
         if let Some(request) = self.artwork_request.borrow_mut().take() {
             request.abort();
         }
@@ -293,6 +387,7 @@ impl ArtworkTile {
         self.area.set_height_request(size);
         self.area.set_size_request(size, size);
         self.area.queue_resize();
+        self.refresh_artwork_size(size);
         let session = self
             .animation
             .borrow()
@@ -300,6 +395,32 @@ impl ArtworkTile {
             .map(|lease| Rc::clone(&lease.session));
         if let Some(session) = session {
             session.refresh();
+        }
+    }
+
+    fn refresh_artwork_size(&self, size: i32) {
+        let bound = self.bound_request.borrow().clone();
+        if let Some(bound) = bound
+            && let Some(owner) = bound.owner.upgrade()
+        {
+            owner.bind_artwork_tile_request(
+                self,
+                bound.request.binding,
+                size,
+                bound.playback,
+                bound.request.cache_only,
+            );
+        }
+    }
+
+    fn refresh_bound_artwork_size(&self) {
+        let size = self
+            .bound_request
+            .borrow()
+            .as_ref()
+            .map(|bound| bound.display_size);
+        if let Some(size) = size {
+            self.refresh_artwork_size(size);
         }
     }
 
@@ -315,7 +436,7 @@ impl ArtworkTile {
         let has_texture = texture.is_some();
         self.image.set_paintable(texture.as_ref());
         self.request_complete.set(request_complete);
-        *self.request_key.borrow_mut() = None;
+        self.bound_request.borrow_mut().take();
         self.sync_presentation(has_texture, true);
         generation
     }
@@ -335,10 +456,11 @@ impl ArtworkTile {
         }
         let reveal = self.transition_pending.replace(false);
         self.image.set_paintable(Some(&texture));
+        self.image_is_preview.set(!complete);
         self.request_complete.set(complete);
         self.sync_presentation(true, true);
         if complete {
-            self.complete_preview_if_current(generation);
+            self.complete_reveal();
         }
         if reveal {
             self.reveal(&texture);
@@ -351,14 +473,22 @@ impl ArtworkTile {
         generation: u64,
         texture: gtk::gdk::Texture,
     ) -> bool {
+        if self.image.paintable().is_some()
+            && !self.image_is_preview.get()
+            && !self.transition_pending.get()
+        {
+            return false;
+        }
         self.set_cover_texture(generation, texture, false)
     }
 
-    pub(super) fn complete_preview_if_current(&self, generation: u64) {
-        if !self.generation_is_current(generation) {
-            return;
-        }
-        self.request_complete.set(true);
+    pub(super) fn has_preview(&self, generation: u64) -> bool {
+        self.generation_is_current(generation)
+            && self.image_is_preview.get()
+            && self.image.paintable().is_some()
+    }
+
+    fn complete_reveal(&self) {
         let animation = self.transition.borrow().as_ref().and_then(|reveal| {
             (reveal.softened.is_visible()
                 && reveal.animation.state() == adw::AnimationState::Finished)
@@ -439,7 +569,7 @@ impl ArtworkTile {
         self.advance_generation();
         self.image.set_paintable(Option::<&gtk::gdk::Texture>::None);
         self.request_complete.set(false);
-        *self.request_key.borrow_mut() = None;
+        self.bound_request.borrow_mut().take();
         self.sync_presentation(false, false);
     }
 
@@ -452,7 +582,7 @@ impl ArtworkTile {
         self.generation.set(self.generation.get().saturating_add(1));
         self.image.set_paintable(Option::<&gtk::gdk::Texture>::None);
         self.request_complete.set(false);
-        *self.request_key.borrow_mut() = None;
+        self.bound_request.borrow_mut().take();
         self.sync_presentation(false, true);
         true
     }
@@ -489,10 +619,10 @@ impl ArtworkTileWeak {
             image: self.image.upgrade()?,
             size: Rc::clone(&self.size),
             request_complete: Rc::clone(&self.request_complete),
-            request_key: Rc::clone(&self.request_key),
+            image_is_preview: Rc::clone(&self.image_is_preview),
             artwork_request: Rc::clone(&self.artwork_request),
             generation: Rc::clone(&self.generation),
-            request_cleanup_installed: Rc::clone(&self.request_cleanup_installed),
+            bound_request: Rc::clone(&self.bound_request),
             animation: Rc::clone(&self.animation),
             transition_pending: Rc::clone(&self.transition_pending),
             transition: Rc::clone(&self.transition),

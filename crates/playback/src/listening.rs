@@ -1,4 +1,32 @@
-use crate::{QueueItem, RunId};
+use crate::{RepeatMode, RunId, TrackReference};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceReportPhase {
+    Started,
+    Progress,
+    QualifiedPlay,
+    Ended,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SourceReportFact {
+    pub transcoded: bool,
+    pub run: RunId,
+    pub session_identifier: String,
+    pub queue_id: Option<u64>,
+    pub queue_item_id: Option<u64>,
+    pub media_uri: String,
+    pub phase: SourceReportPhase,
+    pub started_at_unix_seconds: i64,
+    pub position_millis: u64,
+    pub duration_millis: Option<u64>,
+    pub paused: bool,
+    pub muted: bool,
+    pub volume: f64,
+    pub shuffle: bool,
+    pub repeat_mode: RepeatMode,
+    pub failed: bool,
+}
 
 /// The existing listen moves with playback; delivery jobs do not.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -13,7 +41,7 @@ pub struct ContinuedListen {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ContinuationHeader {
     pub total: usize,
-    pub current: crate::OccurrenceId,
+    pub current: usize,
     pub position_millis: u64,
     pub repeat: crate::RepeatMode,
     pub shuffled: bool,
@@ -40,7 +68,7 @@ pub struct Continuation {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActivityListen {
     pub play_id: String,
-    pub item: QueueItem,
+    pub item: TrackReference,
     pub started_at_unix_seconds: i64,
     pub local_period: String,
     pub listened_millis: u64,
@@ -54,27 +82,6 @@ pub enum RunEndReason {
     Stopped,
     Replaced,
     Failed,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum ListeningFact {
-    Started {
-        run: RunId,
-        started_at_unix_seconds: i64,
-        local_period: String,
-        item: Box<QueueItem>,
-    },
-    Progress {
-        run: RunId,
-        audible_millis: u64,
-        playhead_millis: u64,
-    },
-    Ended {
-        run: RunId,
-        reason: RunEndReason,
-        audible_millis: u64,
-        playhead_millis: u64,
-    },
 }
 
 pub fn qualified_play_threshold_millis(duration_millis: u64) -> u64 {

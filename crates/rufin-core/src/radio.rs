@@ -1,23 +1,20 @@
 //! Provider-first Radio/AutoDJ with bounded Database fallback; Random is Database-owned.
 
-use std::sync::{Arc, Weak};
+use std::sync::Weak;
 
+use crate::playback::RandomPlayRequest;
 use library::{Database, RadioSeed, ReadCancellation, SourceKey};
-use playback::{
-    AutoDjRequest, Batch, Placement, Playback, Provenance, RadioPlayRequest, RandomPlayRequest,
-};
+use playback::Provenance;
 use sources::{Source, SourceRadioSeed};
-use tracing::warn;
 
 use crate::playback::random_u64;
-use crate::source::{SourceOwner, WeakActiveSource};
-
-const MANUAL_RADIO_COUNT: usize = 20;
+use crate::runtime::SelectedLibrary;
+use crate::source::SourceOwner;
 
 pub fn random_play_request(
     settings: &crate::settings::RandomPlaySettings,
     genre: Option<library::GenreKey>,
-    placement: playback::QueuePlacement,
+    placement: crate::playback::QueuePlacement,
 ) -> RandomPlayRequest {
     RandomPlayRequest {
         placement,
@@ -40,7 +37,7 @@ pub async fn queue_random(
     source: SourceKey,
     folder: Option<library::FolderKey>,
     request: RandomPlayRequest,
-    queue: &playback::QueueHandle,
+    queue: &crate::playback::PlaybackOwner,
 ) -> Result<bool, String> {
     let cancellation = ReadCancellation::new();
     let order = database
@@ -57,134 +54,23 @@ pub async fn queue_random(
     if order.is_empty() {
         return Ok(true);
     }
-    queue.play(playback::PlayRequest::ordered(
-        library::QueueInput::MediaUris {
-            order: order.into(),
-            provenance: Provenance::Random,
-        },
-        0,
+    queue.play_selection(crate::playback::PlayRequest::from_input(
+        library::QueueLoad::track_keys(order, Provenance::Random),
         request.placement,
-        false,
     ));
     Ok(false)
-}
-
-pub(crate) fn request_auto_dj(
-    runtime: tokio::runtime::Handle,
-    database: Arc<Database>,
-    source_owner: Weak<SourceOwner>,
-    playback: Playback,
-    request: AutoDjRequest,
-) {
-    runtime.spawn(async move {
-        let candidates = radio_candidates(
-            &database,
-            source_owner,
-            RadioSeed::Track(request.seed_media_uri),
-            request.requested_count,
-            &ReadCancellation::new(),
-        )
-        .await;
-        match candidates {
-            Ok(candidates) => {
-                let media = database
-                    .queue_items_for_uris(&candidates, &ReadCancellation::new())
-                    .await
-                    .unwrap_or_default();
-                let _ = playback.complete_auto_dj_candidates(
-                    request.seed_occurrence,
-                    media,
-                    request.requested_count,
-                    random_u64(),
-                );
-            }
-            Err(error) => {
-                let _ = playback.auto_dj_unavailable(request.seed_occurrence, Some(error));
-            }
-        }
-    });
-}
-
-pub(crate) fn play_radio(
-    runtime: tokio::runtime::Handle,
-    database: Arc<Database>,
-    source_owner: Weak<SourceOwner>,
-    playback: Playback,
-    request: RadioPlayRequest,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let placement = request.placement;
-    let reservation = playback.reserve_materialization(placement).ok()?;
-    Some(runtime.spawn(async move {
-        let candidates = radio_candidates(
-            &database,
-            source_owner,
-            request.seed,
-            MANUAL_RADIO_COUNT,
-            &ReadCancellation::new(),
-        )
-        .await;
-        complete_materialization(
-            playback,
-            reservation,
-            placement,
-            candidates,
-            Provenance::Radio,
-        )
-        .await;
-    }))
-}
-
-pub(crate) fn play_random(
-    runtime: tokio::runtime::Handle,
-    selected: WeakActiveSource,
-    playback: Playback,
-    request: RandomPlayRequest,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let placement = request.placement;
-    let current = selected.upgrade()?.resolve()?;
-    let reservation = playback.reserve_materialization(placement).ok()?;
-    Some(runtime.spawn(async move {
-        let excluded = reservation
-            .current_media_uri
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let candidates = current
-            .database
-            .random_candidates(
-                current.source_key,
-                current.music_folder_key,
-                &request.criteria,
-                &excluded,
-                request.requested,
-                &ReadCancellation::new(),
-            )
-            .await
-            .map_err(|error| error.to_string());
-        complete_materialization(
-            playback,
-            reservation,
-            placement,
-            candidates,
-            Provenance::Random,
-        )
-        .await;
-    }))
 }
 
 pub(crate) async fn radio_candidates(
     database: &Database,
     source_owner: Weak<SourceOwner>,
+    selected: Option<SelectedLibrary>,
     seed: RadioSeed,
     requested: usize,
     cancellation: &ReadCancellation,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<library::TrackKey>, String> {
     let requested = requested.min(library::QUEUE_CONTEXT_LIMIT);
     let owner = source_owner.upgrade();
-    let selected = owner
-        .as_ref()
-        .and_then(|owner| owner.current_session())
-        .and_then(|session| session.resolve());
     let seed_source = database
         .radio_source(&seed, cancellation)
         .await
@@ -193,7 +79,8 @@ pub(crate) async fn radio_candidates(
     let seed_source_key = seed_source.as_ref().map(|(key, _, _)| *key);
     let mut fallback_sources = Vec::new();
     if let Some((source_key, source_id, object_id)) = seed_source {
-        let source = tokio::task::spawn_blocking(move || owner?.client(&source_id).ok())
+        let seed_owner = owner.clone();
+        let source = tokio::task::spawn_blocking(move || seed_owner?.client(&source_id).ok())
             .await
             .map_err(|error| error.to_string())?;
         let native_seed = source_seed(source.as_deref(), &seed, object_id);
@@ -203,7 +90,7 @@ pub(crate) async fn radio_candidates(
                 .await
         {
             candidates = database
-                .admit_radio_candidates(source_key, &seed, &ids, cancellation)
+                .recommended_track_keys(source_key, &seed, &ids, cancellation)
                 .await
                 .map_err(|error| error.to_string())?;
         }
@@ -212,7 +99,11 @@ pub(crate) async fn radio_candidates(
     if let Some(selected) = selected
         && Some(selected.source_key) != seed_source_key
     {
-        fallback_sources.push((selected.source_key, selected.source.is_none()));
+        let source_key = selected.source_key;
+        let source = tokio::task::spawn_blocking(move || owner?.client(&selected.source_id).ok())
+            .await
+            .map_err(|error| error.to_string())?;
+        fallback_sources.push((source_key, source.is_none()));
     }
     candidates.truncate(requested);
     for (source_key, require_media) in fallback_sources {
@@ -252,32 +143,5 @@ fn source_seed(
         RadioSeed::Artist(_) | RadioSeed::AlbumArtist(_) => object_id.map(SourceRadioSeed::Artist),
         RadioSeed::Genre(_) => object_id.map(SourceRadioSeed::Genre),
         RadioSeed::Playlist(_) => object_id.map(SourceRadioSeed::Playlist),
-    }
-}
-
-async fn complete_materialization(
-    playback: Playback,
-    reservation: playback::MaterializationReservation,
-    placement: Placement,
-    candidates: Result<Vec<String>, String>,
-    provenance: Provenance,
-) {
-    match candidates {
-        Ok(candidates) if !candidates.is_empty() => {
-            let batch = Batch::from_input(library::QueueInput::MediaUris {
-                order: candidates.into(),
-                provenance,
-            });
-            if let Err(error) = playback.complete_materialization(reservation.id, batch, placement)
-            {
-                warn!(%error, "could not complete queue materialization");
-            }
-        }
-        Ok(_) => {
-            let _ = playback.cancel_materialization(reservation.id, placement);
-        }
-        Err(error) => {
-            let _ = playback.fail_materialization(reservation.id, placement, error);
-        }
     }
 }

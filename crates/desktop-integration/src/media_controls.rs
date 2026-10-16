@@ -1,7 +1,6 @@
 #[cfg(all(unix, not(any(target_os = "android", target_vendor = "apple"))))]
 mod freedesktop {
     use std::cell::{Cell, RefCell};
-    use std::fmt::Write as _;
     use std::rc::Rc;
 
     use app_identity::{APP_ID, DISPLAY_NAME};
@@ -9,9 +8,7 @@ mod freedesktop {
     use mpris_server::{
         LoopStatus, Metadata, PlaybackStatus, Player as MprisPlayer, Time, TrackId as MprisTrackId,
     };
-    use playback::{
-        PlaybackView, PositionDiscontinuity, RepeatMode, RunId, TransportHandle, TransportStatus,
-    };
+    use playback::{PlaybackView, PositionDiscontinuity, RepeatMode, RunId, TransportStatus};
     use tracing::warn;
 
     #[derive(Clone, Debug, PartialEq)]
@@ -42,7 +39,7 @@ mod freedesktop {
     }
 
     pub struct MediaControls {
-        transport: TransportHandle,
+        transport: std::sync::Arc<rufin_core::playback::PlaybackOwner>,
         player: RefCell<Option<Rc<MprisPlayer>>>,
         desired: RefCell<Option<MprisDesiredState>>,
         applied: RefCell<Option<MprisDesiredState>>,
@@ -52,7 +49,7 @@ mod freedesktop {
     }
 
     impl MediaControls {
-        fn new(transport: TransportHandle) -> Self {
+        fn new(transport: std::sync::Arc<rufin_core::playback::PlaybackOwner>) -> Self {
             Self {
                 transport,
                 player: RefCell::new(None),
@@ -182,7 +179,10 @@ mod freedesktop {
     }
 
     impl MediaControls {
-        pub fn start(transport: TransportHandle, open_uri: impl Fn(&str) + 'static) -> Rc<Self> {
+        pub fn start(
+            transport: std::sync::Arc<rufin_core::playback::PlaybackOwner>,
+            open_uri: impl Fn(&str) + 'static,
+        ) -> Rc<Self> {
             let mpris = Rc::new(Self::new(transport));
             let setup = Rc::clone(&mpris);
             glib::spawn_future_local(async move {
@@ -361,9 +361,7 @@ mod freedesktop {
                 .and_then(|media| media.id.run),
             track_id: playback
                 .and_then(|playback| playback.transport.current.as_ref())
-                .map_or(MprisTrackId::NO_TRACK, |media| {
-                    mpris_track_id(media.id.occurrence.as_str())
-                }),
+                .map_or(MprisTrackId::NO_TRACK, |media| mpris_track_id(&media.id)),
             playback_status: playback.map_or(PlaybackStatus::Stopped, |playback| {
                 mpris_playback_status(playback.transport.effective_state())
             }),
@@ -389,12 +387,17 @@ mod freedesktop {
             return Metadata::builder().trackid(MprisTrackId::NO_TRACK).build();
         };
         let mut builder = Metadata::builder()
-            .trackid(mpris_track_id(entry.id.occurrence.as_str()))
-            .title(entry.title.clone())
-            .artist([entry.artist.clone()])
-            .album(entry.album.clone())
+            .trackid(mpris_track_id(&entry.id))
+            .title(entry.row.track.metadata.title.clone())
+            .artist([entry.row.track.metadata.artist.clone()])
+            .album(entry.row.track.metadata.album.clone())
             .length(Time::from_micros(
-                entry.duration_millis.saturating_mul(1_000),
+                entry
+                    .row
+                    .track
+                    .metadata
+                    .duration_millis
+                    .saturating_mul(1_000),
             ));
         if let Some(art_url) = art_url {
             builder = builder.art_url(art_url);
@@ -402,13 +405,13 @@ mod freedesktop {
         builder.build()
     }
 
-    fn mpris_track_id(occurrence: &str) -> MprisTrackId {
-        let mut encoded = String::with_capacity(occurrence.len() * 2);
-        for byte in occurrence.as_bytes() {
-            let _written = write!(&mut encoded, "{byte:02x}");
-        }
-        MprisTrackId::try_from(format!("/io/github/screwys/Rufin/track/{encoded}"))
-            .unwrap_or(MprisTrackId::NO_TRACK)
+    fn mpris_track_id(media: &playback::CurrentMediaId) -> MprisTrackId {
+        let encoded = blake3::hash(media.media_uri.as_bytes()).to_hex();
+        MprisTrackId::try_from(format!(
+            "/io/github/screwys/Rufin/track/{}/{encoded}",
+            media.run.map_or(0, playback::RunId::get)
+        ))
+        .unwrap_or(MprisTrackId::NO_TRACK)
     }
 
     #[cfg(test)]
@@ -418,7 +421,7 @@ mod freedesktop {
     ) -> bool {
         playback
             .and_then(|playback| playback.transport.current.as_ref())
-            .is_some_and(|entry| &mpris_track_id(entry.id.occurrence.as_str()) == track_id)
+            .is_some_and(|entry| &mpris_track_id(&entry.id) == track_id)
     }
 
     fn mpris_time(position_millis: u64) -> Time {
@@ -458,21 +461,37 @@ mod freedesktop {
             mpris_set_position_matches, mpris_time, mpris_track_id, repeat_mode_from_mpris,
         };
         use crate::discord::tests::test_view;
-        use playback::OccurrenceId;
-        use std::sync::Arc;
+        use playback::{CurrentMediaId, RunId};
 
         #[test]
-        fn mpris_occurrence_paths_distinguish_duplicate_tracks_and_guard_set_position() {
-            let first = OccurrenceId::new("occurrence:first");
-            let second = OccurrenceId::new("occurrence:second");
-            let first_id = mpris_track_id(first.as_str());
-            let second_id = mpris_track_id(second.as_str());
-            assert_ne!(first_id, second_id);
-
-            let mut playback = test_view(1, "Album", TransportStatus::Playing, 1_000);
-            Arc::make_mut(playback.transport.current.as_mut().expect("current media"))
+        fn mpris_run_paths_distinguish_duplicate_tracks_and_guard_set_position() {
+            let playback = test_view(1, "Album", TransportStatus::Playing, 1_000);
+            let first = playback
+                .transport
+                .current
+                .as_ref()
+                .expect("current media")
                 .id
-                .occurrence = first;
+                .clone();
+            let second = CurrentMediaId {
+                run: Some(RunId::new(2)),
+                media_uri: first.media_uri.clone(),
+            };
+            let first_id = mpris_track_id(&first);
+            let second_id = mpris_track_id(&second);
+            assert_ne!(first_id, second_id);
+            let private = CurrentMediaId {
+                run: first.run,
+                media_uri: "https://user:secret@example.test/track?token=secret".into(),
+            };
+            let encoded = private
+                .media_uri
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert!(!mpris_track_id(&private).to_string().contains(&encoded));
+
             assert!(mpris_set_position_matches(Some(&playback), &first_id));
             assert!(!mpris_set_position_matches(Some(&playback), &second_id));
         }
@@ -491,12 +510,12 @@ mod freedesktop {
             assert!(!exhausted.can_go_next);
             assert!(exhausted.can_go_previous);
 
-            playback.queue.next_occurrence = Some(OccurrenceId::new("occurrence:next"));
+            playback.queue.next_index = Some(1);
             playback.queue.can_next = true;
             let with_next = mpris_desired_state(Some(&playback), None);
             assert!(with_next.can_go_next);
 
-            playback.queue.next_occurrence = None;
+            playback.queue.next_index = None;
             assert!(mpris_desired_state(Some(&playback), None).can_go_next);
         }
 
@@ -533,9 +552,7 @@ mod windows {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use playback::{
-        PlaybackView, PositionDiscontinuity, RepeatMode, TransportHandle, TransportStatus,
-    };
+    use playback::{PlaybackView, PositionDiscontinuity, RepeatMode, TransportStatus};
     use tracing::warn;
     use windows::Foundation::{TimeSpan, TypedEventHandler, Uri};
     use windows::Media::Playback::MediaPlayer;
@@ -555,7 +572,10 @@ mod windows {
     }
 
     impl MediaControls {
-        pub fn start(transport: TransportHandle, _open_uri: impl Fn(&str) + 'static) -> Rc<Self> {
+        pub fn start(
+            transport: std::sync::Arc<rufin_core::playback::PlaybackOwner>,
+            _open_uri: impl Fn(&str) + 'static,
+        ) -> Rc<Self> {
             let manager = match WindowsMediaManager::new() {
                 Ok(manager) => Some(manager),
                 Err(error) => {
@@ -608,7 +628,10 @@ mod windows {
         }
     }
 
-    fn apply_media_event(transport: &TransportHandle, event: WindowsMediaEvent) {
+    fn apply_media_event(
+        transport: &rufin_core::playback::PlaybackOwner,
+        event: WindowsMediaEvent,
+    ) {
         match event {
             WindowsMediaEvent::Play => transport.play(),
             WindowsMediaEvent::Pause => transport.pause(),
@@ -653,7 +676,7 @@ mod windows {
         art_url: Option<String>,
     ) -> Option<WindowsMediaState> {
         let playback = playback?;
-        let media = playback.transport.current.as_deref()?;
+        let media = playback.transport.current.as_ref()?;
         let has_active_run = media.id.run.is_some()
             && !matches!(
                 playback.transport.state,
@@ -661,9 +684,9 @@ mod windows {
             );
         let can_next = playback.queue.can_next || playback.controls.auto_dj_enabled;
         Some(WindowsMediaState {
-            title: media.title.clone(),
-            artist: media.artist.clone(),
-            album: media.album.clone(),
+            title: media.row.track.metadata.title.clone(),
+            artist: media.row.track.metadata.artist.clone(),
+            album: media.row.track.metadata.album.clone(),
             duration_millis: playback.transport.duration_millis,
             position_millis: playback.transport.position_millis,
             art_url,
@@ -1033,7 +1056,7 @@ mod macos {
         Artwork, CommandToken, HandlerStatus, NowPlayingInfo, NowPlayingInfoCenter,
         NowPlayingMediaType, PlaybackState, RemoteCommandCenter, RepeatType, ShuffleType,
     };
-    use playback::{PlaybackView, PositionDiscontinuity, RepeatMode, TransportHandle};
+    use playback::{PlaybackView, PositionDiscontinuity, RepeatMode};
 
     pub struct MediaControls {
         center: NowPlayingInfoCenter,
@@ -1054,7 +1077,10 @@ mod macos {
     }
 
     impl MediaControls {
-        pub fn start(transport: TransportHandle, _open_uri: impl Fn(&str) + 'static) -> Rc<Self> {
+        pub fn start(
+            transport: std::sync::Arc<rufin_core::playback::PlaybackOwner>,
+            _open_uri: impl Fn(&str) + 'static,
+        ) -> Rc<Self> {
             Rc::new(Self {
                 center: NowPlayingInfoCenter::default_center(),
                 state: RefCell::new(MediaState::default()),
@@ -1072,7 +1098,7 @@ mod macos {
                 self.clear();
                 return;
             };
-            let Some(media) = playback.transport.current.as_deref() else {
+            let Some(media) = playback.transport.current.as_ref() else {
                 self.clear();
                 return;
             };
@@ -1080,9 +1106,9 @@ mod macos {
             let artwork = art_url.and_then(load_artwork);
             {
                 let mut state = self.state.borrow_mut();
-                state.title.clone_from(&media.title);
-                state.artist.clone_from(&media.artist);
-                state.album.clone_from(&media.album);
+                state.title.clone_from(&media.row.track.metadata.title);
+                state.artist.clone_from(&media.row.track.metadata.artist);
+                state.album.clone_from(&media.row.track.metadata.album);
                 state.duration_millis = playback.transport.duration_millis;
                 state.position_millis = playback.transport.position_millis;
                 state.playback = playback_state(playback);
@@ -1232,7 +1258,9 @@ mod macos {
         }
     }
 
-    fn install_commands(transport: TransportHandle) -> Vec<CommandToken> {
+    fn install_commands(
+        transport: std::sync::Arc<rufin_core::playback::PlaybackOwner>,
+    ) -> Vec<CommandToken> {
         let commands = RemoteCommandCenter::shared();
         vec![
             commands.on_play(command(&transport, TransportCommand::Play)),
@@ -1287,7 +1315,7 @@ mod macos {
     }
 
     fn command(
-        transport: &TransportHandle,
+        transport: &std::sync::Arc<rufin_core::playback::PlaybackOwner>,
         command: TransportCommand,
     ) -> impl FnMut(mediaplayer::CommandEvent) -> HandlerStatus + Send + 'static {
         let transport = transport.clone();
@@ -1325,12 +1353,15 @@ mod macos {
 mod unsupported {
     use std::rc::Rc;
 
-    use playback::{PlaybackView, PositionDiscontinuity, TransportHandle};
+    use playback::{PlaybackView, PositionDiscontinuity};
 
     pub struct MediaControls;
 
     impl MediaControls {
-        pub fn start(_transport: TransportHandle, _open_uri: impl Fn(&str) + 'static) -> Rc<Self> {
+        pub fn start(
+            _transport: std::sync::Arc<rufin_core::playback::PlaybackOwner>,
+            _open_uri: impl Fn(&str) + 'static,
+        ) -> Rc<Self> {
             Rc::new(Self)
         }
 

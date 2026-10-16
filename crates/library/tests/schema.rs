@@ -5,258 +5,131 @@ use sqlx::Connection;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
 
 #[tokio::test]
-async fn scan_publication_and_reopening_an_unanalyzed_catalog_populate_statistics() {
+async fn reopening_without_statistics_preserves_library_order() {
     let fixture = super::support::fixture().await;
-    let mut raw = super::support::connection(&fixture.path).await;
-    let stat: String =
-        sqlx::query_scalar("SELECT stat FROM catalog.sqlite_stat1 WHERE idx='tracks_key_idx'")
-            .fetch_one(&mut raw)
-            .await
-            .expect("publication analyzed tracks");
-    assert_eq!(stat.split_whitespace().next(), Some("4"));
-    sqlx::raw_sql("DROP TABLE catalog.sqlite_stat1")
-        .execute(&mut raw)
-        .await
-        .unwrap();
-    raw.close().await.unwrap();
-    fixture.database.close().await.unwrap();
-    let reopened = Database::open(&fixture.path).await.unwrap();
-    let mut raw = super::support::connection(&fixture.path).await;
-    let stat: String =
-        sqlx::query_scalar("SELECT stat FROM catalog.sqlite_stat1 WHERE idx='tracks_key_idx'")
-            .fetch_one(&mut raw)
-            .await
-            .expect("opening populated catalog analyzed tracks");
-    assert_eq!(stat.split_whitespace().next(), Some("4"));
-    raw.close().await.unwrap();
-    reopened.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn removing_obsolete_catalog_digest_preserves_tracks_and_reconciles_sources() {
-    let fixture = super::support::fixture().await;
-    fixture.database.close().await.unwrap();
-    let before = durable_rows(&fixture.path).await;
-    let mut raw = super::support::connection(&fixture.path).await;
-    sqlx::raw_sql("ALTER TABLE catalog.sources ADD COLUMN catalog_digest BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000'")
-        .execute(&mut raw)
-        .await
-        .unwrap();
-    raw.close().await.unwrap();
-
-    let reopened = Database::open(&fixture.path).await.unwrap();
-    assert_eq!(durable_rows(&fixture.path).await, before);
-    for source in ["source", "new-source"] {
-        reopened
-            .reconcile_source(&SourceId::new(source))
-            .await
-            .unwrap();
-    }
-    let mut raw = super::support::connection(&fixture.path).await;
-    let tracks: Vec<i64> =
-        sqlx::query_scalar("SELECT track_key FROM catalog.tracks ORDER BY track_key")
-            .fetch_all(&mut raw)
-            .await
-            .unwrap();
-    assert_eq!(tracks.len(), fixture.tracks.len());
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM pragma_table_info('sources','catalog') WHERE name='catalog_digest'"
+    let before = fixture
+        .database
+        .selected_track_uris(
+            &library::CatalogQuery {
+                subject: library::CatalogSubject::Tracks {
+                    scope: library::TrackScope::Tracks(fixture.source),
+                    sort: Some(library::CatalogSort::Title),
+                },
+                ..library::CatalogQuery::tracks(library::TrackScope::Tracks(fixture.source))
+            }
+            .selection(),
+            None,
+            &ReadCancellation::new(),
         )
-        .fetch_one(&mut raw)
         .await
-        .unwrap(),
-        0
-    );
-    raw.close().await.unwrap();
-    reopened.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn missing_columns_are_repaired_from_declarations_before_indexes() {
-    let fixture = super::support::fixture().await;
-    fixture.database.close().await.unwrap();
+        .unwrap();
     let mut raw = super::support::connection(&fixture.path).await;
-    sqlx::raw_sql("
-        DROP VIEW temp.playlist_entries;
-        DROP VIEW temp.playlists;
-        DROP VIEW temp.local_access_files;
-        DROP VIEW temp.activity_baseline;
-        DROP INDEX main.playlist_entries_media_idx;
-        ALTER TABLE main.playlist_entries DROP COLUMN title;
-        ALTER TABLE main.playlist_entries ADD COLUMN newer_field TEXT;
-        ALTER TABLE main.queue_occurrences DROP COLUMN origin_position;
-        INSERT INTO main.queue_state(singleton) VALUES(1);
-        ALTER TABLE main.queue_state DROP COLUMN repeat_mode;
-        ALTER TABLE catalog.albums DROP COLUMN source_rating;
-        DROP INDEX catalog.tracks_source_favorites_idx;
-        ALTER TABLE catalog.tracks DROP COLUMN source_favorite;
-        ALTER TABLE catalog.native_playlists DROP COLUMN writable;
-        ALTER TABLE catalog.home_entries DROP COLUMN section_title;
-        ALTER TABLE catalog.local_files DROP COLUMN revision;
-        ALTER TABLE catalog.activity_baseline DROP COLUMN last_played_at;
-        ALTER TABLE catalog.activity_baseline ADD COLUMN newer_field TEXT;
-        INSERT INTO main.playlists(playlist_key,object_id,name,position) VALUES(99,'saved','Saved',0);
-        INSERT INTO main.playlist_entries(playlist_key,object_id,media_uri,artist,position)
-            VALUES(99,'saved-song','https://example.test/saved','Saved artist',0);
-        INSERT INTO catalog.native_playlists(playlist_key,source_key,object_id,name,normalized_name,sort_text)
-            VALUES(91,1,'native','Native','native','native');
-        INSERT INTO catalog.native_playlist_entries(playlist_key,object_id,media_uri,title,artist,position)
-            VALUES(91,'native-song','https://example.test/native','Native title','Native artist',0);
-        INSERT INTO catalog.activity_baseline(source_key,period,item_kind,track_object_id,play_count,skip_count)
-            VALUES(1,'lifetime','track','track-a',7,2);
-        INSERT INTO main.legacy_activity VALUES('source','lifetime','track','legacy',4,1,90);
-    ").execute(&mut raw).await.unwrap();
+    sqlx::raw_sql("DROP TABLE IF EXISTS sqlite_stat1;
+        INSERT INTO listens(media_uri,track_title,artist_name,album_title,started_at,local_period,duration_millis,listened_millis,skipped)
+            SELECT media_uri,'Captured title','Captured artist','Captured album',100,'1970-01',180000,90000,1 FROM tracks LIMIT 1")
+        .execute(&mut raw)
+        .await
+        .unwrap();
     raw.close().await.unwrap();
-
+    fixture.database.close().await.unwrap();
+    let durable = durable_rows(&fixture.path).await;
     let database = Database::open(&fixture.path).await.unwrap();
-    assert!(!database.fresh_start());
+    assert_eq!(durable_rows(&fixture.path).await, durable);
+    let after = database
+        .selected_track_uris(
+            &library::CatalogQuery {
+                subject: library::CatalogSubject::Tracks {
+                    scope: library::TrackScope::Tracks(fixture.source),
+                    sort: Some(library::CatalogSort::Title),
+                },
+                ..library::CatalogQuery::tracks(library::TrackScope::Tracks(fixture.source))
+            }
+            .selection(),
+            None,
+            &ReadCancellation::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(before, after);
+    assert_eq!(after.len(), fixture.tracks.len());
+    database.close().await.unwrap();
+    let mut raw = super::support::connection(&fixture.path).await;
+    let schema_version: i64 = sqlx::query_scalar("PRAGMA schema_version")
+        .fetch_one(&mut raw)
+        .await
+        .unwrap();
+    raw.close().await.unwrap();
+    let reopened = Database::open(&fixture.path).await.unwrap();
+    assert_eq!(durable_rows(&fixture.path).await, durable);
     let mut raw = super::support::connection(&fixture.path).await;
     assert_eq!(
-        sqlx::query_as::<_, (String, String)>(
-            "SELECT title,artist FROM playlist_entries WHERE object_id='native-song'"
-        )
-        .fetch_one(&mut raw)
-        .await
-        .unwrap(),
-        ("Native title".into(), "Native artist".into())
-    );
-    assert_eq!(
-        sqlx::query_as::<_, (Option<String>, String)>(
-            "SELECT title,artist FROM playlist_entries WHERE object_id='saved-song'"
-        )
-        .fetch_one(&mut raw)
-        .await
-        .unwrap(),
-        (None, "Saved artist".into())
-    );
-    assert_eq!(
-        sqlx::query_as::<_, (i64, i64, Option<i64>)>("SELECT play_count,skip_count,last_played_at FROM activity_baseline WHERE track_object_id='legacy'")
-            .fetch_one(&mut raw).await.unwrap(),
-        (4, 1, Some(90))
-    );
-    assert_eq!(
-        sqlx::query_as::<_, (i64, i64, Option<i64>)>("SELECT play_count,skip_count,last_played_at FROM activity_baseline WHERE track_object_id='track-a'")
-            .fetch_one(&mut raw).await.unwrap(),
-        (7, 2, None)
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM catalog.tracks WHERE source_favorite=0")
+        sqlx::query_scalar::<_, i64>("PRAGMA schema_version")
             .fetch_one(&mut raw)
             .await
             .unwrap(),
-        fixture.tracks.len() as i64
+        schema_version
     );
-    assert!(
-        sqlx::query("UPDATE catalog.tracks SET source_favorite=2")
-            .execute(&mut raw)
-            .await
-            .is_err()
-    );
-    assert!(
-        sqlx::query("UPDATE catalog.albums SET source_rating=101")
-            .execute(&mut raw)
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT writable FROM catalog.native_playlists WHERE object_id='native'"
-        )
-        .fetch_one(&mut raw)
-        .await
-        .unwrap(),
-        1
-    );
+    raw.close().await.unwrap();
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn missing_indexed_column_returns_error_without_replacing_the_library() {
+    let fixture = super::support::fixture().await;
+    fixture.database.close().await.unwrap();
+    let mut raw = super::support::connection(&fixture.path).await;
     sqlx::raw_sql(
-        "SELECT origin_position FROM main.queue_occurrences;
-        SELECT section_title FROM catalog.home_entries;
-        SELECT revision FROM catalog.local_files;",
+        "DROP INDEX tracks_local_play_order_idx; DROP INDEX tracks_global_play_order_idx;
+        DROP INDEX tracks_local_shuffle_idx; DROP INDEX tracks_global_local_shuffle_idx;
+        DROP TRIGGER local_play_count_listen_insert; DROP TRIGGER local_play_count_listen_delete;
+        DROP TRIGGER local_play_count_track_insert; DROP TRIGGER local_play_count_track_uri;
+        ALTER TABLE tracks DROP COLUMN local_play_count;",
     )
     .execute(&mut raw)
     .await
     .unwrap();
-    assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT repeat_mode FROM main.queue_state")
-            .fetch_one(&mut raw)
-            .await
-            .unwrap(),
-        "none"
-    );
-    assert!(
-        sqlx::query("UPDATE main.queue_state SET repeat_mode='invalid'")
-            .execute(&mut raw)
-            .await
-            .is_err()
-    );
     raw.close().await.unwrap();
-    database.close().await.unwrap();
-    // Reopening is a no-op for the repaired data and accepts retained newer fields.
-    let database = Database::open(&fixture.path).await.unwrap();
-    assert!(!database.fresh_start());
-    database.close().await.unwrap();
+    let before = durable_rows(&fixture.path).await;
+    assert!(Database::open(&fixture.path).await.is_err());
+    assert_eq!(durable_rows(&fixture.path).await, before);
 }
 
 #[tokio::test]
-async fn attached_catalog_setup_failure_recovers_catalog_without_replacing_store() {
+async fn index_setup_failure_returns_error_without_replacing_the_library() {
     let fixture = super::support::fixture().await;
     fixture
         .database
-        .create_playlist(None, "Keep me", &[])
+        .create_playlist(
+            None,
+            "Keep me",
+            &library::CatalogQuery::uris(library::CatalogKind::Track, vec![]).selection(),
+        )
         .await
         .unwrap();
     fixture.database.close().await.unwrap();
-    let before = durable_rows(&fixture.path).await;
     let mut raw = super::support::connection(&fixture.path).await;
     sqlx::raw_sql(
-        "DROP INDEX catalog.tracks_local_shuffle_idx;
-        CREATE TABLE catalog.tracks_local_shuffle_idx(value TEXT);",
+        "DROP INDEX tracks_local_shuffle_idx; CREATE TABLE tracks_local_shuffle_idx(value TEXT);",
     )
     .execute(&mut raw)
     .await
     .unwrap();
     raw.close().await.unwrap();
-    let database = Database::open(&fixture.path).await.unwrap();
-    assert!(!database.fresh_start());
+    let before = durable_rows(&fixture.path).await;
+    assert!(Database::open(&fixture.path).await.is_err());
     assert_eq!(durable_rows(&fixture.path).await, before);
-    database
-        .reconcile_source(&SourceId::new("source"))
-        .await
-        .unwrap();
-    database.close().await.unwrap();
 }
 
 #[tokio::test]
-async fn malformed_store_schema_is_preserved_even_when_opening_the_writer_fails() {
+async fn malformed_library_schema_returns_error_without_replacing_the_file() {
     let fixture = super::support::fixture().await;
     fixture.database.close().await.unwrap();
     let mut raw = super::support::connection(&fixture.path).await;
-    sqlx::raw_sql("PRAGMA writable_schema=ON;
-        UPDATE main.sqlite_schema SET sql=replace(sql,'CREATE TABLE','BROKEN TABLE') WHERE name='source_ids';")
-        .execute(&mut raw).await.unwrap();
+    sqlx::raw_sql("PRAGMA writable_schema=ON; UPDATE sqlite_schema SET sql=replace(sql,'CREATE TABLE','BROKEN TABLE') WHERE name='sources';").execute(&mut raw).await.unwrap();
     raw.close().await.unwrap();
-    let bytes = std::fs::read(&fixture.path).unwrap();
-    let database = Database::open(&fixture.path).await.unwrap();
-    assert!(database.fresh_start());
-    let preserved = std::fs::read_dir(fixture.path.parent().unwrap())
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| {
-            path.extension()
-                .is_some_and(|extension| extension.to_string_lossy().starts_with("unusable-"))
-        })
-        .unwrap();
-    assert_eq!(std::fs::read(preserved).unwrap(), bytes);
-    let mut raw = super::support::connection(&fixture.path).await;
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM catalog.tracks")
-            .fetch_one(&mut raw)
-            .await
-            .unwrap(),
-        fixture.tracks.len() as i64
-    );
-    raw.close().await.unwrap();
-    database.close().await.unwrap();
+    let before = std::fs::read(&fixture.path).unwrap();
+    assert!(Database::open(&fixture.path).await.is_err());
+    assert_eq!(std::fs::read(&fixture.path).unwrap(), before);
 }
 
 const SCHEMA_43: &str = r#"BEGIN IMMEDIATE;
@@ -807,20 +680,13 @@ COMMIT;
 "#;
 
 async fn connection(path: &Path, create: bool) -> SqliteConnection {
-    let mut connection = SqliteConnection::connect_with(
+    SqliteConnection::connect_with(
         &SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(create),
     )
     .await
-    .expect("open schema test connection");
-    let catalog = path.with_extension("catalog.sqlite");
-    if catalog.exists() {
-        super::production_schema::attach_catalog(&mut connection, &catalog)
-            .await
-            .unwrap();
-    }
-    connection
+    .expect("open schema test connection")
 }
 
 #[tokio::test]
@@ -910,15 +776,22 @@ async fn schema_43_fixture_relocates_and_migrates_every_core_durable_family_and_
     let database = Database::open_configured(&path, &configured, Some(&selected))
         .await
         .expect("migrate schema 43 to the current schema");
-    let history = database
-        .activity_history(None, "", true, &ReadCancellation::new())
+    let history = (&library::CatalogQuery {
+        descending: true,
+        ..library::CatalogQuery::tracks(library::TrackScope::History { source: None })
+    })
+        .rows(&database, 0, 100, &ReadCancellation::new())
         .await
+        .map(|rows| match rows {
+            library::CatalogRows::Tracks(rows) => rows,
+            _ => unreachable!("typed song projection"),
+        })
         .expect("read migrated orphan Activity");
     assert_eq!(
         history
             .iter()
             .take(2)
-            .map(|media| media.title.as_str())
+            .map(|media| media.metadata.title.as_str())
             .collect::<Vec<_>>(),
         ["Gone B", "Gone A"]
     );
@@ -936,11 +809,11 @@ async fn schema_43_fixture_relocates_and_migrates_every_core_durable_family_and_
             .fetch_one(&mut reader)
             .await
             .expect("read migrated version"),
-        46
+        47
     );
     assert_eq!(
         sqlx::query_scalar::<_, String>(
-            "SELECT object_id FROM main.source_ids ORDER BY source_key"
+            "SELECT object_id FROM sources WHERE object_id<>'rufin:recovered' ORDER BY source_key"
         )
         .fetch_all(&mut reader)
         .await
@@ -949,15 +822,15 @@ async fn schema_43_fixture_relocates_and_migrates_every_core_durable_family_and_
     );
     assert_eq!(
         sqlx::query_as::<_, (i64, String, i64)>(
-            "SELECT source_key,display_name,catalog_revision FROM sources ORDER BY source_key"
+            "SELECT source_key,display_name,catalog_revision FROM sources WHERE object_id<>'rufin:recovered' ORDER BY source_key"
         )
         .fetch_all(&mut reader)
         .await
         .expect("read source observations"),
-        [(1, "Alpha".into(), 4), (2, "Beta".into(), 5)]
+        [(1, "Alpha".into(), 3), (2, "Beta".into(), 4)]
     );
     assert_eq!(sqlx::query_as::<_, (String, Option<String>, i64)>(
-        "SELECT media_uri,title,position FROM catalog.native_playlist_entries WHERE object_id='native-a:missing'"
+        "SELECT track.media_uri,track.title,entry.position FROM playlist_entries entry JOIN tracks track USING(track_key) WHERE entry.object_id='native-a:missing'"
     ).fetch_one(&mut reader).await.unwrap(),
         (library::source_entity_uri(&configured[0], "track", "missing-track"), None, 1));
     assert_eq!(
@@ -1062,14 +935,13 @@ async fn schema_43_fixture_relocates_and_migrates_every_core_durable_family_and_
         ]
     );
     assert_eq!(
-        sqlx::query_as::<_, (String, i64, String, i64)>(
-            "SELECT occurrence.object_id,state.progress_millis,state.repeat_mode,state.shuffled
-             FROM queue_occurrences occurrence CROSS JOIN queue_state state"
+        sqlx::query_as::<_, (i64, i64, String, i64)>(
+            "SELECT current_index,progress_millis,repeat_mode,shuffled FROM queue_state"
         )
         .fetch_one(&mut reader)
         .await
         .expect("read selected global Queue"),
-        ("queue-b".to_string(), 222, "one".to_string(), 1)
+        (0, 222, "one".to_string(), 1)
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM local_access_files")
@@ -1150,7 +1022,7 @@ async fn schema_41_and_42_preserve_playlist_order_and_authored_entries() {
         );
         assert_eq!(
             sqlx::query_as::<_, (String, String)>(
-                "SELECT object_id,media_uri FROM main.playlist_entries ORDER BY object_id"
+                "SELECT entry.object_id,track.media_uri FROM playlist_entries entry JOIN tracks track USING(track_key) ORDER BY entry.object_id"
             )
             .fetch_all(&mut raw)
             .await
@@ -1188,7 +1060,7 @@ async fn schema_43_malformed_listen_keeps_valid_siblings_and_preserves_input() {
     schema_43.close().await.expect("close schema-43 fixture");
 
     let database = Database::open_configured(&path, &[], None).await.unwrap();
-    assert!(!database.fresh_start());
+
     database.close().await.unwrap();
     let mut reader = connection(&path, false).await;
     assert_eq!(
@@ -1196,7 +1068,7 @@ async fn schema_43_malformed_listen_keeps_valid_siblings_and_preserves_input() {
             .fetch_one(&mut reader)
             .await
             .expect("read rebuilt schema version"),
-        46
+        47
     );
     assert_eq!(
         sqlx::query_scalar::<_, String>("SELECT external_id FROM listens ORDER BY listen_key")
@@ -1212,7 +1084,9 @@ async fn schema_43_malformed_listen_keeps_valid_siblings_and_preserves_input() {
         .find(|entry| {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            name.contains(".unusable-") && !name.ends_with("-wal") && !name.ends_with("-shm")
+            name.contains(".before-migration-")
+                && !name.ends_with("-wal")
+                && !name.ends_with("-shm")
         })
         .expect("preserve the failed migration input")
         .path();
@@ -1234,89 +1108,6 @@ async fn schema_43_malformed_listen_keeps_valid_siblings_and_preserves_input() {
 }
 
 #[tokio::test]
-async fn fresh_schema_has_exact_table_inventory() {
-    let directory = tempfile::tempdir().expect("temporary Store directory");
-    let path = directory.path().join("library.sqlite3");
-    let _database = Database::open(&path).await.expect("open fresh Store");
-    let mut reader = connection(&path, false).await;
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("PRAGMA user_version")
-            .fetch_one(&mut reader)
-            .await
-            .expect("read final schema version"),
-        46
-    );
-    let tables = sqlx::query_scalar::<_, String>(
-        "SELECT name FROM sqlite_schema
-         WHERE type='table' AND name NOT LIKE 'sqlite_%'
-         ORDER BY name",
-    )
-    .fetch_all(&mut reader)
-    .await
-    .expect("read table inventory");
-    assert_eq!(
-        tables,
-        [
-            "connect_capture",
-            "connect_changes",
-            "connect_collection",
-            "connect_media_files",
-            "connect_native_playlist_seed",
-            "connect_playlist_seed",
-            "connect_roots",
-            "connect_seed",
-            "favorite_outbox",
-            "legacy_activity",
-            "listen_outbox",
-            "listens",
-            "local_locators",
-            "playlist_entries",
-            "playlist_file_ignored",
-            "playlist_file_links",
-            "playlist_file_settings",
-            "playlists",
-            "queue_occurrences",
-            "queue_order",
-            "queue_saved",
-            "queue_state",
-            "queue_transfer_pages",
-            "smart_playlists",
-            "source_ids",
-            "user_media_state"
-        ]
-    );
-    let cache=sqlx::query_scalar::<_,String>("SELECT name FROM catalog.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").fetch_all(&mut reader).await.unwrap();
-    assert_eq!(
-        cache,
-        [
-            "activity_baseline",
-            "album_artists",
-            "album_genres",
-            "album_release_types",
-            "albums",
-            "artists",
-            "folders",
-            "genres",
-            "home_entries",
-            "local_access_metadata",
-            "local_file_dependencies",
-            "local_files",
-            "loudness_measurements",
-            "lyrics_cache",
-            "moods",
-            "native_playlist_entries",
-            "native_playlists",
-            "replay_gain_measurements",
-            "sources",
-            "track_artists",
-            "track_folders",
-            "track_genres",
-            "track_moods",
-            "tracks"
-        ]
-    );
-}
-#[tokio::test]
 async fn older_source_scoped_playlist_ids_remain_distinct_global_playlists() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("library.sqlite3");
@@ -1327,7 +1118,7 @@ async fn older_source_scoped_playlist_ids_remain_distinct_global_playlists() {
         .execute(&mut old).await.unwrap();
     old.close().await.unwrap();
     let database = Database::open(&path).await.unwrap();
-    assert!(!database.fresh_start());
+
     let mut reader = connection(&path, false).await;
     let rows = sqlx::query_as::<_, (String, String, i64)>(
         "SELECT p.name,group_concat(e.object_id,','),p.source_key IS NULL
@@ -1356,14 +1147,14 @@ async fn schema_40_store_migrates_into_current_schema() {
     let directory = tempfile::tempdir().expect("temporary Store directory");
     let path = directory.path().join("library.sqlite3");
     let media = create_legacy_store(&path).await;
-    let database = Database::open_configured(
+    let _database = Database::open_configured(
         &path,
         &[SourceId::new("legacy-source")],
         Some(&SourceId::new("legacy-source")),
     )
     .await
     .expect("migrate and open schema-40 Store");
-    assert!(!database.fresh_start());
+
     let mut reader = connection(&path, false).await;
     let uri = library::source_entity_uri(&SourceId::new("legacy-source"), "track", "legacy-track");
     assert_eq!(
@@ -1427,21 +1218,21 @@ async fn schema_40_store_migrates_into_current_schema() {
     );
     assert_eq!(
         sqlx::query_scalar::<_, String>(
-            "SELECT object_id FROM queue_occurrences ORDER BY traversal_position"
+            "SELECT coalesce(json_extract(provenance,'$'),json_array(context_key,source_rank)) FROM queue_positions position JOIN queue_entries entry USING(entry_id) WHERE order_kind=0 ORDER BY position"
         )
         .fetch_all(&mut reader)
         .await
         .unwrap(),
-        ["occ-auto", "occ-context"]
+        ["AutoDj", "[1,7]"]
     );
     assert_eq!(
-        sqlx::query_as::<_, (Option<String>, i64)>(
-            "SELECT current_occurrence_id,progress_millis FROM queue_state"
+        sqlx::query_as::<_, (Option<i64>, i64)>(
+            "SELECT current_index,progress_millis FROM queue_state"
         )
         .fetch_one(&mut reader)
         .await
         .unwrap(),
-        (Some("occ-context".into()), 1200)
+        (Some(1), 1200)
     );
     for table in [
         "tracks",
@@ -1454,13 +1245,18 @@ async fn schema_40_store_migrates_into_current_schema() {
     ] {
         assert_eq!(
             sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
-                "SELECT count(*) FROM {table}"
+                "SELECT count(*) FROM {table}{}",
+                if table == "tracks" {
+                    " WHERE indexed=1"
+                } else {
+                    ""
+                }
             )))
             .fetch_one(&mut reader)
             .await
             .unwrap(),
             0,
-            "catalog {table} is disposable"
+            "legacy reference import does not index {table}"
         );
     }
     assert_eq!(
@@ -1473,7 +1269,7 @@ async fn schema_40_store_migrates_into_current_schema() {
 }
 
 #[tokio::test]
-async fn schema_39_store_runs_the_committed_chain_into_current_schema() {
+async fn schema_39_store_converts_directly_into_current_schema() {
     let directory = tempfile::tempdir().expect("temporary Store directory");
     let path = directory.path().join("library.sqlite3");
     create_legacy_store(&path).await;
@@ -1491,15 +1287,15 @@ async fn schema_39_store_runs_the_committed_chain_into_current_schema() {
 
     let _database = Database::open(&path)
         .await
-        .expect("run the committed migration chain before opening the current Store");
-    assert!(!_database.fresh_start());
+        .expect("convert the released Store directly into the current schema");
+
     let mut reader = connection(&path, false).await;
     assert_eq!(
         sqlx::query_scalar::<_, i64>("PRAGMA user_version")
             .fetch_one(&mut reader)
             .await
             .expect("read current schema version"),
-        46
+        47
     );
     let definition = sqlx::query_scalar::<_, String>(
         "SELECT definition_json FROM smart_playlists WHERE object_id='smart-list'",
@@ -1540,17 +1336,17 @@ async fn released_migration_ignores_unused_catalog_damage() {
             .fetch_one(&mut restored)
             .await
             .expect("read repaired schema version"),
-        46
+        47
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sources")
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sources WHERE catalog_complete=1")
             .fetch_one(&mut restored)
             .await
             .expect("read fresh catalog"),
         0
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tracks")
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tracks WHERE indexed=1")
             .fetch_one(&mut restored)
             .await
             .expect("read skipped invalid Tracks family"),
@@ -1563,7 +1359,7 @@ async fn released_migration_ignores_unused_catalog_damage() {
             .any(|entry| entry
                 .file_name()
                 .to_string_lossy()
-                .starts_with("library.unusable-")),
+                .starts_with("library.before-migration-")),
         "migration preserves its released input"
     );
 }
@@ -1585,7 +1381,7 @@ async fn released_migration_keeps_playlists_without_old_genre_catalog() {
         .expect("migrate known user facts without unused old catalog tables");
     let mut reader = connection(&path, false).await;
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sources")
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sources WHERE catalog_complete=1")
             .fetch_one(&mut reader)
             .await
             .expect("read fresh catalog"),
@@ -1599,7 +1395,7 @@ async fn released_migration_keeps_playlists_without_old_genre_catalog() {
         2
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tracks")
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tracks WHERE indexed=1")
             .fetch_one(&mut reader)
             .await
             .unwrap(),
@@ -1609,25 +1405,13 @@ async fn released_migration_keeps_playlists_without_old_genre_catalog() {
 }
 
 #[tokio::test]
-async fn not_a_database_is_preserved_and_rebuilt_automatically() {
-    let directory = tempfile::tempdir().expect("temporary Store directory");
+async fn unreadable_library_returns_error_and_preserves_the_file() {
+    let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("library.sqlite3");
-    std::fs::write(&path, b"not a sqlite database").expect("write invalid Store");
-
-    let _database = Database::open(&path)
-        .await
-        .expect("automatically preserve and rebuild invalid Store content");
-    assert!(
-        std::fs::read_dir(directory.path())
-            .expect("read Store directory")
-            .filter_map(Result::ok)
-            .any(|entry| entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("library.unusable-"))
-    );
+    std::fs::write(&path, b"not a sqlite database").unwrap();
+    assert!(Database::open(&path).await.is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"not a sqlite database");
 }
-
 async fn create_legacy_store(path: &Path) -> std::path::PathBuf {
     let mut connection = connection(path, true).await;
     sqlx::raw_sql(
@@ -1913,7 +1697,15 @@ async fn deleting_or_corrupting_catalog_preserves_exact_durable_records_and_loca
     let uri = &fixture.track_uris[0];
     fixture
         .database
-        .create_playlist(None, "Durable duplicate list", &[uri.clone(), uri.clone()])
+        .create_playlist(
+            None,
+            "Durable duplicate list",
+            &library::CatalogQuery::uris(
+                library::CatalogKind::Track,
+                vec![uri.clone(), uri.clone()],
+            )
+            .selection(),
+        )
         .await
         .unwrap();
     fixture
@@ -1930,7 +1722,7 @@ async fn deleting_or_corrupting_catalog_preserves_exact_durable_records_and_loca
     sqlx::raw_sql("INSERT INTO listen_outbox(listen_key,service,account_id,attempts,next_attempt_at,last_error) SELECT listen_key,'lastfm','account',3,200,'retry' FROM listens; INSERT INTO legacy_activity VALUES('source','lifetime','track','track-a',4,2,90);").execute(&mut raw).await.unwrap();
     raw.close().await.unwrap();
     fixture.database.close().await.unwrap();
-    let before = durable_rows(&path).await;
+    let mut before = durable_rows(&path).await;
     for damage in 0..3 {
         for suffix in ["", "-wal", "-shm"] {
             let mut file = catalog.as_os_str().to_os_string();
@@ -1960,10 +1752,6 @@ async fn deleting_or_corrupting_catalog_preserves_exact_durable_records_and_loca
             _ => {}
         }
         let database = Database::open(&path).await.unwrap();
-        assert!(
-            !database.fresh_start(),
-            "cache damage never recovers/replaces durable Store"
-        );
         assert_eq!(durable_rows(&path).await, before);
         let mut raw = connection(&path, false).await;
         assert_eq!(
@@ -1971,7 +1759,7 @@ async fn deleting_or_corrupting_catalog_preserves_exact_durable_records_and_loca
                 .fetch_one(&mut raw)
                 .await
                 .unwrap(),
-            0
+            4
         );
         assert_eq!(
             sqlx::query_scalar::<_, String>("SELECT access_uri FROM local_access_files")
@@ -1990,50 +1778,55 @@ async fn deleting_or_corrupting_catalog_preserves_exact_durable_records_and_loca
         raw.close().await.unwrap();
         // Ordinary rescan rejoins effective favorites/ratings by the unchanged media URI.
         let (_, _, object) = library::source_entity_parts(uri).unwrap();
-        let mut scan = library::Scan::begin(&database, "source", "Source", "source", None)
+        database
+            .reconcile_source(&SourceId::new("source"), "subsonic", "Source")
             .await
             .unwrap();
-        scan.write_track(
-            &object,
-            None,
-            "Changed tags",
-            "changed tags",
-            "",
-            "Artist",
-            "changed tags",
-            100000,
-            1,
-            1,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            Some(999),
-            None,
-            None,
-            None,
-            None,
-            None,
-            [0; 32],
-            &library::AudioProperties::default(),
-        )
-        .await
-        .unwrap();
-        scan.finish().await.unwrap();
+        let mut catalog = database.catalog("source", None).await.unwrap();
+        let observed = catalog.start_observation().await.unwrap();
+        catalog
+            .apply_catalog(
+                &library::CatalogBatch {
+                    tracks: vec![library::TrackObservation {
+                        object_id: object.to_owned(),
+                        metadata: library::TrackMetadata {
+                            title: "Changed tags".into(),
+                            artist: "Artist".into(),
+                            sort_text: "changed tags".into(),
+                            duration_millis: 100000,
+                            disc_number: 1,
+                            track_number: 1,
+                            ..Default::default()
+                        },
+                        user_data: library::NativeUserState {
+                            favorite: Some(false),
+                            rating: Some(Some(99)),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                true,
+            )
+            .await
+            .unwrap();
+        catalog
+            .complete_source_observation(observed, &["track"], None)
+            .await
+            .unwrap();
         let mut raw = connection(&path, false).await;
         assert_eq!(sqlx::query_as::<_,(bool,i64)>("SELECT state.favorite,state.rating FROM tracks track JOIN user_media_state state USING(media_uri) WHERE track.media_uri=?1").bind(uri).fetch_one(&mut raw).await.unwrap(),(true,87));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT title FROM tracks WHERE media_uri=?1")
+                .bind(uri)
+                .fetch_one(&mut raw)
+                .await
+                .unwrap(),
+            "Changed tags"
+        );
         raw.close().await.unwrap();
-        assert_eq!(durable_rows(&path).await, before);
+        before = durable_rows(&path).await;
         database.close().await.unwrap();
     }
 }
@@ -2050,7 +1843,12 @@ async fn durable_rows(path: &Path) -> Vec<(String, Vec<String>)> {
             .unwrap();
         let values = columns
             .iter()
-            .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
+            .map(|column| {
+                format!(
+                    "CASE WHEN typeof(\"{0}\")='blob' THEN hex(\"{0}\") ELSE \"{0}\" END",
+                    column.replace('"', "\"\"")
+                )
+            })
             .collect::<Vec<_>>()
             .join(",");
         let query = format!("SELECT json_array({values}) FROM main.\"{table}\" ORDER BY {values}");
@@ -2065,11 +1863,19 @@ async fn durable_rows(path: &Path) -> Vec<(String, Vec<String>)> {
 }
 
 #[tokio::test]
-async fn forgetting_source_uses_durable_identity_with_no_cached_source() {
+async fn forgetting_source_retains_canonical_metadata_for_global_playlists() {
     let fixture = super::support::fixture().await;
     let database = &fixture.database;
     database
-        .create_playlist(None, "Snapshot", &[fixture.track_uris[0].clone()])
+        .create_playlist(
+            None,
+            "Snapshot",
+            &library::CatalogQuery::uris(
+                library::CatalogKind::Track,
+                vec![fixture.track_uris[0].clone()],
+            )
+            .selection(),
+        )
         .await
         .unwrap();
     let mut raw = connection(&fixture.path, false).await;
@@ -2081,18 +1887,7 @@ async fn forgetting_source_uses_durable_identity_with_no_cached_source() {
             .await
             .unwrap();
     }
-    sqlx::query("DELETE FROM catalog.sources")
-        .execute(&mut raw)
-        .await
-        .unwrap();
     raw.close().await.unwrap();
-    assert_eq!(
-        database
-            .source_identity_key(&SourceId::new("source"))
-            .await
-            .unwrap(),
-        None
-    );
     assert!(
         database
             .remove_source(&library::SourceId::new("source"))
@@ -2117,131 +1912,45 @@ async fn forgetting_source_uses_durable_identity_with_no_cached_source() {
 }
 
 #[tokio::test]
-async fn cache_and_durable_keys_are_independent_and_a_fresh_store_keeps_catalog() {
-    let fixture = super::support::fixture().await;
-    let mut raw = connection(&fixture.path, false).await;
-    sqlx::raw_sql("PRAGMA foreign_keys=OFF;
-      UPDATE main.source_ids SET source_key=88 WHERE object_id='source';
-      INSERT INTO main.playlists(playlist_key,source_key,object_id,position) VALUES(9,88,'native',0);
-      INSERT INTO catalog.native_playlists(playlist_key,source_key,object_id,name,normalized_name,sort_text) VALUES(61,1,'native','Native','native','native');
-      INSERT INTO catalog.native_playlist_entries(playlist_key,object_id,media_uri,title,position) VALUES(61,'occurrence','https://example.test/song','Song',0);
-      INSERT INTO main.local_locators(source_key,media_uri,origin,path,root,relative_path,access_uri) VALUES(88,'https://example.test/song','mapping','/music/song.flac','/music','song.flac','file:///music/song.flac');
-      INSERT INTO catalog.local_access_metadata VALUES('file:///music/song.flac',9,1,NULL,NULL,1,'Song','song','Album','album','Artist','artist',1,1,1000,NULL);")
-      .execute(&mut raw).await.unwrap();
-    assert_eq!(
-        sqlx::query_as::<_, (i64, i64, String)>(
-            "SELECT playlist_key,source_key,name FROM playlists WHERE object_id='native'"
-        )
-        .fetch_one(&mut raw)
-        .await
-        .unwrap(),
-        (-61, 1, "Native".into())
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM playlist_entries WHERE playlist_key=-61"
-        )
-        .fetch_one(&mut raw)
-        .await
-        .unwrap(),
-        1
-    );
-    assert_eq!(
-        sqlx::query_as::<_, (i64, String)>("SELECT source_key,title FROM local_access_files")
-            .fetch_one(&mut raw)
-            .await
-            .unwrap(),
-        (1, "Song".into())
-    );
-    raw.close().await.unwrap();
-    let catalog = fixture.path.with_extension("catalog.sqlite");
-    fixture.database.close().await.unwrap();
-    std::fs::write(&fixture.path, b"unusable user store").unwrap();
-    let database = Database::open(&fixture.path).await.unwrap();
-    assert!(database.fresh_start());
-    let mut raw = connection(&fixture.path, false).await;
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tracks")
-            .fetch_one(&mut raw)
-            .await
-            .unwrap(),
-        4
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT name FROM playlists WHERE object_id='native'")
-            .fetch_one(&mut raw)
-            .await
-            .unwrap(),
-        "Native"
-    );
-    assert!(catalog.exists());
-    raw.close().await.unwrap();
-    database.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn unused_fields_and_version_stamp_do_not_replace_usable_state() {
+async fn unsupported_version_preserves_library_data() {
     let fixture = super::support::fixture().await;
     fixture
         .database
-        .create_playlist(None, "Keep me", &[])
+        .create_playlist(
+            None,
+            "Keep me",
+            &library::CatalogQuery::uris(library::CatalogKind::Track, vec![]).selection(),
+        )
         .await
         .unwrap();
     fixture.database.close().await.unwrap();
     let mut raw = connection(&fixture.path, false).await;
-    sqlx::raw_sql(
-        "ALTER TABLE main.playlists ADD COLUMN irrelevant TEXT;
-      CREATE TABLE extra(value TEXT); PRAGMA user_version=999;",
-    )
-    .execute(&mut raw)
-    .await
-    .unwrap();
+    sqlx::raw_sql("ALTER TABLE playlists ADD COLUMN irrelevant TEXT; CREATE TABLE extra(value TEXT); PRAGMA user_version=999;").execute(&mut raw).await.unwrap();
     raw.close().await.unwrap();
-    let database = Database::open(&fixture.path).await.unwrap();
-    assert!(!database.fresh_start());
-    let mut raw = connection(&fixture.path, false).await;
-    assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT name FROM main.playlists WHERE name IS NOT NULL")
-            .fetch_one(&mut raw)
-            .await
-            .unwrap(),
-        "Keep me"
-    );
-    raw.close().await.unwrap();
-    database.close().await.unwrap();
+    let before = durable_rows(&fixture.path).await;
+    assert!(Database::open(&fixture.path).await.is_err());
+    assert_eq!(durable_rows(&fixture.path).await, before);
 }
 
 #[tokio::test]
-async fn missing_nullable_index_column_is_repaired_without_replacing_store_or_catalog() {
+async fn missing_listen_identity_returns_error_without_replacing_user_data() {
     let fixture = super::support::fixture().await;
     fixture
         .database
-        .create_playlist(None, "Keep me", &[])
+        .create_playlist(
+            None,
+            "Keep me",
+            &library::CatalogQuery::uris(library::CatalogKind::Track, vec![]).selection(),
+        )
         .await
         .unwrap();
     fixture.database.close().await.unwrap();
     let mut raw = connection(&fixture.path, false).await;
-    sqlx::raw_sql("DROP VIEW temp.playlist_entries; DROP VIEW temp.playlists; DROP VIEW temp.local_access_files; DROP VIEW temp.activity_baseline; DROP INDEX listens_media_idx; ALTER TABLE listens DROP COLUMN media_uri;").execute(&mut raw).await.unwrap();
+    sqlx::raw_sql("DROP TRIGGER local_play_count_listen_insert; DROP TRIGGER local_play_count_listen_delete; DROP TRIGGER local_play_count_track_insert; DROP TRIGGER local_play_count_track_uri; DROP TRIGGER IF EXISTS facts_listen_albums_; DROP TRIGGER IF EXISTS facts_listen_artists_; DROP TRIGGER IF EXISTS facts_listen_artists_album_artist_; DROP TRIGGER IF EXISTS facts_listen_delete; DROP TRIGGER IF EXISTS facts_listen_update; DROP INDEX listens_media_activity_idx; ALTER TABLE listens DROP COLUMN media_uri;").execute(&mut raw).await.unwrap();
     raw.close().await.unwrap();
-    let database = Database::open(&fixture.path).await.unwrap();
-    assert!(!database.fresh_start());
-    let mut raw = connection(&fixture.path, false).await;
-    assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT name FROM main.playlists WHERE name IS NOT NULL")
-            .fetch_one(&mut raw)
-            .await
-            .unwrap(),
-        "Keep me"
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tracks")
-            .fetch_one(&mut raw)
-            .await
-            .unwrap(),
-        4
-    );
-    raw.close().await.unwrap();
-    database.close().await.unwrap();
+    let before = durable_rows(&fixture.path).await;
+    assert!(Database::open(&fixture.path).await.is_err());
+    assert_eq!(durable_rows(&fixture.path).await, before);
 }
 
 #[tokio::test]
@@ -2273,7 +1982,7 @@ async fn legacy_local_cue_queue_uses_the_same_identity_as_favorites() {
     );
     assert_eq!(
         sqlx::query_scalar::<_, String>(
-            "SELECT media_uri FROM queue_occurrences ORDER BY position"
+            "SELECT track.media_uri FROM queue_positions position JOIN queue_entries entry USING(entry_id) JOIN tracks track USING(track_key) WHERE order_kind=0 ORDER BY position"
         )
         .fetch_all(&mut raw)
         .await

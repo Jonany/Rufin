@@ -4,7 +4,8 @@ use std::rc::Rc;
 use adw::prelude::*;
 use app_identity::{APP_ID, DISPLAY_NAME};
 use gtk::{gio, glib};
-use playback::{PlaybackTransitionMode, QueuePlacement};
+use playback::PlaybackTransitionMode;
+use rufin_core::playback::QueuePlacement;
 
 use crate::player::play_saved_random;
 use crate::preferences::present_preferences_dialog;
@@ -87,9 +88,9 @@ pub(crate) fn install_window_actions(shell: &Rc<Shell>) {
     add_window_action(shell, "toggle-private-mode", private_mode_accels, {
         let shell = Rc::clone(shell);
         move || {
-            let enabled = !shell.settings.current.borrow().private_mode;
+            let enabled = !shell.settings.current.borrow().application.private_mode;
             shell.preferences.set_private_mode(enabled);
-            if shell.settings.current.borrow().private_mode == enabled {
+            if shell.settings.current.borrow().application.private_mode == enabled {
                 shell
                     .control_feedback
                     .show_control_feedback_toast(if enabled {
@@ -128,7 +129,7 @@ pub(crate) fn install_window_actions(shell: &Rc<Shell>) {
     #[cfg(not(target_os = "macos"))]
     let play_pause_accels = &["<Control>space"][..];
     add_window_action(shell, "play-pause", play_pause_accels, {
-        let transport = shell.products.playback.transport.clone();
+        let transport = shell.products.playback.clone();
         move || transport.play_pause()
     });
     let navigate_sidebar =
@@ -163,7 +164,7 @@ pub(crate) fn install_window_actions(shell: &Rc<Shell>) {
     #[cfg(not(target_os = "macos"))]
     let previous_track_accels = &["<Control>b"][..];
     add_window_action(shell, "previous-track", previous_track_accels, {
-        let transport = shell.products.playback.transport.clone();
+        let transport = shell.products.playback.clone();
         move || transport.previous()
     });
     #[cfg(target_os = "macos")]
@@ -171,7 +172,7 @@ pub(crate) fn install_window_actions(shell: &Rc<Shell>) {
     #[cfg(not(target_os = "macos"))]
     let next_track_accels = &["<Control>n"][..];
     add_window_action(shell, "next-track", next_track_accels, {
-        let transport = shell.products.playback.transport.clone();
+        let transport = shell.products.playback.clone();
         move || transport.next()
     });
     #[cfg(target_os = "macos")]
@@ -659,7 +660,7 @@ fn seek_by(shell: &Shell, delta_seconds: i32) {
     }) else {
         return;
     };
-    shell.products.playback.transport.seek_seconds(seconds);
+    shell.products.playback.seek_seconds(seconds);
 }
 
 fn adjust_volume(shell: &Rc<Shell>, delta: f64) {
@@ -675,13 +676,7 @@ fn adjust_volume(shell: &Rc<Shell>, delta: f64) {
 }
 
 fn set_transition_mode_shortcut(shell: &Rc<Shell>, mode: PlaybackTransitionMode) {
-    if !shell
-        .products
-        .playback
-        .transport
-        .playback_output()
-        .is_local()
-    {
+    if !shell.products.playback.playback_output().is_local() {
         return;
     }
     shell
@@ -696,8 +691,12 @@ fn set_transition_mode_shortcut(shell: &Rc<Shell>, mode: PlaybackTransitionMode)
 }
 
 fn refresh_selected_library(shell: &Shell) {
-    if let Some(source) = shell.selected_source_operations() {
-        source.refresh_library(rufin_core::runtime::LibraryRefreshTrigger::GlobalAction);
+    if let Some(selected) = shell.selected_library() {
+        let source = shell.products.source.clone();
+        let source_id = selected.source_id.clone();
+        gtk::glib::spawn_future_local(async move {
+            let _ = source.refresh_source(source_id, false).await;
+        });
     }
 }
 
@@ -710,21 +709,21 @@ fn toggle_shuffle_shortcut(shell: &Shell) {
     else {
         return;
     };
-    shell.products.playback.transport.set_shuffle(enabled);
+    shell.products.playback.set_shuffle(enabled);
 }
 
 fn cycle_repeat_shortcut(shell: &Shell) {
     if shell.player_ui.selected_playback().is_none() {
         return;
     }
-    shell.products.playback.transport.cycle_repeat();
+    shell.products.playback.cycle_repeat();
 }
 
 fn toggle_auto_dj_shortcut(shell: &Shell) {
     if shell.player_ui.selected_playback().is_none() {
         return;
     }
-    shell.products.playback.transport.toggle_auto_dj();
+    shell.products.playback.toggle_auto_dj();
 }
 
 pub(crate) fn toggle_mute_shortcut(shell: &Rc<Shell>) {

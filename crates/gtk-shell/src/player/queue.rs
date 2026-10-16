@@ -7,8 +7,9 @@ use gtk_widgets::{
     interactions::ContextMenuSurface,
 };
 use localization::msgid;
+use rufin_core::playback::QueueSelection;
 use rufin_core::settings::ContextMenuItem;
-use std::{rc::Rc, sync::Arc};
+use std::rc::Rc;
 
 pub(crate) fn connect_queue_playlist_button(shell: &Rc<Shell>) {
     let weak = Rc::downgrade(shell);
@@ -20,20 +21,17 @@ pub(crate) fn connect_queue_playlist_button(shell: &Rc<Shell>) {
             let Some(shell) = weak.upgrade() else {
                 return;
             };
-            let queue = shell.products.playback.queue.clone();
-            let task = shell
-                .products
-                .runtime
-                .spawn_blocking(move || queue.media_uris());
+            let queue = shell.products.playback.clone();
             let weak = Rc::downgrade(&shell);
             gtk::glib::spawn_future_local(async move {
-                let result = task.await;
+                let result = queue.selection().await;
                 let Some(shell) = weak.upgrade() else {
                     return;
                 };
                 match result {
-                    Ok(Ok(tracks)) => shell.new_playlist_dialog_with(String::new(), tracks),
-                    Ok(Err(error)) => shell.control_feedback.show_feedback_toast(error),
+                    Ok(tracks) => {
+                        shell.new_playlist_dialog_with(String::new(), tracks.as_ref().clone())
+                    }
                     Err(error) => shell
                         .control_feedback
                         .show_feedback_toast(error.to_string()),
@@ -51,17 +49,23 @@ pub(crate) fn present_queue_selection_context_menu(
     surface.append_fixed_action(msgid("Remove from Queue"), "remove-from-queue", REMOVE_ICON);
     surface.append_configurable_action(ContextMenuItem::Play, msgid("Play"), "play", PLAY_ICON);
     append_context_menu_picker_media_uris(&surface, shell, selection.media_uris.iter().cloned());
-    let queue = shell.products.playback.queue.clone();
-    let remove = Arc::clone(&selection.occurrences);
+    let queue = shell.products.playback.clone();
+    let remove = selection.selection.clone();
     surface.add_action("remove-from-queue", move || {
-        queue.remove_many(remove.to_vec())
+        queue.remove_many(remove.clone())
     });
-    let queue = shell.products.playback.queue.clone();
-    let play = selection.occurrences.first().cloned();
-    surface.add_action_enabled("play", play.is_some(), move || {
-        if let Some(play) = play.as_ref() {
-            queue.activate(play.clone());
+    let queue = shell.products.playback.clone();
+    surface.add_action("play", move || match &selection.selection {
+        QueueSelection::Occurrences(ids) => {
+            if let Some(id) = ids.first() {
+                queue.activate_occurrence(*id);
+            }
+        }
+        QueueSelection::Positions(positions) => {
+            if let Some(position) = positions.first() {
+                queue.activate(*position);
+            }
         }
     });
-    surface.popup(&shell.settings.current.borrow().context_menu);
+    surface.popup(&shell.settings.current.borrow().application.context_menu);
 }

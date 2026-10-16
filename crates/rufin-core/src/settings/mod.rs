@@ -1,4 +1,8 @@
 mod activity;
+mod player;
+mod preferences;
+pub use app::{AppearancePreferences, ApplicationPreferences, PlayerDisplayPreferences};
+pub use player::{PlayerPreferenceOptions, PlayerPreferences, SettingsError};
 pub mod app;
 mod connect;
 pub mod context_menu;
@@ -219,16 +223,19 @@ impl StoredSettings {
     }
 
     fn migrate_home_blocks(&mut self) {
-        if self.ui.home_blocks.is_empty() {
+        if self.ui.application.home_blocks.is_empty() {
             let home_sections = self
                 .legacy_home_sections
                 .take()
                 .filter(|sections| !sections.is_empty())
                 .unwrap_or_else(default_home_sections);
-            self.ui.home_blocks = Vec::with_capacity(home_sections.len() + 2);
-            self.ui.home_blocks.push(HomeBlockKind::Showcase);
+            self.ui.application.home_blocks = Vec::with_capacity(home_sections.len() + 2);
+            self.ui
+                .application
+                .home_blocks
+                .push(HomeBlockKind::Showcase);
             for section in home_sections {
-                self.ui.home_blocks.push(match section {
+                self.ui.application.home_blocks.push(match section {
                     HomeSectionKind::Explore => HomeBlockKind::Explore,
                     HomeSectionKind::MostPlayed => HomeBlockKind::MostPlayed,
                     HomeSectionKind::NewlyAdded => HomeBlockKind::NewlyAdded,
@@ -236,8 +243,13 @@ impl StoredSettings {
                     HomeSectionKind::RecentlyReleased => HomeBlockKind::RecentlyReleased,
                 });
             }
-            if !self.ui.home_blocks.contains(&HomeBlockKind::Genres) {
-                self.ui.home_blocks.push(HomeBlockKind::Genres);
+            if !self
+                .ui
+                .application
+                .home_blocks
+                .contains(&HomeBlockKind::Genres)
+            {
+                self.ui.application.home_blocks.push(HomeBlockKind::Genres);
             }
         } else {
             self.legacy_home_sections.take();
@@ -293,25 +305,6 @@ pub struct SettingsFile {
     ),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AppearancePreferences {
-    pub theme_preference: ThemePreference,
-    pub accent_preference: AccentPreference,
-    pub theme_accents: std::collections::BTreeMap<String, String>,
-    pub language: String,
-}
-
-impl From<&UiSettings> for AppearancePreferences {
-    fn from(settings: &UiSettings) -> Self {
-        Self {
-            theme_preference: settings.theme_preference.clone(),
-            accent_preference: settings.accent_preference,
-            theme_accents: settings.theme_accents.clone(),
-            language: settings.language.clone(),
-        }
-    }
-}
-
 impl SettingsFile {
     pub(crate) fn sidebar_changes(&self) -> tokio::sync::watch::Receiver<SidebarSettings> {
         self.sidebar.subscribe()
@@ -324,6 +317,16 @@ impl SettingsFile {
         let mut value = read_startup_settings(&path)?;
         value.migrate_defaults();
         let mut changed = false;
+        for recent in &mut value.ui.recent_search_results {
+            if let Some(binding) = &mut recent.artwork_binding {
+                let normalized = library::normalize_artwork_binding(binding)
+                    .map_err(|error| error.to_string())?;
+                if *binding != normalized {
+                    *binding = normalized;
+                    changed = true;
+                }
+            }
+        }
         if value.jellyfin_device_id.trim().is_empty() {
             match random_identity("rufin-") {
                 Ok(identity) => {
@@ -336,7 +339,7 @@ impl SettingsFile {
         let file = Self {
             revision: Default::default(),
             sidebar: tokio::sync::watch::channel(value.ui.sidebar.clone()).0,
-            appearance: tokio::sync::watch::channel(AppearancePreferences::from(&value.ui)).0,
+            appearance: tokio::sync::watch::channel(value.ui.appearance.clone()).0,
             web_controller: tokio::sync::watch::channel(value.ui.web_controller.clone()).0,
             config_dir: path
                 .parent()
@@ -369,7 +372,7 @@ impl SettingsFile {
             path: None,
             revision: Default::default(),
             sidebar: tokio::sync::watch::channel(value.ui.sidebar.clone()).0,
-            appearance: tokio::sync::watch::channel(AppearancePreferences::from(&value.ui)).0,
+            appearance: tokio::sync::watch::channel(value.ui.appearance.clone()).0,
             web_controller: tokio::sync::watch::channel(value.ui.web_controller.clone()).0,
             config_dir,
             value: Arc::new(Mutex::new(value)),
@@ -383,6 +386,18 @@ impl SettingsFile {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    pub(crate) fn source_name(&self, source_id: &sources::SourceId) -> String {
+        self.value
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sources
+            .configured
+            .iter()
+            .find(|source| &source.configuration.source_id == source_id)
+            .map(|source| source.configuration.name.clone())
+            .unwrap_or_default()
     }
 
     pub(crate) fn playback_stream_quality(&self) -> StreamQuality {
@@ -417,22 +432,23 @@ impl SettingsFile {
         let mut next = self.load();
         let output = operation(&mut next)?;
         next.migrate_defaults();
-        if next.ui.backup.schedule.frequency != backup::BackupFrequency::Off
-            && next.ui.backup.schedule.schedule_id.is_empty()
+        if next.ui.application.backup.schedule.frequency != backup::BackupFrequency::Off
+            && next.ui.application.backup.schedule.schedule_id.is_empty()
         {
-            next.ui.backup.schedule.schedule_id = random_identity("schedule-")?;
+            next.ui.application.backup.schedule.schedule_id = random_identity("schedule-")?;
         }
-        next.ui.backup.schedule.retention = 2;
-        if next.ui.backup.enabled
-            && next.ui.backup.schedule.frequency == backup::BackupFrequency::Off
+        next.ui.application.backup.schedule.retention = 2;
+        if next.ui.application.backup.enabled
+            && next.ui.application.backup.schedule.frequency == backup::BackupFrequency::Off
         {
-            next.ui.backup.schedule.frequency = backup::BackupFrequency::Daily;
-            if next.ui.backup.schedule.schedule_id.is_empty() {
-                next.ui.backup.schedule.schedule_id = random_identity("schedule-")?;
+            next.ui.application.backup.schedule.frequency = backup::BackupFrequency::Daily;
+            if next.ui.application.backup.schedule.schedule_id.is_empty() {
+                next.ui.application.backup.schedule.schedule_id = random_identity("schedule-")?;
             }
         }
-        next.ui.backup.schedule.hour = next.ui.backup.schedule.hour.min(23);
-        next.ui.backup.schedule.weekday = next.ui.backup.schedule.weekday.min(6);
+        next.ui.application.backup.schedule.hour = next.ui.application.backup.schedule.hour.min(23);
+        next.ui.application.backup.schedule.weekday =
+            next.ui.application.backup.schedule.weekday.min(6);
         if next
             == *self
                 .value
@@ -470,6 +486,7 @@ impl SettingsFile {
     }
 }
 
+#[cfg_attr(feature = "bindings", derive(uniffi::Object))]
 #[derive(Clone)]
 pub struct SettingsOwner {
     file: SettingsFile,
@@ -503,11 +520,11 @@ impl SettingsOwner {
     fn save_ui(&self, settings: &UiSettings) -> Result<UiSettings, String> {
         let previous = self.file.load();
         self.file.update(|stored| {
-            let secret_storage_mode = stored.ui.secret_storage_mode;
+            let secret_storage_mode = stored.ui.application.secret_storage_mode;
             let lastfm_api_key = stored.ui.lastfm_api_key.clone();
             stored.ui = settings.clone();
             // These settings are committed together with their credentials.
-            stored.ui.secret_storage_mode = secret_storage_mode;
+            stored.ui.application.secret_storage_mode = secret_storage_mode;
             stored.ui.lastfm_api_key = lastfm_api_key;
             Ok(())
         })?;
@@ -533,11 +550,10 @@ impl SettingsFile {
         self.revision
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         self.appearance.send_if_modified(|current| {
-            let next = AppearancePreferences::from(&stored.ui);
-            if *current == next {
+            if *current == stored.ui.appearance {
                 return false;
             }
-            *current = next;
+            *current = stored.ui.appearance.clone();
             true
         });
         self.sidebar.send_if_modified(|current| {
@@ -574,46 +590,6 @@ impl SettingsOwner {
         self.file.appearance.subscribe()
     }
 
-    pub fn set_theme(&self, theme: ThemePreference) -> Result<(), String> {
-        self.restore(
-            move |stored| {
-                stored.ui.theme_preference = theme;
-                Ok(())
-            },
-            false,
-        )
-    }
-
-    pub fn set_accent(&self, accent: AccentPreference) -> Result<(), String> {
-        self.restore(
-            move |stored| {
-                stored.ui.accent_preference = accent;
-                Ok(())
-            },
-            false,
-        )
-    }
-
-    pub fn set_theme_accent(&self, theme: String, accent: String) -> Result<(), String> {
-        self.restore(
-            move |stored| {
-                stored.ui.theme_accents.insert(theme, accent);
-                Ok(())
-            },
-            false,
-        )
-    }
-
-    pub fn set_language(&self, language: String) -> Result<(), String> {
-        self.restore(
-            move |stored| {
-                stored.ui.language = localization::sanitize_language_preference(&language);
-                Ok(())
-            },
-            false,
-        )
-    }
-
     pub fn load(&self) -> UiSettings {
         self.file.load().ui
     }
@@ -627,180 +603,6 @@ impl SettingsOwner {
         (
             stored.ui.visualizer.fps_limit,
             stored.ui.visualizer.appearance.clone(),
-        )
-    }
-
-    pub fn set_equalizer_enabled(&self, enabled: bool) -> Result<(), String> {
-        self.restore(
-            move |stored| {
-                stored.ui.playback.equalizer.enabled = enabled;
-                Ok(())
-            },
-            false,
-        )
-    }
-
-    pub fn select_equalizer_preset(&self, preset: String) -> Result<(), String> {
-        self.update_preferences(move |ui| {
-            ui.playback.equalizer.select_preset(preset);
-            Ok(())
-        })
-    }
-
-    pub fn set_equalizer_band(&self, index: usize, value: f64) -> Result<(), String> {
-        self.update_preferences(move |ui| {
-            let equalizer = &mut ui.playback.equalizer;
-            let band = equalizer
-                .bands
-                .get_mut(index)
-                .ok_or_else(|| localization::tr("This isn't available"))?;
-            *band = value;
-            equalizer.mark_custom();
-            Ok(())
-        })
-    }
-
-    pub fn set_player_lyrics_preference(
-        &self,
-        field: String,
-        value: serde_json::Value,
-    ) -> Result<(), String> {
-        self.restore(
-            move |stored| {
-                stored
-                    .ui
-                    .lyrics
-                    .set_user_preference(field, value)
-                    .map_err(|error| error.to_string())
-            },
-            false,
-        )
-    }
-
-    pub fn suppress_fetched_lyrics(&self, media_uri: String) -> Result<(), String> {
-        self.restore(
-            move |stored| {
-                stored.ui.lyrics.suppress_auto_lyrics(&media_uri);
-                Ok(())
-            },
-            false,
-        )
-    }
-
-    pub fn set_visualizer_appearance(
-        &self,
-        value: visualizer::VisualizerAppearance,
-    ) -> Result<(), String> {
-        self.restore(
-            move |stored| {
-                stored.ui.visualizer.selected_preset = Some(stored.ui.visualizer.selected_preset());
-                stored.ui.visualizer.appearance = value;
-                Ok(())
-            },
-            false,
-        )
-    }
-
-    pub fn set_visualizer_appearance_field(
-        &self,
-        field: String,
-        value: serde_json::Value,
-    ) -> Result<(), String> {
-        self.restore(
-            move |stored| {
-                let mut appearance = serde_json::to_value(&stored.ui.visualizer.appearance)
-                    .map_err(|error| error.to_string())?;
-                appearance
-                    .as_object_mut()
-                    .expect("Visualizer appearance object")
-                    .insert(field, value);
-                stored.ui.visualizer.selected_preset = Some(stored.ui.visualizer.selected_preset());
-                stored.ui.visualizer.appearance =
-                    serde_json::from_value(appearance).map_err(|error| error.to_string())?;
-                Ok(())
-            },
-            false,
-        )
-    }
-
-    pub fn set_visualizer_frame_limit(&self, value: u32) -> Result<(), String> {
-        self.restore(
-            move |stored| {
-                stored.ui.visualizer.fps_limit = value;
-                Ok(())
-            },
-            false,
-        )
-    }
-
-    pub fn update_visualizer_preset(&self, slot: usize, save: bool) -> Result<(), String> {
-        self.restore(
-            move |stored| {
-                if save {
-                    stored.ui.visualizer.save_preset(slot);
-                } else {
-                    stored.ui.visualizer.select_preset(slot);
-                }
-                Ok(())
-            },
-            false,
-        )
-    }
-
-    pub fn set_activity_overview_field(
-        &self,
-        field: String,
-        value: serde_json::Value,
-    ) -> Result<(), String> {
-        self.restore(
-            move |stored| {
-                let settings = &mut stored.ui.activity_overview;
-                match field.as_str() {
-                    "autoplay_first_track" => {
-                        settings.autoplay_first_track =
-                            serde_json::from_value(value).map_err(|error| error.to_string())?
-                    }
-                    "dynamic_background" => {
-                        settings.dynamic_background =
-                            serde_json::from_value(value).map_err(|error| error.to_string())?
-                    }
-                    "background_image" => {
-                        settings.background_image =
-                            serde_json::from_value(value).map_err(|error| error.to_string())?
-                    }
-                    "tracks" => {
-                        settings.tracks =
-                            serde_json::from_value(value).map_err(|error| error.to_string())?
-                    }
-                    "artists" => {
-                        settings.artists =
-                            serde_json::from_value(value).map_err(|error| error.to_string())?
-                    }
-                    "albums" => {
-                        settings.albums =
-                            serde_json::from_value(value).map_err(|error| error.to_string())?
-                    }
-                    "genres" => {
-                        settings.genres =
-                            serde_json::from_value(value).map_err(|error| error.to_string())?
-                    }
-                    "result_count" => {
-                        settings.result_count =
-                            serde_json::from_value(value).map_err(|error| error.to_string())?
-                    }
-                    "show_comparison" => {
-                        settings.show_comparison =
-                            serde_json::from_value(value).map_err(|error| error.to_string())?
-                    }
-                    "show_rufin_in_headline" => {
-                        settings.show_rufin_in_headline =
-                            serde_json::from_value(value).map_err(|error| error.to_string())?
-                    }
-                    _ => return Err(localization::tr("This isn't available")),
-                }
-                Ok(())
-            },
-            false,
         )
     }
 
@@ -863,27 +665,6 @@ impl SettingsOwner {
         })
     }
 
-    pub fn remember_created_playlist(
-        &self,
-        source_id: Option<SourceId>,
-        playlist_id: String,
-        current: Option<bool>,
-    ) -> Result<(), String> {
-        self.file.update(|stored| {
-            stored.ui.sidebar.set_pinned(
-                SidebarPin::Playlist {
-                    source_id,
-                    playlist_id,
-                },
-                true,
-            );
-            if let Some(current) = current {
-                stored.ui.new_playlist_current = current;
-            }
-            Ok(())
-        })
-    }
-
     pub fn save(&self, settings: &UiSettings) -> Result<UiSettings, String> {
         self.save_ui(settings)
     }
@@ -894,12 +675,15 @@ impl SettingsOwner {
     ) -> Result<(), String> {
         self.restore(move |stored| edit(&mut stored.ui), false)
     }
+}
 
+#[cfg_attr(feature = "bindings", uniffi::export)]
+impl SettingsOwner {
     pub fn set_download_location(
         &self,
         source_id: SourceId,
         location: Option<downloads::DownloadDirectory>,
-    ) -> Result<(), String> {
+    ) -> Result<(), SettingsError> {
         self.restore(
             move |stored| {
                 stored.ui.set_download_location(source_id, location);
@@ -907,14 +691,20 @@ impl SettingsOwner {
             },
             false,
         )
+        .map_err(Into::into)
     }
+}
 
+impl SettingsOwner {}
+
+#[cfg_attr(feature = "bindings", uniffi::export)]
+impl SettingsOwner {
     pub fn set_download_rule(
         &self,
         source_id: SourceId,
         rule: DownloadRule,
         enabled: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), SettingsError> {
         self.restore(
             move |stored| {
                 let mut rules = stored.ui.download_rules(&source_id);
@@ -924,13 +714,17 @@ impl SettingsOwner {
             },
             false,
         )
+        .map_err(Into::into)
     }
+}
 
+#[cfg_attr(feature = "bindings", uniffi::export)]
+impl SettingsOwner {
     pub fn set_download_quality(
         &self,
         source_id: SourceId,
         quality: playback::StreamQuality,
-    ) -> Result<(), String> {
+    ) -> Result<(), SettingsError> {
         self.restore(
             move |stored| {
                 stored.ui.set_download_quality(source_id, quality);
@@ -938,9 +732,13 @@ impl SettingsOwner {
             },
             false,
         )
+        .map_err(Into::into)
     }
+}
 
-    pub fn clear_download_rules(&self, source_id: SourceId) -> Result<(), String> {
+#[cfg_attr(feature = "bindings", uniffi::export)]
+impl SettingsOwner {
+    pub fn clear_download_rules(&self, source_id: SourceId) -> Result<(), SettingsError> {
         self.restore(
             move |stored| {
                 stored
@@ -950,13 +748,14 @@ impl SettingsOwner {
             },
             false,
         )
+        .map_err(Into::into)
     }
 }
 
 pub(crate) fn platform_secret_store(file: &SettingsFile) -> Arc<dyn SecretStore> {
     let settings = file.load();
     let config_dir = file.config_dir();
-    match settings.ui.secret_storage_mode {
+    match settings.ui.application.secret_storage_mode {
         SecretStorageMode::ConfigFile => Arc::new(CachedSecretStore::new(Arc::new(
             ConfigSecretStore::with_scope(
                 config_dir.join("secrets.json"),
@@ -988,7 +787,7 @@ pub(crate) fn backup_password_store(
     settings: &StoredSettings,
     config_dir: &Path,
 ) -> Arc<dyn SecretStore> {
-    match settings.ui.secret_storage_mode {
+    match settings.ui.application.secret_storage_mode {
         SecretStorageMode::ConfigFile => Arc::new(ConfigSecretStore::with_scope(
             config_dir.join("backup-password.json"),
             settings.secret_scope_id.clone(),
@@ -1489,7 +1288,7 @@ mod tests {
         let next_writer = std::thread::spawn(move || {
             next_file.update(|stored| {
                 let previous_shuffle = stored.ui.shuffle_enabled;
-                stored.ui.private_mode = true;
+                stored.ui.application.private_mode = true;
                 Ok(previous_shuffle)
             })
         });
@@ -1501,7 +1300,7 @@ mod tests {
         assert_eq!(observed.unwrap(), initial);
         let committed = file.load();
         assert!(committed.ui.shuffle_enabled);
-        assert!(committed.ui.private_mode);
+        assert!(committed.ui.application.private_mode);
         assert_eq!(read_startup_settings(&path).unwrap(), committed);
     }
 
@@ -1578,24 +1377,27 @@ mod tests {
             path: Some(path.clone()),
             ..SettingsFile::memory_at(directory.path().to_path_buf())
         };
-        assert!(!file.load().ui.backup.enabled);
+        assert!(!file.load().ui.application.backup.enabled);
         file.update(|stored| {
-            stored.ui.backup.schedule.frequency = backup::BackupFrequency::Daily;
+            stored.ui.application.backup.schedule.frequency = backup::BackupFrequency::Daily;
             Ok(())
         })
         .unwrap();
-        let identity = file.load().ui.backup.schedule.schedule_id;
+        let identity = file.load().ui.application.backup.schedule.schedule_id;
         assert!(!identity.is_empty());
         file.update(|stored| {
-            stored.ui.backup.contents.saved_logins = true;
-            stored.ui.backup.schedule.retention = 0;
+            stored.ui.application.backup.contents.saved_logins = true;
+            stored.ui.application.backup.schedule.retention = 0;
             Ok(())
         })
         .unwrap();
         let restored = read_startup_settings(&path).unwrap();
-        assert_eq!(restored.ui.backup.schedule.schedule_id, identity);
-        assert_eq!(restored.ui.backup.schedule.retention, 2);
-        assert!(restored.ui.backup.contents.saved_logins);
+        assert_eq!(
+            restored.ui.application.backup.schedule.schedule_id,
+            identity
+        );
+        assert_eq!(restored.ui.application.backup.schedule.retention, 2);
+        assert!(restored.ui.application.backup.contents.saved_logins);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1719,5 +1521,40 @@ mod tests {
         load_scrobbling_settings(&file, &secrets);
 
         assert!(file.load().scrobbling_secrets_present);
+    }
+}
+
+#[cfg_attr(feature = "bindings", uniffi::export)]
+impl SettingsOwner {
+    pub fn download_settings(&self, source_id: SourceId) -> downloads::SourceDownloadSettings {
+        self.load().download_settings(&source_id)
+    }
+}
+
+#[cfg_attr(feature = "bindings", uniffi::export)]
+impl SettingsOwner {
+    pub fn suppress_fetched_lyrics(&self, media_uri: String) -> Result<(), SettingsError> {
+        self.restore(
+            move |stored| {
+                stored.ui.lyrics.suppress_auto_lyrics(&media_uri);
+                Ok(())
+            },
+            false,
+        )
+        .map_err(Into::into)
+    }
+}
+
+#[cfg_attr(feature = "bindings", uniffi::export)]
+impl SettingsOwner {
+    pub fn set_theme_accent(&self, theme: String, accent: String) -> Result<(), SettingsError> {
+        self.restore(
+            move |stored| {
+                stored.ui.appearance.theme_accents.insert(theme, accent);
+                Ok(())
+            },
+            false,
+        )
+        .map_err(Into::into)
     }
 }

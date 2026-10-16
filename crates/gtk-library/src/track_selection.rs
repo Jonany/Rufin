@@ -14,15 +14,13 @@ use super::track_model::TrackCollectionModel;
 
 #[derive(Clone)]
 pub struct TrackSelection {
-    input: Rc<dyn Fn(&gtk::Bitset) -> library::QueueInput>,
+    input: Rc<dyn Fn(&gtk::Bitset) -> library::TrackSelection>,
     position: Rc<dyn Fn(&str) -> Option<u32>>,
     selection: PositionSelectionModel,
 }
 
 impl TrackSelection {
-    pub fn new<T: gtk_widgets::library_fields::TrackPresentation>(
-        model: TrackCollectionModel<T>,
-    ) -> Self {
+    pub fn new(model: TrackCollectionModel) -> Self {
         let selection = PositionSelectionModel::new(model.list_model());
         let locate = model.clone();
         Self {
@@ -67,14 +65,16 @@ impl TrackSelection {
     }
 
     pub fn dragged_tracks_for(&self, clicked: &str) -> TrackSelectionSnapshot {
-        self.selected_tracks_for(clicked)
-            .unwrap_or_else(|| TrackSelectionSnapshot {
-                input: library::QueueInput::MediaUris {
-                    order: Arc::from([clicked.to_string()]),
-                    provenance: library::QueueProvenance::Manual,
-                },
-                count: 1,
-            })
+        self.selected_tracks_for(clicked).unwrap_or_else(|| {
+            let positions = gtk::Bitset::new_empty();
+            if let Some(position) = (self.position)(clicked) {
+                positions.add(position);
+            }
+            TrackSelectionSnapshot {
+                input: (self.input)(&positions),
+                count: positions.size() as usize,
+            }
+        })
     }
 }
 
@@ -121,10 +121,7 @@ impl PlaylistEntrySelection {
             playlist: self.model.playlist_key(),
             playlist_name: Arc::clone(&self.playlist_name),
             count: 1,
-            input: library::QueueInput::PlaylistEntries {
-                order: Arc::from([entry]),
-                context_id: format!("playlist-selection:{}", self.model.playlist_key()).into(),
-            },
+            input: library::CatalogQuery::playlist_entries(vec![entry]).selection(),
         }
     }
 

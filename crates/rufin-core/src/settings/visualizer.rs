@@ -1,7 +1,30 @@
 use serde::{Deserialize, Serialize};
 
+pub type VisualizerColors = [[f32; 3]; 2];
+pub type PreferenceIndex = usize;
+
+#[cfg(feature = "bindings")]
+uniffi::custom_type!(PreferenceIndex, u64, {
+    remote,
+    lower: |value| value as u64,
+    try_lift: |value| Ok(usize::try_from(value)?),
+});
+
+#[cfg(feature = "bindings")]
+uniffi::custom_type!(VisualizerColors, Vec<Vec<f32>>, {
+    remote,
+    lower: |value| value.into_iter().map(Vec::from).collect(),
+    try_lift: |value| {
+        let colors = value.into_iter().map(|color| color.try_into()
+            .map_err(|_| uniffi::deps::anyhow::anyhow!("A color needs three components")))
+            .collect::<uniffi::Result<Vec<[f32; 3]>>>()?;
+        colors.try_into().map_err(|_| uniffi::deps::anyhow::anyhow!("A gradient needs two colors"))
+    },
+});
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum VisualizerStyle {
     Segmented,
     Solid,
@@ -27,42 +50,41 @@ impl VisualizerStyle {
     ];
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct VisualizerAppearance {
-    pub style: VisualizerStyle,
-    /// None follows the application's accent. Custom gradients store their two endpoints.
-    pub colors: Option<[[f32; 3]; 2]>,
-    pub spacing: f64,
-    pub opacity: f64,
-    pub sidebar_lyrics_opacity: f64,
-    pub fullscreen_lyrics_opacity: f64,
-    pub rise: f64,
-    pub fall: f64,
-    pub peaks: bool,
-    pub peak_hold: f64,
-    pub peak_fall: f64,
+macro_rules! visualizer_preference_fields {
+    ($callback:ident $(, $args:tt)*) => {
+        $callback! { [$($args)*]
+            style: VisualizerStyle = VisualizerStyle::Rounded => set_visualizer_style;
+            /// None follows the application's accent. Custom gradients store their two endpoints.
+            colors: Option<VisualizerColors> = None => set_visualizer_colors;
+            spacing: f64 = 1.0 => set_visualizer_spacing;
+            opacity: f64 = 1.0 => set_visualizer_opacity;
+            sidebar_lyrics_opacity: f64 = 0.48 => set_visualizer_sidebar_lyrics_opacity;
+            fullscreen_lyrics_opacity: f64 = 0.25 => set_visualizer_fullscreen_lyrics_opacity;
+            rise: f64 = 0.72 => set_visualizer_rise;
+            fall: f64 = 0.16 => set_visualizer_fall;
+            peaks: bool = false => set_visualizer_peaks;
+            peak_hold: f64 = 0.5 => set_visualizer_peak_hold;
+            peak_fall: f64 = 0.6 => set_visualizer_peak_fall;
+        }
+    };
 }
 
-impl Default for VisualizerAppearance {
-    fn default() -> Self {
-        Self {
-            style: VisualizerStyle::Rounded,
-            colors: None,
-            spacing: 1.0,
-            opacity: 1.0,
-            sidebar_lyrics_opacity: 0.48,
-            fullscreen_lyrics_opacity: 0.25,
-            rise: 0.72,
-            fall: 0.16,
-            peaks: false,
-            peak_hold: 0.5,
-            peak_fall: 0.6,
+macro_rules! define_visualizer_appearance {
+    ([] $( $(#[$attribute:meta])* $field:ident: $ty:ty = $default:expr => $setter:ident; )*) => {
+        #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+        #[cfg_attr(feature = "bindings", derive(uniffi::Record))]
+        #[serde(default)]
+        pub struct VisualizerAppearance { $( $(#[$attribute])* pub $field: $ty, )* }
+        impl Default for VisualizerAppearance {
+            fn default() -> Self { Self { $( $field: $default, )* } }
         }
-    }
+    };
 }
+visualizer_preference_fields!(define_visualizer_appearance);
+pub(super) use visualizer_preference_fields;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct VisualizerPreset {
     pub appearance: VisualizerAppearance,
 }
@@ -102,11 +124,12 @@ impl VisualizerPreset {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct VisualizerSettings {
     pub fps_limit: u32,
     pub appearance: VisualizerAppearance,
     pub presets: Vec<VisualizerPreset>,
-    pub selected_preset: Option<usize>,
+    pub selected_preset: Option<PreferenceIndex>,
 }
 
 impl Default for VisualizerSettings {

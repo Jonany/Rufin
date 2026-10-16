@@ -29,7 +29,7 @@ pub struct LocalAccessEditor {
     folder: RefCell<Option<PathBuf>>,
     server_prefix: glib::WeakRef<adw::EntryRow>,
     local_prefix: Option<glib::WeakRef<adw::EntryRow>>,
-    sample_source_path: Option<String>,
+    sample_source_path: RefCell<Option<String>>,
     wait_until_mapped: bool,
     operation: RefCell<LocalAccessOperation>,
     on_success: Rc<dyn Fn()>,
@@ -52,7 +52,7 @@ impl LocalAccessEditor {
             folder: RefCell::new(folder),
             server_prefix: server_prefix.downgrade(),
             local_prefix: local_prefix.map(|row| row.downgrade()),
-            sample_source_path,
+            sample_source_path: RefCell::new(sample_source_path),
             wait_until_mapped,
             operation: RefCell::new(LocalAccessOperation::Editing),
             on_success,
@@ -81,7 +81,11 @@ impl LocalAccessEditor {
     }
 
     pub fn sample_source_path(&self) -> Option<String> {
-        self.sample_source_path.clone()
+        self.sample_source_path.borrow().clone()
+    }
+
+    pub fn set_sample_source_path(&self, path: Option<String>) {
+        self.sample_source_path.replace(path);
     }
 
     pub fn begin_editing(&self) {
@@ -192,28 +196,23 @@ impl LocalAccessEditor {
         ) else {
             return;
         };
-        let receiver = self.source.save_local_access(input, self.wait_until_mapped);
+        let source = self.source.clone();
+        let wait_until_mapped = self.wait_until_mapped;
         self.operation.replace(LocalAccessOperation::Pending);
         update();
         let editor = Rc::downgrade(self);
         let update = Rc::downgrade(&update);
         glib::spawn_future_local(async move {
-            let response = receiver.recv().await;
+            let response = source.save_local_access(input, wait_until_mapped).await;
             let (Some(editor), Some(update)) = (editor.upgrade(), update.upgrade()) else {
                 return;
             };
             match response {
-                Ok(Ok(())) => (editor.on_success)(),
-                Ok(Err(error)) => {
+                Ok(()) => (editor.on_success)(),
+                Err(error) => {
                     editor
                         .operation
-                        .replace(LocalAccessOperation::Failed(error));
-                    update();
-                }
-                Err(_) => {
-                    editor.operation.replace(LocalAccessOperation::Failed(tr(
-                        "Local file mapping is no longer available",
-                    )));
+                        .replace(LocalAccessOperation::Failed(error.to_string()));
                     update();
                 }
             }

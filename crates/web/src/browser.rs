@@ -53,6 +53,14 @@ struct Row<'a> {
 }
 
 impl Row<'_> {
+    fn preview_tiles(&self) -> Vec<&str> {
+        let previews = &self.data["artwork_previews"];
+        let count = self.number("artwork_count").max(1) as usize;
+        (0..if count > 1 { 4 } else { 1 })
+            .map(|part| previews[part % count].as_str().unwrap_or_default())
+            .collect()
+    }
+
     fn href(&self, kind: &str) -> String {
         let mut query = self.parameters.clone();
         query.remove("offset");
@@ -95,8 +103,13 @@ impl Row<'_> {
         if kind == "track" {
             value["uris"] = json!([self.data["uri"]]);
         }
+        if kind == "artist" {
+            value["album_artists"] = self.data["album_artists"].clone();
+        }
         for field in ["source", "folder"] {
-            if let Some(text) = self.parameters.get(field) {
+            if (field != "folder" || matches!(kind, "track" | "smart-playlist"))
+                && let Some(text) = self.parameters.get(field)
+            {
                 value[field] = json!(text);
             }
         }
@@ -162,6 +175,7 @@ struct Library<'a> {
     offset: usize,
     total: String,
     album_tracks: bool,
+    activity_sensitive: bool,
     disc_headers: HashMap<usize, String>,
 }
 
@@ -209,6 +223,22 @@ mod disc_tests {
             assert_eq!(html.matches("data-row=").count(), 1);
             assert!(html.contains("class=\"number\">7</td>"));
         }
+        let preview = "data:image/png;base64,iVBORw0KGgo=";
+        let html = render(
+            &HashMap::new(),
+            &json!({"albums":[{"id":1,"title":"Album","artwork_previews":[preview]}]}),
+            "",
+        )
+        .unwrap();
+        assert!(html.contains(&format!("<img src=\"{preview}\" alt=\"\" />")));
+        assert!(!html.contains("preview=true"));
+        let html = render(&HashMap::new(), &json!({"playlists":[{"id":1,"name":"Playlist","artwork_count":2,"artwork_previews":[preview,null]}]}), "").unwrap();
+        assert_eq!(html.matches("class=\"cover-quadrant\"").count(), 4);
+        assert_eq!(
+            html.matches(&format!("<img src=\"{preview}\" alt=\"\" />"))
+                .count(),
+            2
+        );
     }
 }
 
@@ -293,6 +323,7 @@ pub(super) fn render(
                 .map(|count| count.to_string())
                 .unwrap_or_default(),
             album_tracks: value["album_tracks"].as_bool().unwrap_or(false),
+            activity_sensitive: value["activity_sensitive"].as_bool().unwrap_or(false),
             disc_headers: value["disc_sections"]
                 .as_array()
                 .into_iter()
@@ -601,7 +632,7 @@ async fn icon(
 }
 
 struct QueueRow {
-    pub id: String,
+    pub position: u64,
     pub title: String,
     pub artist: String,
 }
@@ -621,6 +652,7 @@ struct Page {
     pub current_favorite: bool,
     pub artist: String,
     pub album: String,
+    pub preview: String,
     pub controls: Value,
     pub position: u64,
     pub duration: u64,
@@ -677,8 +709,11 @@ impl Page {
             )
     }
 
-    pub fn current_id(&self) -> &str {
-        self.controls["current"]["id"].as_str().unwrap_or_default()
+    pub fn current_position(&self) -> String {
+        self.controls["current"]["position"]
+            .as_u64()
+            .map(|position| position.to_string())
+            .unwrap_or_default()
     }
     pub fn has_current(&self) -> bool {
         !self.controls["current"].is_null()
@@ -734,6 +769,7 @@ impl Page {
             .unwrap_or(match self.view() {
                 "album" => "track_number",
                 "playlist" => "position",
+                "smart-playlist" => "definition",
                 _ => "title",
             })
     }
@@ -804,6 +840,7 @@ async fn index(
         current_favorite: false,
         artist: String::new(),
         album: String::new(),
+        preview: String::new(),
         controls: Value::Null,
         position: 0,
         duration: 0,
@@ -853,17 +890,21 @@ async fn index(
         parameters.insert("limit".into(), "48".into());
         page.parameters = parameters.clone();
         let current = products.playback.updates.current();
-        let playback = playback_json(current.as_deref());
+        let playback = playback_json(&products, current.as_deref(), true);
+        page.preview = playback["current"]["track"]["artwork_previews"][0]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
         page.position = playback["position_ms"].as_u64().unwrap_or_default();
         page.duration = playback["duration_ms"].as_u64().unwrap_or_default();
-        let queue = queue_json(current.as_deref(), 5);
+        let queue = queue_json(&products, current.as_deref(), 5);
         page.queue_total = queue["total"].as_u64().unwrap_or_default() as usize;
         page.queue = queue["window"]
             .as_array()
             .into_iter()
             .flatten()
             .map(|row| QueueRow {
-                id: row["id"].as_str().unwrap_or_default().into(),
+                position: row["position"].as_u64().unwrap_or_default(),
                 title: row["track"]["title"].as_str().unwrap_or_default().into(),
                 artist: row["track"]["artist"].as_str().unwrap_or_default().into(),
             })

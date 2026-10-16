@@ -1,5 +1,7 @@
 package io.github.screwys.rufin.ui
 
+import io.github.screwys.rufin.shared.rufin_core.Route
+import io.github.screwys.rufin.browse.*
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -21,9 +23,9 @@ import kotlinx.coroutines.CancellationException
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun MediaNavigationSheet(metadata: AndroidPlayerMetadata?, player: PlayerConnection,
-    onNavigate: (String, String, String?) -> Unit, onDismiss: () -> Unit,
+    onNavigate: (Route, String, String?) -> Unit, onDismiss: () -> Unit,
     mediaUri: String? = metadata?.mediaUri,
-    originRoute: String? = null,
+    originRoute: Route? = null,
 ) {
     val bridge = player.bridge
     val loaded by produceState<Result<AndroidPlayerMetadata?>?>(metadata?.let { Result.success(it) }, metadata, mediaUri, originRoute, bridge) {
@@ -35,7 +37,6 @@ internal fun MediaNavigationSheet(metadata: AndroidPlayerMetadata?, player: Play
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         val resolved = loaded?.getOrNull()
         val links = resolved?.artistLinks.orEmpty().map { "Artist" to it } + resolved?.albumLinks.orEmpty().map { "Album" to it }
-        ArtworkReadyContent(key = resolved?.mediaUri, modifier = Modifier.fillMaxWidth()) {
         LazyColumn(Modifier.fillMaxWidth().heightIn(max = 440.dp), contentPadding = PaddingValues(bottom = 24.dp)) {
             if (loaded == null) item {
                 Box(Modifier.fillMaxWidth().height(96.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
@@ -54,7 +55,6 @@ internal fun MediaNavigationSheet(metadata: AndroidPlayerMetadata?, player: Play
                     leadingContent = { Artwork(artwork, Modifier.size(40.dp).clip(RoundedCornerShape(8.dp))) },
                     modifier = Modifier.clickable { onDismiss(); onNavigate(link.route, link.title, resolved?.sourceId) })
             }
-        }
         }
     }
 }

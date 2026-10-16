@@ -3,11 +3,7 @@ use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use gtk_library::activity::ActivityCollections;
 use gtk_player::fullscreen_background::FullscreenBackground;
-use gtk_widgets::{
-    artwork::{ArtworkTile, cover_fetch_size_for_display},
-    mounted_route::route_current_track,
-    route::Route,
-};
+use gtk_widgets::{mounted_route::route_current_track, route::Route};
 use library::{ActivityOverview, CalendarActivityPeriod};
 use localization::{tr, tr_with};
 use rufin_core::activity::{ReportAppearance, percentage_change, period_key, period_label};
@@ -46,7 +42,8 @@ pub(super) struct ActivityView {
     changing_period: Cell<bool>,
     data: RefCell<Option<ActivityOverview>>,
     task: RefCell<Option<tokio::task::AbortHandle>>,
-    bg_tile: ArtworkTile,
+    background_texture: RefCell<Option<gdk::Texture>>,
+    background_task: RefCell<Option<glib::JoinHandle<()>>>,
     shell: Weak<Shell>,
 }
 
@@ -56,7 +53,9 @@ impl Drop for ActivityView {
         if let Some(task) = self.task.get_mut().take() {
             task.abort();
         }
-        self.bg_tile.cancel_artwork_request();
+        if let Some(task) = self.background_task.get_mut().take() {
+            task.abort();
+        }
     }
 }
 
@@ -67,6 +66,7 @@ impl Shell {
             .settings
             .current
             .borrow()
+            .application
             .activity_overview
             .startup_periods(&now);
         if periods.iter().all(Option::is_none) {
@@ -85,13 +85,13 @@ impl Shell {
             let Some(shell) = weak.upgrade() else {
                 return;
             };
-            let period = periods.into_iter().flatten().find(|period| match period {
-                CalendarActivityPeriod::Month { .. } => months.contains(&period_key(*period)),
-                CalendarActivityPeriod::Year(year) => months
-                    .iter()
-                    .any(|month| month.starts_with(&format!("{year}-"))),
-                CalendarActivityPeriod::Lifetime => false,
-            });
+            let period = shell
+                .settings
+                .current
+                .borrow()
+                .application
+                .activity_overview
+                .startup_period(&now, &months);
             let Some(period) = period else {
                 return;
             };
@@ -99,14 +99,8 @@ impl Shell {
             shell
                 .settings
                 .update_app_settings("automatic activity overview", |settings| {
-                    let settings = &mut settings.activity_overview;
-                    match period {
-                        CalendarActivityPeriod::Month { .. } => {
-                            settings.opened_month = Some(period_key(period))
-                        }
-                        CalendarActivityPeriod::Year(year) => settings.opened_year = Some(year),
-                        CalendarActivityPeriod::Lifetime => {}
-                    }
+                    let settings = &mut settings.application.activity_overview;
+                    settings.mark_opened(period);
                     true
                 });
         });
@@ -273,7 +267,8 @@ impl ActivityView {
             changing_period: Cell::new(false),
             data: RefCell::new(None),
             task: RefCell::new(None),
-            bg_tile: ArtworkTile::new(256),
+            background_texture: RefCell::new(None),
+            background_task: RefCell::new(None),
             shell: Rc::downgrade(shell),
         });
         let weak = Rc::downgrade(shell);
@@ -294,7 +289,13 @@ impl ActivityView {
             glib::Propagation::Proceed
         });
         view.root.add_controller(key);
-        let settings = shell.settings.current.borrow().activity_overview.clone();
+        let settings = shell
+            .settings
+            .current
+            .borrow()
+            .application
+            .activity_overview
+            .clone();
         background_image.set_sensitive(settings.dynamic_background);
         let image_setting = background_image.downgrade();
         dynamic_background.connect_active_notify(move |row| {
@@ -337,7 +338,7 @@ impl ActivityView {
                 shell
                     .settings
                     .update_app_settings("listening overview", |settings| {
-                        let settings = &mut settings.activity_overview;
+                        let settings = &mut settings.application.activity_overview;
                         let target = match index {
                             0 => &mut settings.autoplay_first_track,
                             1 => &mut settings.dynamic_background,
@@ -375,7 +376,8 @@ impl ActivityView {
             shell
                 .settings
                 .update_app_settings("listening overview", |settings| {
-                    settings.activity_overview.result_count = counts[row.selected() as usize];
+                    settings.application.activity_overview.result_count =
+                        counts[row.selected() as usize];
                     true
                 });
             view.apply_data();
@@ -414,14 +416,6 @@ impl ActivityView {
                 view.export_png();
             }
         });
-        let weak = Rc::downgrade(&view);
-        view.bg_tile
-            .drag_paintable_source()
-            .connect_paintable_notify(move |_| {
-                if let Some(view) = weak.upgrade() {
-                    view.refresh_background();
-                }
-            });
         view.refresh_background();
         minimize.grab_focus();
         view
@@ -548,6 +542,9 @@ impl ActivityView {
         if let Some(task) = self.task.borrow_mut().take() {
             task.abort();
         }
+        if let Some(task) = self.background_task.borrow_mut().take() {
+            task.abort();
+        }
         self.export.set_sensitive(false);
         if self.data.borrow().is_none() || !self.report.is_visible() {
             self.report.set_visible(false);
@@ -560,9 +557,11 @@ impl ActivityView {
         let db = shell.products.library.clone();
         let (sender, receiver) = async_channel::bounded(1);
         let task = shell.products.runtime.spawn(async move {
-            let result = db
-                .activity_overview(period, 10, &library::ReadCancellation::new())
-                .await;
+            let result = async {
+                db.activity_overview(period, 10, &library::ReadCancellation::new())
+                    .await
+            }
+            .await;
             let _ = sender.send(result).await;
         });
         self.task.replace(Some(task.abort_handle()));
@@ -579,7 +578,7 @@ impl ActivityView {
             }
             match result {
                 Ok(data) => {
-                    let top = data.tracks.first().map(|row| row.media_uri.clone());
+                    let top = data.tracks.first().map(|row| row.track_key);
                     view.transition.skip();
                     let animate = view.report.is_visible() && view.report.is_mapped();
                     if animate {
@@ -588,6 +587,16 @@ impl ActivityView {
                         view.outgoing_content
                             .set_height_request(view.content.height());
                     }
+                    let artwork_changed = view
+                        .data
+                        .borrow()
+                        .as_ref()
+                        .and_then(|data| data.tracks.first())
+                        .and_then(|row| row.artwork_binding.as_ref())
+                        != data
+                            .tracks
+                            .first()
+                            .and_then(|row| row.artwork_binding.as_ref());
                     let first_artwork = data
                         .tracks
                         .first()
@@ -595,14 +604,25 @@ impl ActivityView {
                         .map(artwork::ArtworkBinding::opaque)
                         .unwrap_or_default();
                     view.data.replace(Some(data));
-                    if let Some(shell) = view.shell.upgrade() {
-                        let fetch_size = cover_fetch_size_for_display(256);
-                        shell.artwork.bind_artwork_tile(
-                            &view.bg_tile,
-                            first_artwork,
-                            256,
-                            fetch_size,
-                        );
+                    if (artwork_changed || view.background_texture.borrow().is_none())
+                        && let Some(shell) = view.shell.upgrade()
+                    {
+                        view.background_texture.borrow_mut().take();
+                        view.refresh_background();
+                        let artwork = Rc::clone(&shell.artwork);
+                        let weak = Rc::downgrade(&view);
+                        let task =
+                            glib::MainContext::ref_thread_default().spawn_local(async move {
+                                let texture = artwork.load_texture(first_artwork, 256).await;
+                                let Some(view) = weak.upgrade() else { return };
+                                if view.selected_period() == Some(period) {
+                                    view.background_texture.replace(texture);
+                                    view.refresh_background();
+                                }
+                            });
+                        if let Some(previous) = view.background_task.replace(Some(task)) {
+                            previous.abort();
+                        }
                     }
                     view.apply_data();
                     if animate {
@@ -615,13 +635,14 @@ impl ActivityView {
                             .settings
                             .current
                             .borrow()
+                            .application
                             .activity_overview
                             .autoplay_first_track
                         && let Some(uri) = top
                     {
                         (shell.media_menus.play_target)(
-                            &rufin_core::playback::PlaybackTarget::Track(uri),
-                            playback::QueuePlacement::Now,
+                            &gtk_widgets::selection::track_play_request(uri),
+                            rufin_core::playback::QueuePlacement::Now,
                             false,
                         );
                     }
@@ -640,7 +661,13 @@ impl ActivityView {
         let Some(shell) = self.shell.upgrade() else {
             return;
         };
-        let settings = shell.settings.current.borrow().activity_overview.clone();
+        let settings = shell
+            .settings
+            .current
+            .borrow()
+            .application
+            .activity_overview
+            .clone();
         self.apply_display_settings();
         let data = self.data.borrow();
         let Some(data) = data.as_ref() else {
@@ -676,11 +703,12 @@ impl ActivityView {
             change.set_text(&comparison);
             change.set_visible(settings.show_comparison && !comparison.is_empty());
         }
-        let maximum = data.genres.first().map_or(1, |(_, count)| *count).max(1) as f64;
+        let maximum = data.genres.first().map_or(1, |genre| genre.plays).max(1) as f64;
         for (index, (row, name, count, bar)) in self.genre_rows.iter().enumerate() {
             let value = data.genres.get(index).filter(|_| index < limit);
             row.set_visible(value.is_some());
-            if let Some((genre, plays)) = value {
+            if let Some(genre) = value {
+                let (genre, plays) = (&genre.name, &genre.plays);
                 name.set_text(genre);
                 count.set_text(&plays.to_string());
                 bar.set_fraction(*plays as f64 / maximum);
@@ -698,7 +726,13 @@ impl ActivityView {
         let Some(shell) = self.shell.upgrade() else {
             return;
         };
-        let settings = shell.settings.current.borrow().activity_overview.clone();
+        let settings = shell
+            .settings
+            .current
+            .borrow()
+            .application
+            .activity_overview
+            .clone();
         if let Some(period) = self.selected_period() {
             let label = period_label(period);
             let args = [("period", label.as_str())];
@@ -734,13 +768,21 @@ impl ActivityView {
         let Some(shell) = self.shell.upgrade() else {
             return;
         };
-        let settings = shell.settings.current.borrow().activity_overview.clone();
+        let settings = shell
+            .settings
+            .current
+            .borrow()
+            .application
+            .activity_overview
+            .clone();
         self.background.set_visible(settings.dynamic_background);
         if settings.dynamic_background {
-            self.background.update(
-                self.bg_tile.drag_paintable_source().paintable(),
-                settings.background_image,
-            );
+            let texture = self
+                .background_texture
+                .borrow()
+                .clone()
+                .map(|texture| texture.upcast());
+            self.background.update(texture, settings.background_image);
         }
     }
 
@@ -754,7 +796,13 @@ impl ActivityView {
         let Some(data) = self.data.borrow().clone() else {
             return;
         };
-        let settings = shell.settings.current.borrow().activity_overview.clone();
+        let settings = shell
+            .settings
+            .current
+            .borrow()
+            .application
+            .activity_overview
+            .clone();
         let rgb = |color: gdk::RGBA| {
             [color.red(), color.green(), color.blue()]
                 .map(|channel| (channel * 255.0).round() as u8)

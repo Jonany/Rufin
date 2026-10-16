@@ -1,5 +1,7 @@
 package io.github.screwys.rufin.browse
 
+import io.github.screwys.rufin.shared.rufin_core.ConfiguredSources
+import io.github.screwys.rufin.shared.rufin_core.Route
 import io.github.screwys.rufin.app.RufinConnection
 
 import androidx.compose.runtime.*
@@ -16,13 +18,13 @@ internal class BrowseOptions {
     var filter by mutableStateOf("")
     var favoritesOnly by mutableStateOf(false)
     var downloadedOnly by mutableStateOf(false)
-    var sort by mutableStateOf("")
+    var sort by mutableStateOf<io.github.screwys.rufin.shared.rufin_core.LibraryField?>(null)
     var descending by mutableStateOf(false)
     var displaySettings by mutableStateOf<AndroidBrowseDisplay?>(null)
 }
 
 internal data class BrowseLocation(
-    val route: String, val title: String, val kind: String = "",
+    val route: Route, val title: String, val kind: String = "",
     val options: BrowseOptions = BrowseOptions(),
     val playbackTitle: String = title,
 )
@@ -77,15 +79,6 @@ internal class BrowseConnection(private val connection: RufinConnection, scope: 
     var filter: String
         get() = currentOptions.filter
         set(value) { currentOptions.filter = value }
-    var sort: String
-        get() = currentOptions.sort
-        set(value) { currentOptions.sort = value }
-    var descending: Boolean
-        get() = currentOptions.descending
-        set(value) { currentOptions.descending = value }
-    val sortFields get() = visiblePage?.sortFields.orEmpty()
-    val sortSelection get() = visiblePage?.sortSelection
-    val displaySettings get() = currentOptions.displaySettings ?: visiblePage?.displaySettings
     val scrollSections get() = visiblePage?.scrollSections.orEmpty()
     val homeRows get() = visiblePage?.homeRows.orEmpty()
     val loading get() = if (section == AppSection.Search) searchLoading else visiblePage?.loading == true
@@ -99,7 +92,7 @@ internal class BrowseConnection(private val connection: RufinConnection, scope: 
         ?.let { BrowseLocation(it.route, it.title, it.id, optionsFor(it.id)) }
 
     private data class SearchContext(val section: AppSection, val text: String,
-        val library: AndroidLibrary?, val source: String?, val revision: ULong?)
+        val library: AndroidLibrary?, val source: ConfiguredSources?, val revision: ULong?)
 
     init {
         scope.launch {
@@ -122,7 +115,7 @@ internal class BrowseConnection(private val connection: RufinConnection, scope: 
         }
         scope.launch {
             snapshotFlow { SearchContext(section, searchText, library,
-                connection.libraryState?.sourceId, connection.libraryState?.revision) }
+                connection.sources, connection.catalogRevision?.catalog) }
                 .debounce(250).collectLatest { context ->
                     if (context.section != AppSection.Search || context.text.isBlank() || context.library == null) {
                         searchRows = emptyList()
@@ -131,11 +124,13 @@ internal class BrowseConnection(private val connection: RufinConnection, scope: 
                     }
                     searchLoading = true
                     try {
-                        val rows = context.library.search(context.text)
-                        val order = rows.filter { it.kind == "track" }.map { it.mediaUri }
-                        val capture = "search:${context.source}:${context.text}"
-                        searchRows = rows.mapIndexed { index, row ->
-                            BrowseItem(row, index.toULong(), null, searchOrder = order, searchContext = capture, contextTitle = context.text)
+                        searchRows = withContext(Dispatchers.Default) {
+                            val rows = context.library.search(context.text)
+                            val order = rows.filter { it.kind == "track" }.map { it.mediaUri }
+                            val capture = "search:${context.source?.selectedSourceId}:${context.text}"
+                            rows.mapIndexed { index, row ->
+                                BrowseItem(row, index.toULong(), null, searchOrder = order, searchContext = capture, contextTitle = context.text)
+                            }
                         }
                     } catch (cancelled: CancellationException) { throw cancelled }
                     catch (error: Exception) { connection.runAction { throw error } }
@@ -176,29 +171,29 @@ internal class BrowseConnection(private val connection: RufinConnection, scope: 
 
     fun chooseRoot(id: String) { rootId = id; details = emptyList() }
     fun back() { details = details.dropLast(1) }
-    fun folderAncestor(route: String, title: String) {
+    fun folderAncestor(route: Route, title: String) {
         val index = details.indexOfLast { it.route == route }
         if (index >= 0) details = details.take(index + 1)
         else if (routes.any { it.id == "Folders" && it.route == route }) chooseRoot("Folders")
         else details = details.dropLast(1) + BrowseLocation(route, title, "folder", currentOptions)
     }
-    fun openRoute(route: String, title: String, kind: String = "", playbackTitle: String = title) {
+    fun openRoute(route: Route, title: String, kind: String = "", playbackTitle: String = title) {
         section = AppSection.Browse
         val options = BrowseOptions().also { it.category = if (kind in listOf("artist", "ArtistDetail", "AlbumArtistDetail", "ArtistDiscography", "AlbumArtistDiscography")) "albums" else "tracks" }
         details = details + BrowseLocation(route, title, kind, options, playbackTitle)
     }
-    fun openLinkedRoute(route: String, title: String, sourceId: String?) {
+    fun openLinkedRoute(route: Route, title: String, sourceId: String?) {
         if (sourceId == null || sourceId == connection.sources?.selectedSourceId) {
-            openRoute(route, title, library?.routeKind(route).orEmpty())
+            openRoute(route, title, route.kind)
         } else connection.runAction {
-            library?.selectSource(sourceId)
-            openRoute(route, title, library?.routeKind(route).orEmpty())
+            connection.sourceOwner?.selectSource(sourceId)
+            openRoute(route, title, route.kind)
         }
     }
     fun open(item: BrowseItem) {
         val route = item.row.detailRoute ?: return play(item)
         connection.runAction {
-            item.row.sourceId?.takeIf { it != connection.sources?.selectedSourceId }?.let { source -> library?.selectSource(source) }
+            item.row.sourceId?.takeIf { it != connection.sources?.selectedSourceId }?.let { source -> connection.sourceOwner?.selectSource(source) }
             section = AppSection.Browse
             val options = BrowseOptions().also {
                 it.category = if (item.row.kind == "artist") "albums" else "tracks"
@@ -225,7 +220,9 @@ internal class BrowseConnection(private val connection: RufinConnection, scope: 
         if (item.searchContext == null) return
         val bridge = library ?: return
         connection.runAction {
-            if (withContext(Dispatchers.IO) { bridge.rememberSearchResult(item.row) }) {
+            if (withContext(Dispatchers.IO) { bridge.rememberSearchResult(io.github.screwys.rufin.shared.rufin_core.RecentSearchResult(
+                io.github.screwys.rufin.shared.rufin_core.RecentSearchKind.valueOf(item.row.kind.uppercase()),
+                item.row.mediaUri, item.row.title, item.row.subtitle, item.row.artworkIdentity)) }) {
                 recentSearchRows = loadRecentSearches(bridge)
             }
         }
@@ -253,7 +250,8 @@ internal class BrowseConnection(private val connection: RufinConnection, scope: 
             library?.playRows("pin:${item.row.key}", listOf(item.row.mediaUri), 0UL, placement, shuffled, translate("Pins"))
             return@playRequest
         }
-        if (item.query != null) item.query.play(item.index, item.row.mediaUri, placement, shuffled, item.contextTitle)
+        if (item.query != null) item.query.play(item.index, item.row.mediaUri, item.row.trackKey, item.row.key,
+            item.row.albumKey, item.row.albumMediaUri, item.row.album, placement, shuffled, item.contextTitle)
         else {
             val order = item.searchOrder ?: listOf(item.row.mediaUri)
             library?.playRows(item.searchContext ?: "track:${item.row.mediaUri}", order,
@@ -266,7 +264,7 @@ internal class BrowseConnection(private val connection: RufinConnection, scope: 
         val value = !connection.projectedFavorite(item.row.kind, item.row.mediaUri, item.row.favorite)
         connection.setFavoriteIntent(item.row.kind, item.row.mediaUri, value)
         connection.runAction {
-            try { library?.favorite(item.row.kind, item.row.mediaUri, value) }
+            try { connection.sourceOwner?.setFavoriteWithResult(favoriteTarget(item.row.kind, item.row.mediaUri), value) }
             finally {
                 connection.releaseFavoriteIntent(item.row.kind, item.row.mediaUri, value)
             }

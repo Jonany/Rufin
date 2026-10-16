@@ -4,7 +4,7 @@
 //! away from GTK, then builds and mounts its GTK model. Home and playlist
 //! detail have narrow point-update hooks because those operations are
 //! intentionally visible without remounting the whole page.
-
+use rufin_core::browse::{BrowseRequest, library_list_key};
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::rc::Rc;
@@ -20,19 +20,16 @@ use tracing::{debug, warn};
 use super::Shell;
 use super::navigation::update_navigation_selection;
 use super::route_position::{
-    RoutePositionKey, RoutePositionMemory, prepare_route_position_before_snapshot,
+    RoutePosition, RoutePositionKey, RoutePositionMemory, RouteSurface, mount_route_surface,
 };
 use crate::{LibraryListKey, LibraryListSettings};
+use gtk_library::NamedDetailId;
 use gtk_library::route_layout::{primary_route_scroll_adjustment, route_boundary};
-use gtk_library::{
-    NamedDetailId, load_artist_discography, load_artist_overview, load_artist_tracks,
-    load_named_detail, load_smart_playlist_detail,
-};
 use gtk_widgets::mounted_route::*;
 use gtk_widgets::route::{CollectionCategory, Route};
 use gtk_widgets::selection::{PlaylistEntrySelectionSnapshot, TrackSelectionSnapshot};
 
-const SLOW_ROUTE_RENDER_MS: u64 = 250;
+const SLOW_ROUTE_REVEAL_MS: u64 = 250;
 
 type RouteTiming = Option<Instant>;
 
@@ -97,7 +94,6 @@ fn route_is_current(shell: &Shell, route: &Route, source: SourceKey) -> bool {
 pub(crate) struct RouteViewport {
     pub(super) route_host: gtk::Stack,
     route_loading: gtk::Box,
-    route_cover_generation: Cell<u64>,
     mounted_route: RefCell<Option<MountedRouteEntry>>,
     position_memory: RefCell<RoutePositionMemory>,
     catalog: RefCell<Option<Rc<gtk_library::CatalogUi>>>,
@@ -107,8 +103,9 @@ pub(crate) struct RouteViewport {
 
 struct MountedRouteEntry {
     route: Route,
+    load_failed: bool,
     view: MountedRoute,
-    surface: gtk::Widget,
+    surface: RouteSurface,
     position_key: Option<RoutePositionKey>,
     scroll_adjustment: Option<gtk::Adjustment>,
 }
@@ -118,7 +115,6 @@ impl RouteViewport {
         Self {
             route_host,
             route_loading,
-            route_cover_generation: Cell::new(0),
             mounted_route: RefCell::new(None),
             position_memory: RefCell::new(RoutePositionMemory::default()),
             catalog: RefCell::new(None),
@@ -185,31 +181,21 @@ impl RouteStack {
 
 impl Shell {
     fn route_seed_window(&self, route: &Route) -> library::RouteSeedWindow {
-        let mounted_relative = self
-            .route_viewport
-            .mounted_route
-            .borrow()
-            .as_ref()
-            .filter(|entry| entry.route == *route)
-            .and_then(|entry| entry.scroll_adjustment.as_ref())
-            .map(|adjustment| {
-                let scrollable = (adjustment.upper() - adjustment.page_size()).max(0.0);
-                if scrollable <= f64::EPSILON {
-                    0.0
-                } else {
-                    (adjustment.value() / scrollable).clamp(0.0, 1.0)
-                }
+        let mounted = self.route_viewport.mounted_route.borrow();
+        let current = mounted.as_ref().filter(|entry| entry.route == *route);
+        let position = current
+            .and_then(|entry| {
+                entry.scroll_adjustment.as_ref().map(|adjustment| {
+                    RoutePosition::capture(adjustment, entry.view.item_scroll().as_ref())
+                })
+            })
+            .or_else(|| {
+                self.route_viewport
+                    .position_memory
+                    .borrow_mut()
+                    .restore(&RoutePositionKey::new(route.clone()))
             });
-        let relative = mounted_relative.or_else(|| {
-            self.route_viewport
-                .position_memory
-                .borrow_mut()
-                .restore(&RoutePositionKey::new(route.clone()))
-                .map(|position| position.relative())
-        });
-        relative.map_or_else(library::RouteSeedWindow::top, |relative| {
-            library::RouteSeedWindow::relative(relative)
-        })
+        position.map_or_else(library::RouteSeedWindow::top, RoutePosition::window)
     }
 
     fn queue_application_route<T, E, F, Fut, B>(
@@ -242,10 +228,12 @@ impl Shell {
                 Ok(Ok(rows)) => rows,
                 Ok(Err(error)) => {
                     warn!(%error, ?route, context, "failed to prepare route");
+                    shell.show_route_load_error(route, None, render_started);
                     return;
                 }
                 Err(error) => {
                     warn!(%error, ?route, context, "route preparation task failed");
+                    shell.show_route_load_error(route, None, render_started);
                     return;
                 }
             };
@@ -279,35 +267,28 @@ impl Shell {
         let source_id = selected.source_id.clone();
         let window = self.route_seed_window(&route);
         let (generation, cancellation) = self.begin_root_order_read();
-        let task = selected.runtime.spawn(load(window, cancellation));
+        let task = self.products.runtime.spawn(load(window, cancellation));
         let shell = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let result = task.await;
             let Some(shell) = shell.upgrade() else { return };
-            if !shell.finish_root_order_read(generation) {
+            if !shell.finish_root_order_read(generation)
+                || !route_is_current(&shell, &route, source)
+            {
                 return;
             }
             let prepared = match result {
-                Ok(Ok(prepared)) => Some(prepared),
+                Ok(Ok(prepared)) => prepared,
                 Ok(Err(error)) => {
                     warn!(%error, ?route, context, "failed to prepare route");
-                    None
+                    shell.show_route_load_error(route, Some(source_id), render_started);
+                    return;
                 }
                 Err(error) => {
                     warn!(%error, ?route, context, "route preparation task failed");
-                    None
+                    shell.show_route_load_error(route, Some(source_id), render_started);
+                    return;
                 }
-            };
-            if !route_is_current(&shell, &route, source) {
-                return;
-            }
-            let Some(prepared) = prepared else {
-                shell.replace_mounted_route(route, Some(source_id), render_started, |_| {
-                    MountedRoute::static_widget(gtk_library::route_layout::route_empty_view(
-                        localization::msgid("Nothing here yet"),
-                    ))
-                });
-                return;
             };
             shell.replace_mounted_route(route, Some(source_id), render_started, move |catalog| {
                 build(catalog, prepared, selected)
@@ -321,11 +302,17 @@ impl Shell {
         route: Route,
         render_started: RouteTiming,
     ) {
-        let database = Arc::clone(&selected.database);
+        let database = Arc::clone(&self.products.library);
         let source = selected.source_key;
         let folder = selected.music_folder_key;
         let (showcase_variation, explore_variation) = self.products.source.home_variations();
-        let blocks = self.settings.current.borrow().home_blocks.clone();
+        let blocks = self
+            .settings
+            .current
+            .borrow()
+            .application
+            .home_blocks
+            .clone();
         self.queue_prepared_route(
             selected,
             route,
@@ -354,13 +341,19 @@ impl Shell {
         let Some(selected) = self.selected_library().as_deref().cloned() else {
             return;
         };
-        let database = Arc::clone(&selected.database);
+        let database = Arc::clone(&self.products.library);
         let source = selected.source_key;
         let folder = selected.music_folder_key;
         let (showcase_variation, explore_variation) = self.products.source.home_variations();
-        let blocks = self.settings.current.borrow().home_blocks.clone();
+        let blocks = self
+            .settings
+            .current
+            .borrow()
+            .application
+            .home_blocks
+            .clone();
         let (generation, cancellation) = self.begin_root_order_read();
-        let task = selected.runtime.spawn(async move {
+        let task = self.products.runtime.spawn(async move {
             database
                 .home_page(
                     source,
@@ -374,20 +367,32 @@ impl Shell {
         });
         let shell = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let Ok(Ok(home)) = task.await else { return };
+            let result = task.await;
             let Some(shell) = shell.upgrade() else { return };
-            if !shell.finish_root_order_read(generation) {
+            if !shell.finish_root_order_read(generation)
+                || !route_is_current(&shell, &Route::Home, source)
+            {
                 return;
             }
-            if !route_is_current(&shell, &Route::Home, source) {
-                return;
-            }
+            let home = match result {
+                Ok(Ok(home)) => home,
+                Ok(Err(error)) => {
+                    warn!(%error, "failed to refresh Home route");
+                    shell.show_route_load_error(Route::Home, Some(selected.source_id), None);
+                    return;
+                }
+                Err(error) => {
+                    warn!(%error, "Home refresh task failed");
+                    shell.show_route_load_error(Route::Home, Some(selected.source_id), None);
+                    return;
+                }
+            };
             let view = shell
                 .route_viewport
                 .mounted_route
                 .borrow()
                 .as_ref()
-                .filter(|entry| entry.route == Route::Home)
+                .filter(|entry| entry.route == Route::Home && !entry.load_failed)
                 .map(|entry| entry.view.clone());
             if let Some(view) = view {
                 view.apply_home_page(home);
@@ -548,30 +553,28 @@ impl Shell {
             .mounted_route
             .borrow()
             .as_ref()
-            .is_some_and(|entry| entry.route == route);
+            .is_some_and(|entry| entry.route == route && !entry.load_failed);
         if !force && mounted_current {
             self.cancel_root_order_read();
-            // Repeat navigation must preserve the mounted view's deferred artwork.
-            self.route_viewport
-                .route_loading
-                .set_visible(self.route_viewport.route_cover_generation.get() != 0);
+            let current = self.route_viewport.mounted_route.borrow();
+            self.route_viewport.route_loading.set_visible(
+                current
+                    .as_ref()
+                    .is_some_and(|entry| !entry.surface.is_ready()),
+            );
             return;
         }
 
         self.cancel_route_loading();
         self.show_route_loading();
-        let render_started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
+        let render_started = tracing::enabled!(tracing::Level::WARN).then(Instant::now);
         match route.clone() {
             Route::History => {
                 self.queue_history_route(route, render_started);
                 return;
             }
             Route::Playlists | Route::SmartPlaylists => {
-                let key = if route == Route::Playlists {
-                    LibraryListKey::Playlists
-                } else {
-                    LibraryListKey::SmartPlaylists
-                };
+                let key = library_list_key(&route, CollectionCategory::Tracks);
                 let settings = self.settings.current.borrow().library_list(key);
                 if route == Route::Playlists {
                     self.queue_playlist_route(route, settings, render_started);
@@ -585,7 +588,7 @@ impl Shell {
                     .settings
                     .current
                     .borrow()
-                    .library_list(LibraryListKey::PlaylistTracks);
+                    .library_list(library_list_key(&route, CollectionCategory::Tracks));
                 self.queue_playlist_detail_route(route, key, settings, render_started);
                 return;
             }
@@ -595,13 +598,21 @@ impl Shell {
             }
             Route::GenreDetail(genre_id) => {
                 let id = NamedDetailId::Genre(genre_id);
-                let settings = self.settings.current.borrow().library_list(id.key());
+                let settings = self
+                    .settings
+                    .current
+                    .borrow()
+                    .library_list(library_list_key(&route, CollectionCategory::Tracks));
                 self.queue_named_detail_route(route, id, settings, render_started);
                 return;
             }
             Route::MoodDetail(mood_id) => {
                 let id = NamedDetailId::Mood(mood_id);
-                let settings = self.settings.current.borrow().library_list(id.key());
+                let settings = self
+                    .settings
+                    .current
+                    .borrow()
+                    .library_list(library_list_key(&route, CollectionCategory::Tracks));
                 self.queue_named_detail_route(route, id, settings, render_started);
                 return;
             }
@@ -610,25 +621,24 @@ impl Shell {
                     .settings
                     .current
                     .borrow()
-                    .library_list(LibraryListKey::AlbumDetailTracks);
+                    .library_list(library_list_key(&route, CollectionCategory::Tracks));
                 self.queue_album_detail_route(route, album_id, settings, render_started);
                 return;
             }
-            Route::ArtistDetail(artist_id) | Route::AlbumArtistDetail(artist_id) => {
+            Route::ArtistDetail(_) | Route::AlbumArtistDetail(_) => {
                 let album_artist = matches!(&route, Route::AlbumArtistDetail(_));
                 let track_settings = self
                     .settings
                     .current
                     .borrow()
-                    .library_list(LibraryListKey::ArtistTracks);
+                    .library_list(library_list_key(&route, CollectionCategory::Tracks));
                 let album_settings = self
                     .settings
                     .current
                     .borrow()
-                    .library_list(LibraryListKey::ArtistAlbums);
+                    .library_list(library_list_key(&route, CollectionCategory::Albums));
                 self.queue_artist_overview_route(
                     route,
-                    artist_id,
                     album_artist,
                     track_settings,
                     album_settings,
@@ -636,32 +646,24 @@ impl Shell {
                 );
                 return;
             }
-            Route::ArtistDiscography(artist_id) | Route::AlbumArtistDiscography(artist_id) => {
-                let album_artist = matches!(&route, Route::AlbumArtistDiscography(_));
+            Route::ArtistDiscography(_) | Route::AlbumArtistDiscography(_) => {
                 let settings = self
                     .settings
                     .current
                     .borrow()
-                    .library_list(LibraryListKey::ArtistAlbums);
-                self.queue_artist_discography_route(
-                    route,
-                    artist_id,
-                    album_artist,
-                    settings,
-                    render_started,
-                );
+                    .library_list(library_list_key(&route, CollectionCategory::Albums));
+                self.queue_artist_discography_route(route, settings, render_started);
                 return;
             }
-            Route::ArtistTracks(artist_id) | Route::AlbumArtistTracks(artist_id) => {
+            Route::ArtistTracks(_) | Route::AlbumArtistTracks(_) => {
                 let album_artist = matches!(&route, Route::AlbumArtistTracks(_));
                 let settings = self
                     .settings
                     .current
                     .borrow()
-                    .library_list(LibraryListKey::ArtistTracks);
+                    .library_list(library_list_key(&route, CollectionCategory::Tracks));
                 self.queue_artist_tracks_route(
                     route,
-                    artist_id,
                     album_artist,
                     settings,
                     false,
@@ -669,22 +671,14 @@ impl Shell {
                 );
                 return;
             }
-            Route::ArtistFavoriteTracks(artist_id)
-            | Route::AlbumArtistFavoriteTracks(artist_id) => {
+            Route::ArtistFavoriteTracks(_) | Route::AlbumArtistFavoriteTracks(_) => {
                 let album_artist = matches!(&route, Route::AlbumArtistFavoriteTracks(_));
                 let settings = self
                     .settings
                     .current
                     .borrow()
-                    .library_list(LibraryListKey::ArtistTracks);
-                self.queue_artist_tracks_route(
-                    route,
-                    artist_id,
-                    album_artist,
-                    settings,
-                    true,
-                    render_started,
-                );
+                    .library_list(library_list_key(&route, CollectionCategory::Tracks));
+                self.queue_artist_tracks_route(route, album_artist, settings, true, render_started);
                 return;
             }
             _ => {}
@@ -714,7 +708,9 @@ impl Shell {
                     .settings
                     .current
                     .borrow()
-                    .library_list(LibraryListKey::Folders);
+                    .library_list(library_list_key(&route, CollectionCategory::Tracks));
+                let source = self.products.source.clone();
+                let database = self.products.library.clone();
                 let load_selected = selected.clone();
                 let load_path = path.clone();
                 self.queue_prepared_route(
@@ -722,12 +718,15 @@ impl Shell {
                     route,
                     render_started,
                     "Folder route",
-                    move |_window, cancellation| async move {
+                    move |window, cancellation| async move {
                         Ok::<_, std::convert::Infallible>(
                             gtk_library::folders::prepare_folder_route(
+                                &source,
+                                &database,
                                 &load_selected,
                                 &load_path,
                                 &settings,
+                                window,
                                 &cancellation,
                             )
                             .await,
@@ -741,7 +740,7 @@ impl Shell {
                     .settings
                     .current
                     .borrow()
-                    .library_list(LibraryListKey::Albums);
+                    .library_list(library_list_key(&route, CollectionCategory::Albums));
                 self.queue_album_route(selected, route, settings, false, render_started);
             }
             Route::Tracks => {
@@ -749,8 +748,8 @@ impl Shell {
                     .settings
                     .current
                     .borrow()
-                    .library_list(LibraryListKey::Tracks);
-                self.queue_root_track_route(selected, route, settings, false, render_started);
+                    .library_list(library_list_key(&route, CollectionCategory::Tracks));
+                self.queue_root_track_route(selected, route, settings, render_started);
             }
             Route::Artists | Route::AlbumArtists => {
                 let album_artists = matches!(&route, Route::AlbumArtists);
@@ -775,15 +774,15 @@ impl Shell {
                         .settings
                         .current
                         .borrow()
-                        .library_list(LibraryListKey::FavoriteTracks);
-                    self.queue_root_track_route(selected, route, settings, true, render_started);
+                        .library_list(library_list_key(&route, CollectionCategory::Tracks));
+                    self.queue_root_track_route(selected, route, settings, render_started);
                 }
                 CollectionCategory::Albums => {
                     let settings = self
                         .settings
                         .current
                         .borrow()
-                        .library_list(LibraryListKey::Albums);
+                        .library_list(library_list_key(&route, CollectionCategory::Albums));
                     self.queue_album_route(selected, route, settings, true, render_started);
                 }
                 CollectionCategory::Artists => {
@@ -791,18 +790,14 @@ impl Shell {
                         .settings
                         .current
                         .borrow()
-                        .library_list(LibraryListKey::Artists);
+                        .library_list(library_list_key(&route, CollectionCategory::Artists));
                     self.queue_artist_route(selected, route, false, settings, true, render_started);
                 }
             },
             Route::History => unreachable!("History is application-owned"),
             Route::Genres | Route::Moods => {
                 let genres = matches!(&route, Route::Genres);
-                let key = if genres {
-                    LibraryListKey::Genres
-                } else {
-                    LibraryListKey::Moods
-                };
+                let key = library_list_key(&route, CollectionCategory::Tracks);
                 let settings = self.settings.current.borrow().library_list(key);
                 if genres {
                     self.queue_genre_route(selected, route, settings, render_started);
@@ -832,34 +827,29 @@ impl Shell {
         selected: rufin_core::runtime::SelectedLibrary,
         route: Route,
         settings: LibraryListSettings,
-        favorites_only: bool,
         render_started: RouteTiming,
     ) {
-        let database = Arc::clone(&selected.database);
+        let database = Arc::clone(&self.products.library);
         let source_key = selected.source_key;
         let folder = selected.music_folder_key;
         let build_route = route.clone();
         self.queue_prepared_route(
             selected,
-            route,
+            route.clone(),
             render_started,
             "Track route",
             move |window, cancellation| async move {
-                database
-                    .query_track_route_page(
-                        &library::TrackQuery {
-                            source: source_key,
-                            collection: None,
-                            folder,
-                            downloaded_only: false,
-                            favorites_only,
-                        },
-                        "",
-                        settings.sort_key.track_sort(),
-                        settings.descending,
-                        window,
-                        &cancellation,
-                    )
+                (&BrowseRequest::new(
+                    &route,
+                    CollectionCategory::Tracks,
+                    Some(source_key),
+                    folder,
+                    &settings,
+                    8,
+                )
+                .tracks()
+                .expect("song route"))
+                    .page(&database, window, &cancellation)
                     .await
             },
             move |shell, page, selected| match build_route {
@@ -883,13 +873,15 @@ impl Shell {
             render_started,
             "Album detail route",
             move |window, cancellation| async move {
-                gtk_library::load_album_detail(
-                    &database,
-                    &album_uri,
+                BrowseRequest::new(
+                    &Route::AlbumDetail(album_uri),
+                    CollectionCategory::Tracks,
+                    None,
+                    None,
                     &settings,
-                    window,
-                    &cancellation,
+                    8,
                 )
+                .detail_page(&database, &settings, window, &cancellation)
                 .await
             },
             move |shell, detail| shell.album_detail_view(detail),
@@ -904,25 +896,44 @@ impl Shell {
         favorites_only: bool,
         render_started: RouteTiming,
     ) {
-        let database = Arc::clone(&selected.database);
+        let database = Arc::clone(&self.products.library);
         let source_key = selected.source_key;
         let folder = selected.music_folder_key;
         self.queue_prepared_route(
             selected,
-            route,
+            route.clone(),
             render_started,
             "Album route",
             move |window, cancellation| async move {
-                gtk_library::load_album_collection(
-                    &database,
-                    source_key,
-                    folder,
-                    &settings,
-                    favorites_only,
-                    window,
-                    &cancellation,
-                )
+                BrowseRequest {
+                    favorites_only: favorites_only,
+                    ..BrowseRequest::new(
+                        &route,
+                        CollectionCategory::Albums,
+                        Some(source_key),
+                        folder,
+                        &settings,
+                        8,
+                    )
+                }
+                .collection()
+                .expect("collection route")
+                .page(&database, window, &cancellation)
                 .await
+                .map(
+                    |library::CatalogPage {
+                         count,
+                         first_row_position: start,
+                         rows,
+                         ..
+                     }| match rows {
+                        library::CatalogRows::Albums(rows) => (count, start, rows, Vec::new()),
+                        library::CatalogRows::AlbumDetails(rows) => {
+                            (count, start, Vec::new(), rows)
+                        }
+                        _ => unreachable!("album query"),
+                    },
+                )
             },
             move |shell, (order, first_row_position, first_rows, first_detail_rows), selected| {
                 shell.library_albums_route(
@@ -946,28 +957,47 @@ impl Shell {
         favorites_only: bool,
         render_started: RouteTiming,
     ) {
-        let database = Arc::clone(&selected.database);
+        let database = Arc::clone(&self.products.library);
         let source_key = selected.source_key;
         let folder = selected.music_folder_key;
         self.queue_prepared_route(
             selected,
-            route,
+            route.clone(),
             render_started,
             "Artist route",
             move |window, cancellation| async move {
-                database
-                    .artist_route_page(
-                        source_key,
+                BrowseRequest {
+                    favorites_only: favorites_only,
+                    ..BrowseRequest::new(
+                        &route,
+                        CollectionCategory::Artists,
+                        Some(source_key),
                         folder,
-                        album_artist,
-                        favorites_only,
-                        "",
-                        settings.sort_key.artist_sort(),
-                        settings.descending,
-                        window,
-                        &cancellation,
+                        &settings,
+                        8,
                     )
-                    .await
+                }
+                .collection()
+                .expect("collection route")
+                .page(&database, window, &cancellation)
+                .await
+                .map(
+                    |library::CatalogPage {
+                         count,
+                         first_row_position: start,
+                         rows,
+                         ..
+                     }| {
+                        (
+                            count,
+                            start,
+                            match rows {
+                                library::CatalogRows::Artists(rows) => rows,
+                                _ => unreachable!("catalog page projection"),
+                            },
+                        )
+                    },
+                )
             },
             move |shell, (order, first_row_position, first_rows), selected| {
                 shell.library_artist_list_route(
@@ -1005,18 +1035,18 @@ impl Shell {
             render_started,
             "Smart Playlist detail route",
             move |window, cancellation| async move {
-                load_smart_playlist_detail(
-                    &database,
+                BrowseRequest::new(
+                    &Route::SmartPlaylistDetail(key),
+                    CollectionCategory::Tracks,
                     source,
                     folder,
-                    key,
-                    settings,
-                    window,
-                    &cancellation,
+                    &settings,
+                    8,
                 )
+                .detail_page(&database, &settings, window, &cancellation)
                 .await
             },
-            move |shell, detail| shell.smart_playlist_detail_route(key, detail, source, folder),
+            move |shell, detail| shell.smart_playlist_detail_route(key, detail),
         );
     }
 
@@ -1029,19 +1059,12 @@ impl Shell {
     ) {
         let database = Arc::clone(&self.products.library);
         self.queue_application_route(
-            route,
+            route.clone(),
             render_started,
             "Playlist detail route",
             move |window, cancellation| async move {
-                database
-                    .playlist_detail_page(
-                        key,
-                        None,
-                        settings.sort_key.playlist_entry_sort(),
-                        settings.descending,
-                        window,
-                        &cancellation,
-                    )
+                BrowseRequest::new(&route, CollectionCategory::Tracks, None, None, &settings, 8)
+                    .detail_page(&database, &settings, window, &cancellation)
                     .await
             },
             move |shell, detail| shell.playlist_detail_route(key, detail),
@@ -1051,7 +1074,6 @@ impl Shell {
     fn queue_artist_overview_route(
         self: &Rc<Self>,
         route: Route,
-        artist_uri: String,
         album_artist: bool,
         track_settings: LibraryListSettings,
         album_settings: LibraryListSettings,
@@ -1059,103 +1081,48 @@ impl Shell {
     ) {
         let database = Arc::clone(&self.products.library);
         self.queue_application_route(
-            route,
+            route.clone(),
             render_started,
             "Artist overview route",
             move |window, cancellation| async move {
-                let Some(row) = database
-                    .artist_row_by_media_uri(&artist_uri, &cancellation)
-                    .await
-                    .map_err(|error| error.to_string())?
-                else {
-                    return Ok(None);
-                };
-                let source = row.source_key;
-                let artist = row.artist_key;
-                let folder = None;
-                load_artist_overview(
-                    &database,
-                    source,
-                    folder,
-                    artist,
-                    album_artist,
-                    &track_settings,
+                BrowseRequest::new(
+                    &route,
+                    CollectionCategory::Albums,
+                    None,
+                    None,
                     &album_settings,
-                    window,
-                    &cancellation,
+                    8,
                 )
+                .detail_page(&database, &track_settings, window, &cancellation)
                 .await
             },
-            move |shell, detail| {
-                let Some(detail) = detail else {
-                    return MountedRoute::static_widget(
-                        gtk_library::route_layout::route_empty_view(localization::msgid(
-                            "This isn't available",
-                        )),
-                    );
-                };
-                let artist = detail.summary.artist_key;
-                let source = detail.summary.source_key;
-                shell.artist_detail_view(artist, album_artist, Some(detail), source)
-            },
+            move |shell, detail| shell.artist_detail_view(album_artist, detail),
         );
     }
 
     fn queue_artist_discography_route(
         self: &Rc<Self>,
         route: Route,
-        artist_uri: String,
-        album_artist: bool,
         settings: LibraryListSettings,
         render_started: RouteTiming,
     ) {
         let database = Arc::clone(&self.products.library);
         self.queue_application_route(
-            route,
+            route.clone(),
             render_started,
             "Artist discography route",
             move |window, cancellation| async move {
-                let Some(row) = database
-                    .artist_row_by_media_uri(&artist_uri, &cancellation)
+                BrowseRequest::new(&route, CollectionCategory::Albums, None, None, &settings, 8)
+                    .detail_page(&database, &settings, window, &cancellation)
                     .await
-                    .map_err(|error| error.to_string())?
-                else {
-                    return Ok(None);
-                };
-                let source = row.source_key;
-                let artist = row.artist_key;
-                let folder = None;
-                load_artist_discography(
-                    &database,
-                    source,
-                    folder,
-                    artist,
-                    album_artist,
-                    &settings,
-                    window,
-                    &cancellation,
-                )
-                .await
             },
-            move |shell, detail| {
-                let Some(detail) = detail else {
-                    return MountedRoute::static_widget(
-                        gtk_library::route_layout::route_empty_view(localization::msgid(
-                            "This isn't available",
-                        )),
-                    );
-                };
-                let source = detail.summary.source_key;
-                let artist = detail.summary.artist_key;
-                shell.artist_discography_view(artist, album_artist, Some(detail), source)
-            },
+            move |shell, detail| shell.artist_discography_view(detail),
         );
     }
 
     fn queue_artist_tracks_route(
         self: &Rc<Self>,
         route: Route,
-        artist_uri: String,
         album_artist: bool,
         settings: LibraryListSettings,
         favorites_only: bool,
@@ -1163,46 +1130,19 @@ impl Shell {
     ) {
         let database = Arc::clone(&self.products.library);
         self.queue_application_route(
-            route,
+            route.clone(),
             render_started,
             "Artist tracks route",
             move |window, cancellation| async move {
-                let Some(row) = database
-                    .artist_row_by_media_uri(&artist_uri, &cancellation)
+                BrowseRequest::new(&route, CollectionCategory::Tracks, None, None, &settings, 8)
+                    .detail_page(&database, &settings, window, &cancellation)
                     .await
-                    .map_err(|error| error.to_string())?
-                else {
-                    return Ok(None);
-                };
-                let source = row.source_key;
-                let artist = row.artist_key;
-                let folder = None;
-                load_artist_tracks(
-                    &database,
-                    source,
-                    folder,
-                    artist,
-                    album_artist,
-                    &settings,
-                    favorites_only,
-                    window,
-                    &cancellation,
-                )
-                .await
             },
             move |shell, detail| {
-                let Some(detail) = detail else {
-                    return MountedRoute::static_widget(
-                        gtk_library::route_layout::route_empty_view(localization::msgid(
-                            "This isn't available",
-                        )),
-                    );
-                };
-                let artist = detail.summary.artist_key;
                 if favorites_only {
-                    shell.artist_favorite_tracks_view(artist, album_artist, Some(detail))
+                    shell.artist_favorite_tracks_view(album_artist, detail)
                 } else {
-                    shell.artist_tracks_view(artist, album_artist, Some(detail))
+                    shell.artist_tracks_view(album_artist, detail)
                 }
             },
         );
@@ -1221,7 +1161,13 @@ impl Shell {
             render_started,
             "Named detail route",
             move |window, cancellation| async move {
-                load_named_detail(&database, id, &settings, window, &cancellation).await
+                let route = match id {
+                    NamedDetailId::Genre(key) => Route::GenreDetail(key),
+                    NamedDetailId::Mood(key) => Route::MoodDetail(key),
+                };
+                BrowseRequest::new(&route, CollectionCategory::Tracks, None, None, &settings, 8)
+                    .detail_page(&database, &settings, window, &cancellation)
+                    .await
             },
             move |shell, detail| shell.named_detail_view(id, detail),
         );
@@ -1241,21 +1187,39 @@ impl Shell {
         drop(selected);
         let database = Arc::clone(&self.products.library);
         self.queue_application_route(
-            route,
+            route.clone(),
             render_started,
             "Playlist route",
             move |window, cancellation| async move {
-                database
-                    .playlist_route_page(
-                        source,
-                        folder,
-                        settings.sort_key.playlist_sort(),
-                        settings.descending,
-                        "",
-                        window,
-                        &cancellation,
-                    )
-                    .await
+                BrowseRequest::new(
+                    &route,
+                    CollectionCategory::Tracks,
+                    source,
+                    folder,
+                    &settings,
+                    8,
+                )
+                .collection()
+                .expect("collection route")
+                .page(&database, window, &cancellation)
+                .await
+                .map(
+                    |library::CatalogPage {
+                         count,
+                         first_row_position: start,
+                         rows,
+                         ..
+                     }| {
+                        (
+                            count,
+                            start,
+                            match rows {
+                                library::CatalogRows::Playlists(rows) => rows,
+                                _ => unreachable!("catalog page projection"),
+                            },
+                        )
+                    },
+                )
             },
             move |shell, (order, first_row_position, first_rows)| {
                 shell.library_playlists_route(order, first_row_position, first_rows, source, folder)
@@ -1280,21 +1244,42 @@ impl Shell {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs().min(i64::MAX as u64) as i64);
         self.queue_application_route(
-            route,
+            route.clone(),
             render_started,
             "Smart Playlist route",
             move |window, cancellation| async move {
-                database
-                    .smart_playlist_route_page(
+                BrowseRequest {
+                    now: now,
+                    ..BrowseRequest::new(
+                        &route,
+                        CollectionCategory::Tracks,
                         source,
                         folder,
-                        settings.sort_key.smart_playlist_sort(),
-                        settings.descending,
-                        now,
-                        window,
-                        &cancellation,
+                        &settings,
+                        8,
                     )
-                    .await
+                }
+                .collection()
+                .expect("collection route")
+                .page(&database, window, &cancellation)
+                .await
+                .map(
+                    |library::CatalogPage {
+                         count,
+                         first_row_position: start,
+                         rows,
+                         ..
+                     }| {
+                        (
+                            count,
+                            start,
+                            match rows {
+                                library::CatalogRows::SmartPlaylists(rows) => rows,
+                                _ => unreachable!("catalog page projection"),
+                            },
+                        )
+                    },
+                )
             },
             move |shell, (order, first_row_position, first_rows)| {
                 shell.library_smart_playlists_route(
@@ -1316,12 +1301,22 @@ impl Shell {
             .borrow()
             .library_list(LibraryListKey::History);
         self.queue_application_route(
-            route,
+            route.clone(),
             render_started,
             "History route",
             move |_, cancellation| async move {
-                database
-                    .activity_history(None, "", settings.descending, &cancellation)
+                let query = BrowseRequest::new(
+                    &route,
+                    CollectionCategory::Tracks,
+                    None,
+                    None,
+                    &settings,
+                    8,
+                )
+                .tracks()
+                .expect("song route");
+                query
+                    .page(&database, library::RouteSeedWindow::top(), &cancellation)
                     .await
             },
             |shell, rows| shell.history_route(rows),
@@ -1335,26 +1330,44 @@ impl Shell {
         settings: LibraryListSettings,
         render_started: RouteTiming,
     ) {
-        let database = Arc::clone(&selected.database);
+        let database = Arc::clone(&self.products.library);
         let source_key = selected.source_key;
         let folder = selected.music_folder_key;
         self.queue_prepared_route(
             selected,
-            route,
+            route.clone(),
             render_started,
             "Genre route",
             move |window, cancellation| async move {
-                database
-                    .genre_route_page(
-                        source_key,
-                        folder,
-                        "",
-                        settings.sort_key.genre_sort(),
-                        settings.descending,
-                        window,
-                        &cancellation,
-                    )
-                    .await
+                BrowseRequest::new(
+                    &route,
+                    CollectionCategory::Tracks,
+                    Some(source_key),
+                    folder,
+                    &settings,
+                    8,
+                )
+                .collection()
+                .expect("collection route")
+                .page(&database, window, &cancellation)
+                .await
+                .map(
+                    |library::CatalogPage {
+                         count,
+                         first_row_position: start,
+                         rows,
+                         ..
+                     }| {
+                        (
+                            count,
+                            start,
+                            match rows {
+                                library::CatalogRows::Genres(rows) => rows,
+                                _ => unreachable!("catalog page projection"),
+                            },
+                        )
+                    },
+                )
             },
             |shell, (order, first_row_position, first_rows), selected| {
                 shell.library_genres_route(order, first_row_position, first_rows, selected)
@@ -1369,26 +1382,44 @@ impl Shell {
         settings: LibraryListSettings,
         render_started: RouteTiming,
     ) {
-        let database = Arc::clone(&selected.database);
+        let database = Arc::clone(&self.products.library);
         let source_key = selected.source_key;
         let folder = selected.music_folder_key;
         self.queue_prepared_route(
             selected,
-            route,
+            route.clone(),
             render_started,
             "Mood route",
             move |window, cancellation| async move {
-                database
-                    .mood_route_page(
-                        source_key,
-                        folder,
-                        "",
-                        settings.sort_key.mood_sort(),
-                        settings.descending,
-                        window,
-                        &cancellation,
-                    )
-                    .await
+                BrowseRequest::new(
+                    &route,
+                    CollectionCategory::Tracks,
+                    Some(source_key),
+                    folder,
+                    &settings,
+                    8,
+                )
+                .collection()
+                .expect("collection route")
+                .page(&database, window, &cancellation)
+                .await
+                .map(
+                    |library::CatalogPage {
+                         count,
+                         first_row_position: start,
+                         rows,
+                         ..
+                     }| {
+                        (
+                            count,
+                            start,
+                            match rows {
+                                library::CatalogRows::Moods(rows) => rows,
+                                _ => unreachable!("catalog page projection"),
+                            },
+                        )
+                    },
+                )
             },
             |shell, (order, first_row_position, first_rows), selected| {
                 shell.library_moods_route(order, first_row_position, first_rows, selected)
@@ -1446,9 +1477,9 @@ impl Shell {
         render_started: RouteTiming,
         build: impl FnOnce(Rc<gtk_library::CatalogUi>) -> MountedRoute,
     ) {
-        let replacement_started = render_started.as_ref().map(|_| Instant::now());
+        let teardown_started = render_started.as_ref().map(|_| Instant::now());
         let previous = self.begin_mounted_route_replacement();
-        let route_loading_generation = self.begin_route_loading_gate();
+        let release_ms = teardown_started.map(elapsed_ms);
         let model_started = render_started.as_ref().map(|_| Instant::now());
         let catalog = self.build_catalog(&route, source_id.as_ref());
         catalog.refresh_current_route_now_playing_selections(route_current_track(
@@ -1460,11 +1491,12 @@ impl Shell {
         let view = build(catalog);
         let model_ms = model_started.map(elapsed_ms);
 
-        let mount_started = render_started.as_ref().map(|_| Instant::now());
+        let removal_started = render_started.as_ref().map(|_| Instant::now());
         let widget = view.widget();
         if let Some(previous) = previous {
             if gtk::prelude::RootExt::focus(&self.chrome.window).is_some_and(|focus| {
-                focus == previous.surface || focus.is_ancestor(&previous.surface)
+                focus == *previous.surface.upcast_ref::<gtk::Widget>()
+                    || focus.is_ancestor(&previous.surface)
             }) {
                 // Clear focus before removal so GTK does not move it into the new page.
                 gtk::prelude::RootExt::set_focus(&self.chrome.window, None::<&gtk::Widget>);
@@ -1472,6 +1504,9 @@ impl Shell {
             self.route_viewport.route_host.remove(&previous.surface);
             drop(previous);
         }
+        let teardown_ms =
+            removal_started.map(|started| elapsed_ms(started) + release_ms.unwrap_or(0));
+        let mount_started = render_started.as_ref().map(|_| Instant::now());
         let scroll_adjustment = primary_route_scroll_adjustment(&widget);
         let position_key = source_id
             .filter(|_| scroll_adjustment.is_some())
@@ -1485,25 +1520,15 @@ impl Shell {
         let boundary = route_boundary(widget);
         let ready_shell = Rc::downgrade(self);
         let ready_view = view.clone();
-        let surface = prepare_route_position_before_snapshot(
+        let surface = mount_route_surface(
             &boundary,
             scroll_adjustment.as_ref(),
-            restore_position
-                .filter(|position| position.value > 0.0)
-                .map(|position| position.value),
-            move || {
-                ready_view.resume_initial_demand();
-                let Some(cover_generation) = route_loading_generation else {
-                    return;
-                };
-                if let Some(shell) = ready_shell.upgrade()
-                    && shell.route_viewport.route_cover_generation.get() == cover_generation
-                {
-                    shell.artwork.close_route_cover_registration(
-                        cover_generation,
-                        shell.route_viewport.route_host.upcast_ref(),
-                    );
-                    shell.try_finish_route_loading(cover_generation);
+            restore_position,
+            view.item_scroll(),
+            move || ready_view.resume_initial_demand(),
+            move |surface| {
+                if let Some(shell) = ready_shell.upgrade() {
+                    shell.finish_route_loading(surface, render_started);
                 }
             },
         );
@@ -1513,6 +1538,7 @@ impl Shell {
             .mounted_route
             .replace(Some(MountedRouteEntry {
                 route: route.clone(),
+                load_failed: false,
                 view: view.clone(),
                 surface: surface.clone(),
                 position_key,
@@ -1520,71 +1546,93 @@ impl Shell {
             }));
         debug_assert!(displaced.is_none());
         self.route_viewport.route_host.set_visible_child(&surface);
-        if let (
-            Some(render_started),
-            Some(replacement_started),
-            Some(model_ms),
-            Some(mount_started),
-        ) = (render_started, replacement_started, model_ms, mount_started)
+        self.prepare_startup_content_readiness();
+        if let (Some(render_started), Some(teardown_ms), Some(model_ms), Some(mount_started)) =
+            (render_started, teardown_ms, model_ms, mount_started)
         {
-            let teardown_ms = elapsed_ms(replacement_started).saturating_sub(model_ms);
             let mount_ms = elapsed_ms(mount_started);
             let total_ms = elapsed_ms(render_started);
             debug!(
                 ?route,
                 teardown_ms, model_ms, mount_ms, total_ms, "route render timing"
             );
-            if total_ms >= SLOW_ROUTE_RENDER_MS {
-                warn!(
-                    ?route,
-                    teardown_ms, model_ms, mount_ms, total_ms, "slow route render"
-                );
+        }
+    }
+
+    fn show_route_load_error(
+        self: &Rc<Self>,
+        route: Route,
+        source_id: Option<SourceId>,
+        render_started: RouteTiming,
+    ) {
+        let resource = crate::ui_resource::ROUTE_ERROR_RESOURCE;
+        let builder = gtk_widgets::ui_resource::builder(resource);
+        gtk_widgets::objects!(builder, resource, {
+            root: gtk::Box,
+            message: gtk::Label,
+            refresh: gtk::Button,
+        });
+        let keep_content = self
+            .route_viewport
+            .mounted_route
+            .borrow()
+            .as_ref()
+            .is_some_and(|entry| {
+                entry.route == route && !entry.load_failed && entry.surface.is_ready()
+            });
+        if keep_content {
+            self.cancel_route_loading();
+            self.control_feedback
+                .show_feedback_toast(message.text().to_string());
+            return;
+        }
+        let shell = Rc::downgrade(self);
+        let reload: MountedRouteResume = Rc::new(move || {
+            if let Some(shell) = shell.upgrade() {
+                shell.replace_current_route_when_ready();
             }
+        });
+        let clicked = Rc::clone(&reload);
+        refresh.connect_clicked(move |_| clicked());
+        self.replace_mounted_route(route, source_id, render_started, move |_| {
+            MountedRoute::static_widget(root.upcast()).with_catalog_refresh(reload)
+        });
+        if let Some(entry) = self.route_viewport.mounted_route.borrow_mut().as_mut() {
+            entry.load_failed = true;
         }
     }
 
     fn show_route_loading(&self) {
-        if self.startup.route_revealed.get() {
-            self.route_viewport.route_loading.set_visible(true);
-        }
-    }
-
-    fn begin_route_loading_gate(self: &Rc<Self>) -> Option<u64> {
-        if !self.startup.route_revealed.get() {
-            return None;
-        }
         self.route_viewport.route_loading.set_visible(true);
-        let generation = self.artwork.begin_route_cover_prime();
-        self.route_viewport.route_cover_generation.set(generation);
-        debug!(generation, "route artwork loading started");
-        Some(generation)
     }
 
-    pub(in crate::shell) fn try_finish_route_loading(&self, cover_generation: u64) {
-        if self.route_viewport.route_cover_generation.get() == cover_generation
-            && self.artwork.route_cover_prime_ready(cover_generation)
-        {
-            self.finish_route_loading(cover_generation);
-        }
-    }
-
-    fn finish_route_loading(&self, cover_generation: u64) {
-        if self.route_viewport.route_cover_generation.get() != cover_generation {
+    fn finish_route_loading(self: &Rc<Self>, surface: &gtk::Widget, started: RouteTiming) {
+        if self.route_viewport.order_cancellation.borrow().is_some() {
             return;
         }
-        self.route_viewport.route_loading.set_visible(false);
-        self.route_viewport.route_cover_generation.set(0);
-        self.artwork.finish_route_cover_prime_gate();
-        debug!(
-            generation = cover_generation,
-            "route artwork loading finished"
-        );
+        let route = self
+            .route_viewport
+            .mounted_route
+            .borrow()
+            .as_ref()
+            .filter(|entry| {
+                entry.surface.upcast_ref::<gtk::Widget>() == surface
+                    && entry.route == *self.navigation.routes.borrow().current()
+            })
+            .map(|entry| entry.route.clone());
+        if let Some(route) = route {
+            self.route_viewport.route_loading.set_visible(false);
+            self.try_reveal_startup_route();
+            let total_ms = started.map(elapsed_ms);
+            debug!(?route, total_ms, "visible route window ready");
+            if let Some(total_ms) = total_ms.filter(|elapsed| *elapsed >= SLOW_ROUTE_REVEAL_MS) {
+                warn!(?route, total_ms, "slow route reveal");
+            }
+        }
     }
 
     fn cancel_route_loading(&self) {
-        self.route_viewport.route_cover_generation.set(0);
         self.route_viewport.route_loading.set_visible(false);
-        self.artwork.finish_route_cover_prime_gate();
     }
 
     pub(crate) fn apply_favorite_settlement_to_mounted_route(
@@ -1630,6 +1678,14 @@ impl Shell {
         self.route_viewport.mounted_route.borrow().is_some()
     }
 
+    pub(super) fn mounted_route_is_ready(&self) -> bool {
+        self.route_viewport
+            .mounted_route
+            .borrow()
+            .as_ref()
+            .is_some_and(|entry| entry.surface.is_ready())
+    }
+
     fn begin_mounted_route_replacement(&self) -> Option<MountedRouteEntry> {
         let previous = self.route_viewport.mounted_route.borrow_mut().take();
         if let Some(previous) = previous.as_ref()
@@ -1640,9 +1696,7 @@ impl Shell {
         {
             self.route_viewport.position_memory.borrow_mut().record(
                 key.clone(),
-                adjustment.value(),
-                adjustment.upper(),
-                adjustment.page_size(),
+                RoutePosition::capture(adjustment, previous.view.item_scroll().as_ref()),
             );
         }
         self.clear_favorite_controls();

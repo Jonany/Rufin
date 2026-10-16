@@ -5,58 +5,24 @@ use std::io::{BufRead, Write};
 
 use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
-use sqlx::{Connection, FromRow, Row, SqliteConnection, sqlite::SqliteRow};
+use sqlx::{Connection, FromRow, SqliteConnection};
 
 use crate::{
-    AlbumKey, ArtistKey, Database, GenreKey, LibraryError, LibraryResult, ListenKey,
-    ListenOutboxKey, ReadCancellation, SourceId, SourceKey, TrackKey, source_entity_parts,
+    Database, LibraryError, LibraryResult, ListenKey, ListenOutboxKey, ReadCancellation, SourceId,
+    TrackKey, source_entity_parts,
 };
 
 const HISTORY_LIMIT: i64 = 100;
-const ACTIVITY_RESULT_LIMIT: usize = 100;
 const DELIVERY_LIMIT: usize = 100;
 const ACTIVITY_EXPORT_SELECT: &str = "SELECT listen_key,external_id,
                     strftime('%Y-%m-%dT%H:%M:%SZ',started_at,'unixepoch') utc_time,
-                    source_id,media_uri,track_title title,artist_name artist,album_title album,
+                    source_id,COALESCE(captured_media_uri,media_uri) media_uri,
+                    CASE WHEN captured_media_uri IS NOT NULL THEN media_uri END current_media_uri,
+                    track_title title,artist_name artist,album_title album,
                     duration_millis,disc_number,track_number,year,release_date,source_format,
                     musicbrainz_recording_id,musicbrainz_release_track_id,started_at,
                     local_period,listened_millis,skipped
              FROM listens";
-const HISTORY_ROW_SELECT: &str = r#"
-             listen.media_uri,
-                    listen.track_title title,listen.artist_name artist,listen.album_title album,
-                    album.display_artist album_display_artist,
-                    listen.disc_number,listen.track_number,listen.year,listen.release_date,
-                    listen.source_format,listen.musicbrainz_recording_id,
-                    listen.musicbrainz_release_track_id,
-                    listen.started_at last_played,
-                    listen.duration_millis,track.artwork_binding,
-                    COALESCE(track.audio_properties,'{}') audio_properties,track.date_added,track.bpm,track.source_path,
-                    (SELECT display_name FROM sources WHERE source_key=track.source_key) source_name,
-                    (SELECT COALESCE(group_concat(name, ', '),'') FROM (
-                       SELECT genre.name FROM track_genres credit JOIN genres genre USING(genre_key)
-                       WHERE credit.track_key=track.track_key ORDER BY credit.position
-                    )) genre,
-                    COALESCE((SELECT baseline.play_count FROM activity_baseline baseline
-                              WHERE baseline.source_key=track.source_key
-                                AND baseline.track_object_id=track.object_id
-                                AND baseline.period='lifetime' AND baseline.item_kind='track'),0)
-                      +(SELECT count(*) FROM listens accepted WHERE accepted.media_uri=listen.media_uri) play_count,
-                    COALESCE((SELECT state.favorite FROM user_media_state state
-                              WHERE state.media_uri=listen.media_uri),
-                             (SELECT track.source_favorite FROM tracks track
-                              WHERE track.media_uri=listen.media_uri),0) favorite,
-                    COALESCE((SELECT state.rating FROM user_media_state state
-                              WHERE state.media_uri=listen.media_uri),
-                             (SELECT track.source_rating FROM tracks track
-                              WHERE track.media_uri=listen.media_uri))/10 rating,
-                    EXISTS(SELECT 1 FROM local_access_files access
-                           WHERE access.media_uri=listen.media_uri AND access.origin='download') is_downloaded
-             FROM selected listen
-             LEFT JOIN tracks track USING(media_uri)
-             LEFT JOIN albums album ON album.album_key=track.album_key
-"#;
-
 #[derive(Clone, Debug, FromRow, PartialEq, Deserialize, Serialize)]
 pub struct ListenWrite {
     pub external_id: Option<String>,
@@ -84,6 +50,8 @@ pub struct ActivityRecord {
     pub version: u32,
     pub listen_key: i64,
     pub source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_media_uri: Option<String>,
     #[serde(flatten)]
     pub listen: ListenWrite,
 }
@@ -94,51 +62,6 @@ pub struct ActivityImportReport {
     pub skipped: u64,
 }
 
-#[derive(Clone, Debug, FromRow, PartialEq)]
-pub struct HistoryRow {
-    pub audio_properties: crate::AudioProperties,
-    pub source_path: Option<String>,
-    pub source_name: Option<String>,
-    pub media_uri: String,
-    pub title: String,
-    pub artist: String,
-    pub album: String,
-    pub album_media_uri: Option<String>,
-    #[sqlx(skip)]
-    pub artists: Vec<crate::TrackArtistLink>,
-    #[sqlx(skip)]
-    pub album_artists: Vec<crate::TrackArtistLink>,
-    pub album_display_artist: Option<String>,
-    pub artwork_binding: Option<Vec<u8>>,
-    pub duration_millis: i64,
-    pub disc_number: Option<i64>,
-    pub track_number: Option<i64>,
-    pub year: Option<i64>,
-    pub release_date: Option<String>,
-    pub date_added: Option<String>,
-    pub bpm: Option<i64>,
-    pub genre: String,
-    pub play_count: i64,
-    pub source_format: Option<String>,
-    pub musicbrainz_recording_id: Option<String>,
-    pub musicbrainz_release_track_id: Option<String>,
-    pub last_played: Option<i64>,
-    pub favorite: bool,
-    pub rating: Option<i64>,
-    pub is_downloaded: bool,
-}
-
-fn history_rows(rows: Vec<SqliteRow>) -> LibraryResult<Vec<HistoryRow>> {
-    rows.iter()
-        .map(|row| {
-            let mut history = HistoryRow::from_row(row)?;
-            history.artists = serde_json::from_str(row.try_get("artists")?)?;
-            history.album_artists = serde_json::from_str(row.try_get("album_artists")?)?;
-            Ok(history)
-        })
-        .collect()
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListenDeliveryTarget {
     pub service: String,
@@ -146,56 +69,12 @@ pub struct ListenDeliveryTarget {
     pub next_attempt_at: Option<i64>,
 }
 
-#[derive(Clone, Debug, FromRow, PartialEq)]
-pub struct ActivityTrackRow {
-    pub track_key: TrackKey,
-    pub title: String,
-    pub artist: String,
-    pub album: String,
-    pub play_count: i64,
-    pub skip_count: i64,
-    pub last_played: Option<i64>,
-    pub listened_millis: i64,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum CalendarActivityPeriod {
     Month { year: i32, month: u8 },
     Year(i32),
     Lifetime,
-}
-
-#[derive(Clone, Debug, FromRow, PartialEq)]
-pub struct ActivityAlbumRow {
-    pub album_key: AlbumKey,
-    pub title: String,
-    pub artist: String,
-    pub play_count: i64,
-    pub listened_millis: i64,
-}
-
-#[derive(Clone, Debug, FromRow, PartialEq)]
-pub struct ActivityArtistRow {
-    pub artist_key: ArtistKey,
-    pub name: String,
-    pub play_count: i64,
-    pub listened_millis: i64,
-}
-
-#[derive(Clone, Debug, FromRow, PartialEq)]
-pub struct ActivityGenreRow {
-    pub genre_key: GenreKey,
-    pub name: String,
-    pub play_count: i64,
-    pub listened_millis: i64,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct CalendarActivitySummary {
-    pub tracks: Vec<ActivityTrackRow>,
-    pub albums: Vec<ActivityAlbumRow>,
-    pub artists: Vec<ActivityArtistRow>,
-    pub genres: Vec<ActivityGenreRow>,
 }
 
 #[derive(Clone, Debug, FromRow, PartialEq)]
@@ -221,24 +100,57 @@ impl Database {
     pub async fn record_listen(
         &self,
         listen: &ListenWrite,
+        current_track: Option<TrackKey>,
         deliveries: &[ListenDeliveryTarget],
     ) -> LibraryResult<ListenKey> {
         validate_listen(listen, deliveries)?;
         let mut writer = self.writer().await?;
         let connection = writer.as_mut().ok_or(LibraryError::WriterUnavailable)?;
         let mut transaction = connection.begin().await?;
-        let source_id = match source_entity_parts(&listen.media_uri) {
-            Some((source, _, _)) => Some(source.as_str().to_string()),
-            None => sqlx::query_scalar("SELECT source.object_id FROM tracks track JOIN sources source USING(source_key) WHERE track.media_uri=?1 LIMIT 1")
-                .bind(&listen.media_uri).fetch_optional(&mut *transaction).await?,
+        let current: Option<(String, Option<crate::SourceKey>, Option<String>)> = if let Some(key) =
+            current_track
+        {
+            Some(sqlx::query_as("SELECT track.media_uri,source.source_key,source.object_id FROM tracks track LEFT JOIN sources source USING(source_key) WHERE track.track_key=?1")
+                .bind(key).fetch_one(&mut *transaction).await?)
+        } else {
+            sqlx::query_as("SELECT track.media_uri,source.source_key,source.object_id FROM tracks track LEFT JOIN sources source USING(source_key) WHERE track.media_uri=?1")
+                .bind(&listen.media_uri).fetch_optional(&mut *transaction).await?
         };
-        let key = write_listen(&mut transaction, listen, source_id.as_deref()).await?;
+        let current_media_uri =
+            current_track.and_then(|_| current.as_ref().map(|(uri, _, _)| uri.as_str()));
+        let media_uri = current_media_uri.unwrap_or(&listen.media_uri);
+        let source_id = source_entity_parts(media_uri)
+            .map(|(source, _, _)| source.as_str().to_string())
+            .or_else(|| current.as_ref().and_then(|(_, _, id)| id.clone()));
+        let origin = current
+            .as_ref()
+            .and_then(|(_, key, id)| id.as_ref().zip(*key))
+            .map(|(id, key)| (SourceId::new(id), key));
+        let (key, inserted) = write_listen(
+            &mut transaction,
+            listen,
+            source_id.as_deref(),
+            current_media_uri,
+            None,
+        )
+        .await?;
         for delivery in deliveries {
             sqlx::query("INSERT OR IGNORE INTO listen_outbox(listen_key,service,account_id,next_attempt_at) VALUES (?1,?2,?3,?4)")
                 .bind(key).bind(&delivery.service).bind(&delivery.account_id)
                 .bind(delivery.next_attempt_at).execute(&mut *transaction).await?;
         }
         transaction.commit().await?;
+        drop(writer);
+        if inserted {
+            self.catalog_updated(
+                origin,
+                crate::CatalogUpdate {
+                    activity: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
         Ok(key)
     }
 
@@ -312,214 +224,6 @@ impl Database {
         let report = import_activity_jsonl_on(&mut transaction, input).await?;
         transaction.commit().await?;
         Ok(report)
-    }
-
-    pub async fn history_rows_by_uri(
-        &self,
-        media_uris: &[String],
-        cancellation: &ReadCancellation,
-    ) -> LibraryResult<Vec<HistoryRow>> {
-        if media_uris.len() > HISTORY_LIMIT as usize {
-            return Err(LibraryError::InvalidRequest(
-                "History row window exceeds 100".into(),
-            ));
-        }
-        let mut connection = tokio::select! {
-            result = self.acquire_reader() => result?,
-            () = cancellation.cancelled() => return Err(LibraryError::ReadCancelled),
-        };
-        let sql = format!(
-            "WITH selected AS MATERIALIZED (
-                SELECT listen.*,requested.key ordinal
-                FROM json_each(?1) requested JOIN listens listen
-                  ON listen.listen_key=(
-                    SELECT recent.listen_key FROM listens recent WHERE recent.media_uri=requested.value
-                    ORDER BY recent.started_at DESC,recent.listen_key DESC LIMIT 1
-                  )
-             ) SELECT {} {HISTORY_ROW_SELECT} ORDER BY listen.ordinal",
-            crate::tracks::TRACK_LINK_COLUMNS,
-        );
-        history_rows(
-            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-                .bind(serde_json::to_string(media_uris)?)
-                .fetch_all(&mut *connection)
-                .await?,
-        )
-    }
-
-    pub async fn activity_history(
-        &self,
-        current: Option<&SourceId>,
-        query: &str,
-        descending: bool,
-        cancellation: &ReadCancellation,
-    ) -> LibraryResult<Vec<HistoryRow>> {
-        let query: String = query.trim().to_lowercase().chars().take(256).collect();
-        let (_permit, mut connection) = self.acquire_general(cancellation).await?;
-        let sources = if current.is_some() {
-            vec![
-                "listen.source_id=?1",
-                "listen.source_id IS NULL AND EXISTS (
-                   SELECT 1 FROM tracks member WHERE member.media_uri=listen.media_uri
-                     AND member.source_key=(SELECT source_key FROM sources WHERE object_id=?1))",
-            ]
-        } else {
-            vec!["1"]
-        };
-        let recent_source = if current.is_some() {
-            "AND (recent.source_id=?1 OR (recent.source_id IS NULL AND EXISTS (
-               SELECT 1 FROM tracks member WHERE member.media_uri=recent.media_uri
-                 AND member.source_key=(SELECT source_key FROM sources WHERE object_id=?1))))"
-        } else {
-            ""
-        };
-        let filter = if query.is_empty() {
-            ""
-        } else {
-            "AND (instr(lower(listen.track_title),?2)>0 OR instr(lower(listen.artist_name),?2)>0
-                  OR instr(lower(listen.album_title),?2)>0)"
-        };
-        let recent_filter = filter.replace("listen.", "recent.");
-        // Each source branch uses the history index and stops at 100. Merge at most 200
-        // candidates; old unattributed Local listens need no backfill or full-history sort.
-        let selected = sources
-            .into_iter()
-            .map(|source| {
-                format!(
-                    "SELECT * FROM (SELECT listen.* FROM listens listen
-             WHERE {source} {filter} AND listen.listen_key=(
-               SELECT recent.listen_key FROM listens recent
-               WHERE recent.media_uri=listen.media_uri {recent_source} {recent_filter}
-               ORDER BY recent.started_at DESC,recent.listen_key DESC LIMIT 1)
-             ORDER BY listen.started_at DESC,listen.listen_key DESC LIMIT ?3)"
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" UNION ALL ");
-        let direction = if descending { "DESC" } else { "ASC" };
-        let sql = format!(
-            "WITH selected AS MATERIALIZED (
-               SELECT * FROM ({selected}) ORDER BY started_at DESC,listen_key DESC LIMIT ?3
-             )
-             SELECT {} {HISTORY_ROW_SELECT}
-             ORDER BY listen.started_at {direction},listen.listen_key {direction}",
-            crate::tracks::TRACK_LINK_COLUMNS,
-        );
-        let result = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-            .bind(current.map(SourceId::as_str))
-            .bind(query)
-            .bind(HISTORY_LIMIT)
-            .fetch_all(&mut *connection)
-            .await;
-        history_rows(result?)
-    }
-
-    pub async fn calendar_activity_summary(
-        &self,
-        source: SourceKey,
-        period: CalendarActivityPeriod,
-        limit: usize,
-        cancellation: &ReadCancellation,
-    ) -> LibraryResult<CalendarActivitySummary> {
-        let limit = limit.clamp(1, ACTIVITY_RESULT_LIMIT) as i64;
-        let (month, year, lifetime) = calendar_filter(period)?;
-        let (_permit, mut connection) = self.acquire_general(cancellation).await?;
-        let mut transaction = connection.begin().await?;
-        let tracks = sqlx::query_as::<_, ActivityTrackRow>(
-            "WITH period_baseline AS (SELECT track_object_id,sum(play_count) play_count,sum(skip_count) skip_count,max(last_played_at) last_played_at FROM activity_baseline WHERE source_key=?1 AND item_kind='track' AND ((?4 AND period='lifetime') OR (NOT ?4 AND ((?2 IS NOT NULL AND period=?2) OR (?3 IS NOT NULL AND substr(period,1,4)=?3)))) GROUP BY track_object_id), window AS (
-               SELECT listens.media_uri,count(*) play_count,COALESCE(sum(skipped),0) skip_count,
-                      max(started_at) last_played,COALESCE(sum(listened_millis),0) listened_millis
-               FROM tracks member CROSS JOIN listens ON listens.media_uri=member.media_uri
-               WHERE member.source_key=?1
-                 AND (?4 OR (?2 IS NOT NULL AND local_period=?2) OR (?3 IS NOT NULL AND substr(local_period,1,4)=?3))
-               GROUP BY listens.media_uri
-             )
-             SELECT track.track_key,track.title,track.display_artist artist,track.display_album album,
-                    COALESCE(window.play_count,0)+COALESCE(baseline.play_count,0) play_count,
-                    COALESCE(window.skip_count,0)+COALESCE(baseline.skip_count,0) skip_count,
-                    CASE WHEN baseline.last_played_at IS NULL THEN window.last_played
-                         WHEN window.last_played IS NULL THEN baseline.last_played_at
-                         ELSE max(window.last_played,baseline.last_played_at) END last_played,
-                    COALESCE(window.listened_millis,0) listened_millis
-             FROM tracks track LEFT JOIN window USING(media_uri)
-             LEFT JOIN period_baseline baseline ON baseline.track_object_id=track.object_id
-             WHERE track.source_key=?1 AND (COALESCE(window.play_count,0)+COALESCE(baseline.play_count,0))>0
-             ORDER BY play_count DESC,last_played DESC NULLS LAST,track.sort_text,track.track_key LIMIT ?5",
-        )
-        .bind(source).bind(&month).bind(&year).bind(lifetime).bind(limit)
-        .fetch_all(&mut *transaction).await?;
-        let albums = sqlx::query_as::<_, ActivityAlbumRow>(
-            "WITH period_baseline AS (SELECT track_object_id,sum(play_count) play_count,sum(skip_count) skip_count,max(last_played_at) last_played_at FROM activity_baseline WHERE source_key=?1 AND item_kind='track' AND ((?4 AND period='lifetime') OR (NOT ?4 AND ((?2 IS NOT NULL AND period=?2) OR (?3 IS NOT NULL AND substr(period,1,4)=?3)))) GROUP BY track_object_id), window AS (
-               SELECT listens.media_uri,count(*) play_count,COALESCE(sum(listened_millis),0) listened_millis
-               FROM tracks member CROSS JOIN listens ON listens.media_uri=member.media_uri
-               WHERE member.source_key=?1
-                 AND (?4 OR (?2 IS NOT NULL AND local_period=?2) OR (?3 IS NOT NULL AND substr(local_period,1,4)=?3)) GROUP BY listens.media_uri
-             ), facts AS (
-               SELECT track.track_key,track.album_key,
-                      COALESCE(window.play_count,0)+COALESCE(baseline.play_count,0) play_count,
-                      COALESCE(window.listened_millis,0) listened_millis
-               FROM tracks track LEFT JOIN window USING(media_uri)
-               LEFT JOIN period_baseline baseline ON baseline.track_object_id=track.object_id
-               WHERE track.source_key=?1
-             )
-             SELECT album.album_key,album.title,album.display_artist artist,
-                    sum(facts.play_count) play_count,sum(facts.listened_millis) listened_millis
-             FROM facts JOIN albums album USING(album_key) GROUP BY album.album_key
-             HAVING play_count>0 ORDER BY play_count DESC,album.sort_text,album.album_key LIMIT ?5",
-        )
-        .bind(source).bind(&month).bind(&year).bind(lifetime).bind(limit)
-        .fetch_all(&mut *transaction).await?;
-        let artists = sqlx::query_as::<_, ActivityArtistRow>(
-            "WITH period_baseline AS (SELECT track_object_id,sum(play_count) play_count,sum(skip_count) skip_count,max(last_played_at) last_played_at FROM activity_baseline WHERE source_key=?1 AND item_kind='track' AND ((?4 AND period='lifetime') OR (NOT ?4 AND ((?2 IS NOT NULL AND period=?2) OR (?3 IS NOT NULL AND substr(period,1,4)=?3)))) GROUP BY track_object_id), window AS (
-               SELECT listens.media_uri,count(*) play_count,COALESCE(sum(listened_millis),0) listened_millis
-               FROM tracks member CROSS JOIN listens ON listens.media_uri=member.media_uri
-               WHERE member.source_key=?1
-                 AND (?4 OR (?2 IS NOT NULL AND local_period=?2) OR (?3 IS NOT NULL AND substr(local_period,1,4)=?3)) GROUP BY listens.media_uri
-             ), facts AS (
-               SELECT track.track_key,
-                      COALESCE(window.play_count,0)+COALESCE(baseline.play_count,0) play_count,
-                      COALESCE(window.listened_millis,0) listened_millis
-               FROM tracks track LEFT JOIN window USING(media_uri)
-               LEFT JOIN period_baseline baseline ON baseline.track_object_id=track.object_id
-               WHERE track.source_key=?1
-             )
-             SELECT artist.artist_key,artist.name,sum(facts.play_count) play_count,
-                    sum(facts.listened_millis) listened_millis
-             FROM facts JOIN track_artists credit USING(track_key) JOIN artists artist USING(artist_key)
-             GROUP BY artist.artist_key HAVING play_count>0
-             ORDER BY play_count DESC,artist.sort_text,artist.artist_key LIMIT ?5",
-        )
-        .bind(source).bind(&month).bind(&year).bind(lifetime).bind(limit)
-        .fetch_all(&mut *transaction).await?;
-        let genres = sqlx::query_as::<_, ActivityGenreRow>(
-            "WITH period_baseline AS (SELECT track_object_id,sum(play_count) play_count,sum(skip_count) skip_count,max(last_played_at) last_played_at FROM activity_baseline WHERE source_key=?1 AND item_kind='track' AND ((?4 AND period='lifetime') OR (NOT ?4 AND ((?2 IS NOT NULL AND period=?2) OR (?3 IS NOT NULL AND substr(period,1,4)=?3)))) GROUP BY track_object_id), window AS (
-               SELECT listens.media_uri,count(*) play_count,COALESCE(sum(listened_millis),0) listened_millis
-               FROM tracks member CROSS JOIN listens ON listens.media_uri=member.media_uri
-               WHERE member.source_key=?1
-                 AND (?4 OR (?2 IS NOT NULL AND local_period=?2) OR (?3 IS NOT NULL AND substr(local_period,1,4)=?3)) GROUP BY listens.media_uri
-             ), facts AS (
-               SELECT track.track_key,
-                      COALESCE(window.play_count,0)+COALESCE(baseline.play_count,0) play_count,
-                      COALESCE(window.listened_millis,0) listened_millis
-               FROM tracks track LEFT JOIN window USING(media_uri)
-               LEFT JOIN period_baseline baseline ON baseline.track_object_id=track.object_id
-               WHERE track.source_key=?1
-             )
-             SELECT genre.genre_key,genre.name,sum(facts.play_count) play_count,
-                    sum(facts.listened_millis) listened_millis
-             FROM facts JOIN track_genres credit USING(track_key) JOIN genres genre USING(genre_key)
-             GROUP BY genre.genre_key HAVING play_count>0
-             ORDER BY play_count DESC,genre.sort_text,genre.genre_key LIMIT ?5",
-        )
-        .bind(source).bind(&month).bind(&year).bind(lifetime).bind(limit)
-        .fetch_all(&mut *transaction).await?;
-        transaction.commit().await?;
-        Ok(CalendarActivitySummary {
-            tracks,
-            albums,
-            artists,
-            genres,
-        })
     }
 
     pub async fn due_listen_deliveries(
@@ -610,33 +314,6 @@ impl Database {
     }
 }
 
-fn calendar_filter(
-    period: CalendarActivityPeriod,
-) -> LibraryResult<(Option<String>, Option<String>, bool)> {
-    match period {
-        CalendarActivityPeriod::Lifetime => Ok((None, None, true)),
-        CalendarActivityPeriod::Year(year) if (1970..=9999).contains(&year) => {
-            Ok((None, Some(format!("{year:04}")), false))
-        }
-        CalendarActivityPeriod::Year(_) => Err(LibraryError::InvalidRequest(
-            "Activity year is out of range".to_string(),
-        )),
-        CalendarActivityPeriod::Month { year, month } => {
-            if !(1..=12).contains(&month) {
-                return Err(LibraryError::InvalidRequest(
-                    "Activity month must be between 1 and 12".to_string(),
-                ));
-            }
-            if !(1970..=9999).contains(&year) {
-                return Err(LibraryError::InvalidRequest(
-                    "Activity year is out of range".to_string(),
-                ));
-            }
-            Ok((Some(format!("{year:04}-{month:02}")), None, false))
-        }
-    }
-}
-
 fn validate_listen(listen: &ListenWrite, deliveries: &[ListenDeliveryTarget]) -> LibraryResult<()> {
     if listen.external_id.as_deref().is_some_and(str::is_empty) || listen.media_uri.is_empty() {
         return Err(LibraryError::InvalidRequest(
@@ -690,26 +367,41 @@ pub(crate) async fn write_listen(
     connection: &mut SqliteConnection,
     listen: &ListenWrite,
     source_id: Option<&str>,
-) -> LibraryResult<ListenKey> {
-    write_imported_listen(connection, listen, source_id, None).await
-}
-
-pub(crate) async fn write_imported_listen(
-    connection: &mut SqliteConnection,
-    listen: &ListenWrite,
-    source_id: Option<&str>,
+    current_media_uri: Option<&str>,
     imported_key: Option<i64>,
-) -> LibraryResult<ListenKey> {
+) -> LibraryResult<(ListenKey, bool)> {
     validate_listen(listen, &[])?;
+    crate::catalog::remember_track(
+        connection,
+        &crate::TrackReference {
+            media_uri: current_media_uri.unwrap_or(&listen.media_uri).to_owned(),
+            metadata: crate::TrackMetadata {
+                title: listen.title.clone(),
+                artist: listen.artist.clone(),
+                album: listen.album.clone(),
+                duration_millis: listen.duration_millis,
+                disc_number: listen.disc_number.unwrap_or_default(),
+                track_number: listen.track_number.unwrap_or_default(),
+                year: listen.year,
+                release_date: listen.release_date.clone(),
+                source_format: listen.source_format.clone(),
+                musicbrainz_recording_id: listen.musicbrainz_recording_id.clone(),
+                musicbrainz_release_track_id: listen.musicbrainz_release_track_id.clone(),
+                ..Default::default()
+            },
+            artwork_binding: None,
+        },
+    )
+    .await?;
     let inserted = sqlx::query_scalar::<_, ListenKey>(
         "INSERT INTO listens(
-                 external_id,source_id,media_uri,listen_key,
+                 external_id,source_id,media_uri,listen_key,captured_media_uri,
                  track_title,artist_name,album_title,
                  disc_number,track_number,year,release_date,source_format,
                  musicbrainz_recording_id,musicbrainz_release_track_id,
                  started_at,local_period,duration_millis,listened_millis,skipped
              ) VALUES (
-                 ?1,?2,?3,?19,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,
+                 ?1,?2,?3,?19,?20,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,
                  ?17,?18
              )
              ON CONFLICT DO NOTHING
@@ -717,7 +409,7 @@ pub(crate) async fn write_imported_listen(
     )
     .bind(&listen.external_id)
     .bind(source_id)
-    .bind(&listen.media_uri)
+    .bind(current_media_uri.unwrap_or(&listen.media_uri))
     .bind(&listen.title)
     .bind(&listen.artist)
     .bind(&listen.album)
@@ -744,6 +436,11 @@ pub(crate) async fn write_imported_listen(
     .bind(listen.listened_millis)
     .bind(listen.skipped)
     .bind(imported_key)
+    .bind(
+        current_media_uri
+            .filter(|uri| *uri != listen.media_uri)
+            .map(|_| &listen.media_uri),
+    )
     .fetch_optional(&mut *connection)
     .await?;
     let key = if let Some(key) = inserted {
@@ -760,7 +457,7 @@ pub(crate) async fn write_imported_listen(
                 )
             })?
     };
-    Ok(key)
+    Ok((key, inserted.is_some()))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -774,6 +471,7 @@ struct ActivityExportRow {
     listen_key: i64,
     utc_time: String,
     source_id: Option<String>,
+    current_media_uri: Option<String>,
     #[sqlx(flatten)]
     listen: ListenWrite,
 }
@@ -795,10 +493,11 @@ pub(crate) async fn import_activity_jsonl_on(
                 continue;
             }
         };
-        write_imported_listen(
+        write_listen(
             connection,
             &record.listen,
             record.source_id.as_deref(),
+            record.current_media_uri.as_deref(),
             Some(record.listen_key),
         )
         .await?;
@@ -885,6 +584,7 @@ pub(crate) async fn export_activity_jsonl_on(
                 version: 1,
                 listen_key: row.listen_key,
                 source_id: row.source_id,
+                current_media_uri: row.current_media_uri,
                 listen: row.listen,
             },
         )?;
@@ -916,7 +616,169 @@ pub(crate) async fn write_legacy_activity(
     connection: &mut SqliteConnection,
     record: &LegacyActivityRecord,
 ) -> LibraryResult<()> {
+    if record.item_kind == "track" {
+        let known = sqlx::query_scalar::<_, String>(
+            "SELECT track.media_uri FROM tracks track JOIN sources source USING(source_key)
+             WHERE source.object_id=?1 AND track.object_id=?2",
+        )
+        .bind(&record.source_id)
+        .bind(&record.track_object_id)
+        .fetch_optional(&mut *connection)
+        .await?;
+        if known.is_none() {
+            let uri =
+                crate::normalize_direct_media_uri(&record.track_object_id).unwrap_or_else(|| {
+                    crate::source_entity_uri(
+                        &SourceId::new(&record.source_id),
+                        "track",
+                        &record.track_object_id,
+                    )
+                });
+            crate::catalog::remember_track(
+                connection,
+                &crate::TrackReference {
+                    media_uri: uri,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+    }
     sqlx::query("INSERT INTO legacy_activity(source_id,period,item_kind,track_object_id,play_count,skip_count,last_played_at) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(source_id,period,item_kind,track_object_id) DO UPDATE SET play_count=excluded.play_count,skip_count=excluded.skip_count,last_played_at=excluded.last_played_at")
             .bind(&record.source_id).bind(&record.period).bind(&record.item_kind).bind(&record.track_object_id).bind(record.play_count).bind(record.skip_count).bind(record.last_played_at).execute(&mut *connection).await?;
+    Ok(())
+}
+
+pub(crate) fn history_query(
+    current: Option<&SourceId>,
+    filter: &str,
+    descending: bool,
+) -> crate::query::OrderedQuery {
+    let current = current.map(|source| crate::query::quote(source.as_str()));
+    let filter: String = filter.trim().to_lowercase().chars().take(256).collect();
+    let filter = crate::query::quote(&filter);
+    let sources = if let Some(source) = current.as_ref() {
+        vec![
+            format!("listen.source_id={source}"),
+            format!(
+                "listen.source_id IS NULL AND EXISTS (
+            SELECT 1 FROM tracks member WHERE member.media_uri=listen.media_uri
+            AND member.source_key=(SELECT source_key FROM sources WHERE object_id={source}))"
+            ),
+        ]
+    } else {
+        vec!["1".into()]
+    };
+    let recent_source = if let Some(source) = current.as_ref() {
+        format!(
+            "AND (recent.source_id={source} OR (recent.source_id IS NULL AND EXISTS (
+            SELECT 1 FROM tracks member WHERE member.media_uri=recent.media_uri
+            AND member.source_key=(SELECT source_key FROM sources WHERE object_id={source}))))"
+        )
+    } else {
+        String::new()
+    };
+    let filter = format!("AND (instr(lower(listen.track_title),{filter})>0 OR instr(lower(listen.artist_name),{filter})>0
+        OR instr(lower(listen.album_title),{filter})>0)");
+    let recent_filter = filter.replace("listen.", "recent.");
+    // Read at most 100 from each indexed source branch before the final merge.
+    let selected = sources
+        .into_iter()
+        .map(|source| {
+            format!(
+                "SELECT * FROM (SELECT listen.* FROM listens listen WHERE {source} {filter}
+        AND listen.listen_key=(SELECT recent.listen_key FROM listens recent
+            WHERE recent.media_uri=listen.media_uri {recent_source} {recent_filter}
+            ORDER BY recent.started_at DESC,recent.listen_key DESC LIMIT 1)
+        ORDER BY listen.started_at DESC,listen.listen_key DESC LIMIT {HISTORY_LIMIT})"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let direction = if descending { "DESC" } else { "ASC" };
+    crate::query::OrderedQuery {
+        albumless:false,
+        key:"listen.listen_key".into(),text:None,
+        from: format!("(SELECT * FROM ({selected}) ORDER BY started_at DESC,listen_key DESC LIMIT {HISTORY_LIMIT}) listen
+            JOIN tracks track USING(media_uri) LEFT JOIN albums album ON album.album_key=track.album_key"),
+        predicate: "1".into(),
+        order: vec![format!("listen.started_at {direction}"), format!("listen.listen_key {direction}")],
+        uri: "track.media_uri".into(),
+        entry_key: "NULL".into(),
+        arguments: Default::default(),
+    }
+}
+
+pub(crate) async fn load_history_page(
+    connection: &mut SqliteConnection,
+    query: &crate::query::OrderedQuery,
+    offset: usize,
+    limit: usize,
+) -> LibraryResult<Vec<crate::TrackView>> {
+    let selected: Vec<(TrackKey, ListenKey)> = crate::query::selected_rows_on(
+        connection,
+        query,
+        "track.track_key,listen.listen_key",
+        Some(std::slice::from_ref(
+            &(offset..offset.saturating_add(limit.min(HISTORY_LIMIT as usize))),
+        )),
+        None,
+    )
+    .await?;
+    let keys = selected.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+    let listens = selected.iter().map(|(_, key)| *key).collect::<Vec<_>>();
+    let mut songs = crate::tracks::load_track_rows(connection, &keys).await?;
+    overlay_history(connection, &mut songs, Some(&listens)).await?;
+    Ok(songs)
+}
+
+pub(crate) async fn overlay_history(
+    connection: &mut SqliteConnection,
+    songs: &mut [crate::TrackView],
+    selected: Option<&[ListenKey]>,
+) -> LibraryResult<()> {
+    use sqlx::Row;
+    let uris = songs.iter().map(|song| &song.media_uri).collect::<Vec<_>>();
+    let sql = format!(
+        "SELECT listen.*,listen.track_title title,listen.artist_name artist,listen.album_title album,{} local_plays,{} local_skips FROM json_each(?1) requested JOIN tracks track ON track.media_uri=requested.value JOIN listens listen ON listen.listen_key=coalesce(json_extract(?2,'$['||requested.key||']'),(SELECT listen_key FROM listens WHERE media_uri=track.media_uri ORDER BY started_at DESC,listen_key DESC LIMIT 1))",
+        crate::tracks::local_stat("play_count"),
+        crate::tracks::local_stat("skip_count")
+    );
+    let mut facts = std::collections::HashMap::new();
+    for row in sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(serde_json::to_string(&uris)?)
+        .bind(selected.map(serde_json::to_string).transpose()?)
+        .fetch_all(connection)
+        .await?
+    {
+        let listen = ListenWrite::from_row(&row)?;
+        let plays = row.try_get::<i64, _>("local_plays")?;
+        let skips = row.try_get::<i64, _>("local_skips")?;
+        facts.insert(listen.media_uri.clone(), (listen, plays, skips));
+    }
+    for song in songs {
+        let Some((listen, plays, skips)) = facts.get(&song.media_uri) else {
+            continue;
+        };
+        let metadata = &mut song.metadata;
+        metadata.title.clone_from(&listen.title);
+        metadata.artist.clone_from(&listen.artist);
+        metadata.album.clone_from(&listen.album);
+        metadata.duration_millis = listen.duration_millis;
+        metadata.disc_number = listen.disc_number.unwrap_or_default();
+        metadata.track_number = listen.track_number.unwrap_or_default();
+        metadata.year = listen.year;
+        metadata.release_date.clone_from(&listen.release_date);
+        metadata.source_format.clone_from(&listen.source_format);
+        metadata
+            .musicbrainz_recording_id
+            .clone_from(&listen.musicbrainz_recording_id);
+        metadata
+            .musicbrainz_release_track_id
+            .clone_from(&listen.musicbrainz_release_track_id);
+        song.state.last_played = Some(listen.started_at);
+        song.state.play_count = *plays;
+        song.state.skip_count = *skips;
+    }
     Ok(())
 }

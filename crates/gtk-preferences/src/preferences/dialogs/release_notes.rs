@@ -47,7 +47,12 @@ pub fn schedule_periodic_release_checks(shell: &Rc<Preferences>) {
     if let Some(source) = shell.state.release_check_source.borrow_mut().take() {
         source.remove();
     }
-    let hours = shell.settings.current.borrow().release_check_interval_hours;
+    let hours = shell
+        .settings
+        .current
+        .borrow()
+        .application
+        .release_check_interval_hours;
     let weak_shell = Rc::downgrade(shell);
     let source =
         glib::timeout_add_local(Duration::from_secs(u64::from(hours) * 60 * 60), move || {
@@ -548,11 +553,11 @@ fn present_release_notes_dialog(
         }
         button.update_state(&[gtk::accessible::State::Busy(true)]);
         feedback.set_visible_child_name("checking");
-        let result = release_check.check_now();
+        let release_check = release_check.clone();
         let button = button.downgrade();
         let feedback = feedback.downgrade();
         glib::spawn_future_local(async move {
-            let success = result.recv().await.unwrap_or(false);
+            let success = release_check.check_now().await;
             let (Some(button), Some(feedback)) = (button.upgrade(), feedback.upgrade()) else {
                 return;
             };
@@ -802,8 +807,6 @@ impl Preferences {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use rufin_core::runtime::{ReleaseHistory, ReleaseNote};
 
     use super::{
@@ -843,34 +846,32 @@ mod tests {
 
     #[test]
     fn only_the_latest_newer_release_gets_an_update_action() {
-        let notes: Arc<[ReleaseNote]> = vec![
-            ReleaseNote {
-                version: "2.0.0".to_string(),
-                date: String::new(),
-                url: "https://github.com/screwys/Rufin/releases/tag/v2.0.0".to_string(),
-                body: String::new(),
-            },
-            ReleaseNote {
-                version: "1.0.0".to_string(),
-                date: String::new(),
-                url: "https://github.com/screwys/Rufin/releases/tag/v1.0.0".to_string(),
-                body: String::new(),
-            },
-        ]
-        .into();
         let history = ReleaseHistory {
-            notes: Arc::clone(&notes),
+            notes: vec![
+                ReleaseNote {
+                    version: "2.0.0".to_string(),
+                    date: String::new(),
+                    url: "https://github.com/screwys/Rufin/releases/tag/v2.0.0".to_string(),
+                    body: String::new(),
+                },
+                ReleaseNote {
+                    version: "1.0.0".to_string(),
+                    date: String::new(),
+                    url: "https://github.com/screwys/Rufin/releases/tag/v1.0.0".to_string(),
+                    body: String::new(),
+                },
+            ],
             installed_version: "1.0.0".to_string(),
             available_version: Some("2.0.0".to_string()),
             automatic_updates_supported: true,
         };
 
         assert_eq!(
-            release_row_status(&history, &notes[0]),
+            release_row_status(&history, &history.notes[0]),
             ReleaseRowStatus::Update
         );
         assert_eq!(
-            release_row_status(&history, &notes[1]),
+            release_row_status(&history, &history.notes[1]),
             ReleaseRowStatus::Installed
         );
     }

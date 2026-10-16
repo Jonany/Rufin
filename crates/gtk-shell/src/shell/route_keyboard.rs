@@ -11,7 +11,7 @@ use gtk_media_menus::media_menus::{
 };
 use gtk_player::outputs::{select_next_audio_output, select_previous_audio_output};
 use gtk_widgets::selection::TrackSelectionSnapshot;
-use playback::QueuePlacement;
+use rufin_core::playback::{QueuePlacement, QueueSelection};
 use std::rc::Rc;
 #[derive(Clone, Copy)]
 enum SelectionShortcut {
@@ -79,7 +79,7 @@ impl Shell {
                     && shell.playback_keyboard_available()
                     && !focus_blocks_playback_shortcut(current_focus.as_ref())
                 {
-                    shell.products.playback.transport.play_pause();
+                    shell.products.playback.play_pause();
                     return glib::Propagation::Stop;
                 }
                 if key
@@ -161,21 +161,20 @@ impl Shell {
             let Some(queue) = self.player_ui.selected_queue() else {
                 return false;
             };
+            let Some(selection) = queue.selected_rows() else {
+                return false;
+            };
             match shortcut {
-                SelectionShortcut::Play(_) => {
-                    let Some(occurrence) = queue
-                        .selected_occurrences()
-                        .and_then(|occurrences| occurrences.first().cloned())
-                    else {
-                        return false;
-                    };
-                    self.products.playback.queue.activate(occurrence);
-                }
+                SelectionShortcut::Play(_) => match selection.selection {
+                    QueueSelection::Occurrences(ids) => {
+                        self.products.playback.activate_occurrence(ids[0]);
+                    }
+                    QueueSelection::Positions(positions) => {
+                        self.products.playback.activate(positions[0]);
+                    }
+                },
                 SelectionShortcut::AddToPlaylist => {
-                    let Some(media_uris) = queue.selected_media_uris() else {
-                        return false;
-                    };
-                    present_playlist_picker_media_uris(self, media_uris.iter().cloned());
+                    present_playlist_picker_media_uris(self, selection.media_uris.iter().cloned());
                 }
                 SelectionShortcut::Download => return false,
                 SelectionShortcut::Delete => unreachable!(),
@@ -187,7 +186,7 @@ impl Shell {
         {
             match shortcut {
                 SelectionShortcut::Play(placement) => {
-                    selection.play(&self.products.playback.queue, placement, false)
+                    selection.play(&self.products.playback, placement, false)
                 }
                 SelectionShortcut::AddToPlaylist => {
                     present_playlist_picker_entries(self, selection)
@@ -204,7 +203,7 @@ impl Shell {
         };
         match shortcut {
             SelectionShortcut::Play(placement) => {
-                selection.play(&self.products.playback.queue, placement, false)
+                selection.play(&self.products.playback, placement, false)
             }
             SelectionShortcut::AddToPlaylist => present_playlist_picker_selection(self, selection),
             SelectionShortcut::Download => {
@@ -217,17 +216,14 @@ impl Shell {
 
     fn remove_focused_selection(self: &Rc<Self>, focus: Option<&gtk::Widget>) -> bool {
         if self.queue_selection_focused(focus) {
-            let Some(occurrences) = self
+            let Some(selection) = self
                 .player_ui
                 .selected_queue()
-                .and_then(|queue| queue.selected_occurrences())
+                .and_then(|queue| queue.selected_rows())
             else {
                 return false;
             };
-            self.products
-                .playback
-                .queue
-                .remove_many(occurrences.to_vec());
+            self.products.playback.remove_many(selection.selection);
             return true;
         }
         self.current_playlist_entry_selection_snapshot()
@@ -386,11 +382,15 @@ mod tests {
         let primary = gtk::gdk::ModifierType::CONTROL_MASK;
         assert!(matches!(
             selection_shortcut(gtk::gdk::Key::Return, gtk::gdk::ModifierType::empty()),
-            Some(SelectionShortcut::Play(playback::QueuePlacement::Now))
+            Some(SelectionShortcut::Play(
+                rufin_core::playback::QueuePlacement::Now
+            ))
         ));
         assert!(matches!(
             selection_shortcut(gtk::gdk::Key::Return, primary),
-            Some(SelectionShortcut::Play(playback::QueuePlacement::Next))
+            Some(SelectionShortcut::Play(
+                rufin_core::playback::QueuePlacement::Next
+            ))
         ));
         assert!(matches!(
             selection_shortcut(

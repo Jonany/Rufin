@@ -1,6 +1,9 @@
 //! Translates supported released formats into the ordinary user-state writers.
+pub(crate) mod current;
 mod legacy;
+pub(crate) mod snapshots;
 use crate::{Database, LibraryError, LibraryResult, SourceId, source_entity_uri};
+pub(crate) use current::import as import_current;
 use futures_util::TryStreamExt;
 use sqlx::{
     Connection, Row, SqliteConnection,
@@ -133,116 +136,6 @@ fn track_uri(row: &SqliteRow, source: &str, object: &str) -> Option<String> {
     direct.or_else(|| crate::normalize_direct_media_uri(object))
 }
 
-/// Preserve the normalized released catalog; only changed representations need conversion.
-async fn convert_catalog(input: &Path, destination: &Path) -> LibraryResult<()> {
-    Database::relocate(input, destination).await?;
-    let mut target = SqliteConnection::connect_with(
-        &SqliteConnectOptions::new()
-            .filename(destination)
-            .foreign_keys(false),
-    )
-    .await?;
-    sqlx::raw_sql(
-        "ALTER TABLE sources ADD COLUMN distinct_track_covers INTEGER NOT NULL DEFAULT 0;
-        ALTER TABLE albums ADD COLUMN media_uri TEXT;
-        ALTER TABLE artists ADD COLUMN media_uri TEXT;
-        ALTER TABLE playlists RENAME TO released_playlists;
-        ALTER TABLE playlist_entries RENAME TO released_playlist_entries;
-        ALTER TABLE released_playlist_entries ADD COLUMN media_uri TEXT;
-        ALTER TABLE lyrics_cache RENAME TO released_lyrics;
-        ALTER TABLE local_access_files RENAME TO released_local_access;
-        DROP TABLE favorite_outbox; DROP TABLE smart_playlists; DROP TABLE listens;
-        DROP TABLE listen_outbox; DROP TABLE queue_occurrences; DROP TABLE queue_state;",
-    )
-    .execute(&mut target)
-    .await?;
-    let sources: BTreeMap<i64, String> = sqlx::query_as("SELECT source_key,object_id FROM sources")
-        .fetch_all(&mut target)
-        .await?
-        .into_iter()
-        .collect();
-    sqlx::query(
-        "CREATE TEMP TABLE converted_uris(entity_key INTEGER PRIMARY KEY,uri TEXT NOT NULL)",
-    )
-    .execute(&mut target)
-    .await?;
-    for (table, key, kind) in [
-        ("albums", "album_key", "album"),
-        ("artists", "artist_key", "artist"),
-        ("tracks", "track_key", "track"),
-        ("released_playlist_entries", "playlist_entry_key", "track"),
-    ] {
-        let mut after = 0_i64;
-        loop {
-            let select = if table == "released_playlist_entries" {
-                "SELECT entry.playlist_entry_key,playlist.source_key,entry.track_object_id object_id,track.media_uri
-                 FROM released_playlist_entries entry JOIN released_playlists playlist USING(playlist_key)
-                 LEFT JOIN tracks track ON track.source_key=playlist.source_key AND track.object_id=entry.track_object_id
-                 WHERE entry.playlist_entry_key>?1 ORDER BY entry.playlist_entry_key LIMIT 256".to_string()
-            } else {
-                format!("SELECT * FROM {table} WHERE {key}>?1 ORDER BY {key} LIMIT 256")
-            };
-            let rows = sqlx::query(sqlx::AssertSqlSafe(select))
-                .bind(after)
-                .fetch_all(&mut target)
-                .await?;
-            if rows.is_empty() {
-                break;
-            }
-            let mut values = Vec::with_capacity(rows.len());
-            for row in &rows {
-                after = row.try_get(key)?;
-                let source = &sources[&row.try_get::<i64, _>("source_key")?];
-                let object: String = row.try_get("object_id")?;
-                let uri = (kind == "track")
-                    .then(|| track_uri(row, source, &object))
-                    .flatten()
-                    .unwrap_or_else(|| source_entity_uri(&SourceId::new(source), kind, &object));
-                values.push((after, uri));
-            }
-            let mut insert = sqlx::QueryBuilder::new("INSERT INTO converted_uris(entity_key,uri) ");
-            insert.push_values(&values, |mut row, (key, uri)| {
-                row.push_bind(key).push_bind(uri);
-            });
-            insert.build().execute(&mut target).await?;
-            sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {table} SET media_uri=(SELECT uri FROM converted_uris WHERE entity_key={key}) WHERE {key} IN (SELECT entity_key FROM converted_uris)")))
-                .execute(&mut target).await?;
-            sqlx::query("DELETE FROM converted_uris")
-                .execute(&mut target)
-                .await?;
-        }
-        if table != "released_playlist_entries" {
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "CREATE UNIQUE INDEX {table}_media_uri_idx ON {table}(media_uri)"
-            )))
-            .execute(&mut target)
-            .await?;
-        }
-    }
-    crate::schema::initialize_catalog(&mut target).await?;
-    sqlx::raw_sql("INSERT INTO native_playlists(playlist_key,source_key,object_id,name,normalized_name,sort_text,artwork_binding)
-        SELECT playlist_key,source_key,object_id,name,normalized_name,sort_text,artwork_binding
-        FROM released_playlists WHERE ownership='source' AND object_id NOT LIKE 'rufin:playlist:%'
-            AND source_key IN (SELECT source_key FROM sources WHERE object_id<>'local:server:library');
-        INSERT INTO native_playlist_entries(playlist_entry_key,playlist_key,object_id,media_uri,title,artist,album,album_display_artist,
-            duration_millis,disc_number,track_number,year,release_date,source_format,musicbrainz_recording_id,musicbrainz_release_track_id,position)
-        SELECT entry.playlist_entry_key,entry.playlist_key,entry.object_id,entry.media_uri,track.title,track.display_artist,track.display_album,
-            album.display_artist,track.duration_millis,track.disc_number,track.track_number,track.year,track.release_date,track.source_format,
-            track.musicbrainz_recording_id,track.musicbrainz_release_track_id,entry.position
-        FROM released_playlist_entries entry JOIN native_playlists playlist USING(playlist_key)
-        LEFT JOIN tracks track ON track.source_key=playlist.source_key AND track.object_id=entry.track_object_id
-        LEFT JOIN albums album ON album.album_key=track.album_key;
-        INSERT INTO lyrics_cache SELECT track.media_uri,lyrics.authority,lyrics.role,lyrics.language,lyrics.script,
-            lyrics.cache_input_digest,lyrics.lyrics,lyrics.updated_at FROM released_lyrics lyrics JOIN tracks track USING(track_key);
-        INSERT INTO local_access_metadata SELECT media_uri,size_bytes,mtime_ns,device_id,inode,parser_version,title,normalized_title,
-            album,normalized_album,artist,normalized_artist,disc_number,track_number,duration_millis,loudness_analysis_key
-            FROM released_local_access WHERE true ON CONFLICT(access_uri) DO NOTHING;
-        DROP TABLE released_playlist_entries; DROP TABLE released_lyrics; DROP TABLE released_local_access;")
-        .execute(&mut target).await?;
-    target.close().await?;
-    Ok(())
-}
-
 /// A version selects a known reader; arbitrary damaged/current databases are never salvaged.
 pub(crate) async fn import_released(
     input: &Path,
@@ -264,11 +157,23 @@ pub(crate) async fn import_released(
         .prefix("rufin-migration-")
         .tempdir_in(parent)?;
     let pending = stage.path().join("store.sqlite");
-    let pending_catalog = stage.path().join("catalog.sqlite");
-    if version >= 41 && !catalog.exists() {
-        convert_catalog(input, &pending_catalog).await?;
+    let database = Database::open_final(&pending).await?;
+    if version >= 41 {
+        let mut writer = database.writer().await?;
+        let connection = writer.as_mut().ok_or(LibraryError::WriterUnavailable)?;
+        current::attach(connection, input, "released").await?;
+        if catalog.exists() {
+            current::attach(connection, catalog, "old_catalog").await?;
+        }
+        let mut transaction = connection.begin().await?;
+        let target = &mut *transaction;
+        if catalog.exists() {
+            current::copy_catalog(target, "old_catalog", false).await?;
+        } else {
+            current::copy_catalog(target, "released", true).await?;
+        }
+        transaction.commit().await?;
     }
-    let database = Database::open_final(&pending, &pending_catalog).await?;
     let mut lookup = reader(input).await?;
     if version < 41 {
         legacy::import(&mut source, &mut lookup, &database, selected).await?;
@@ -293,10 +198,52 @@ pub(crate) async fn import_released(
         let order = serde_json::to_string(&order)?;
         {
             let mut writer = database.writer().await?;
-            let target = writer.as_mut().ok_or(LibraryError::WriterUnavailable)?;
+            let connection = writer.as_mut().ok_or(LibraryError::WriterUnavailable)?;
+            let mut transaction = connection.begin().await?;
+            let target = &mut *transaction;
             for id in sources.values() {
                 crate::db::write_source_identity(target, id).await?;
             }
+            current::create_metadata_candidates(target).await?;
+            for (table, priority, stamp, key) in [
+                ("playlist_entries", 1, "snapshot_at", "playlist_entry_key"),
+                (
+                    "queue_occurrences",
+                    2,
+                    "snapshot_at",
+                    "queue_occurrence_key",
+                ),
+                ("listens", 3, "started_at", "listen_key"),
+            ] {
+                let query = if table == "playlist_entries" {
+                    "SELECT entry.*,playlist.source_key FROM playlist_entries entry JOIN playlists playlist USING(playlist_key)".to_string()
+                } else {
+                    format!("SELECT * FROM {table}")
+                };
+                let mut rows = sqlx::query(sqlx::AssertSqlSafe(query)).fetch(&mut source);
+                while let Some(row) = rows.try_next().await? {
+                    let result = async {
+                        let uri = media_uri(&mut lookup, &sources, &row, "track").await?;
+                        current::row_candidate(
+                            target,
+                            &row,
+                            &uri,
+                            priority,
+                            integer(&row, stamp).unwrap_or(0),
+                            integer(&row, key).unwrap_or(0),
+                            table == "listens",
+                        )
+                        .await
+                    }
+                    .await;
+                    imported(result, "saved metadata")?;
+                }
+            }
+            if catalog.exists() {
+                current::native_candidates(target).await?;
+            }
+            current::saved_candidates(target, "released").await?;
+            current::reduce_metadata(target).await?;
             import_playlists(&mut source, &mut lookup, target, &sources, &order, version).await?;
             import_smart(&mut source, target, &order).await?;
             import_user_state(&mut source, &mut lookup, target, &sources).await?;
@@ -309,33 +256,44 @@ pub(crate) async fn import_released(
             }
             drop(history);
             import_locators(&mut source, &mut lookup, target, &sources).await?;
+            transaction.commit().await?;
         }
         import_queue(&mut source, &mut lookup, &database, &sources, selected).await?;
     }
-    if version >= 41 && !catalog.exists() {
+    if version >= 41 {
         let mut writer = database.writer().await?;
         let target = writer.as_mut().ok_or(LibraryError::WriterUnavailable)?;
-        sqlx::raw_sql("UPDATE catalog.home_entries SET entity_key=(
-            SELECT current.playlist_key FROM catalog.released_playlists old JOIN temp.playlists current ON current.object_id=old.object_id
-            WHERE old.playlist_key=home_entries.entity_key AND (current.source_key=home_entries.source_key OR current.source_key IS NULL) LIMIT 1)
-            WHERE entity_kind='playlist';
-            DROP TABLE catalog.released_playlists;")
+        if catalog.exists() {
+            current::copy_native_playlists(target).await?;
+        } else {
+            sqlx::query("UPDATE home_entries SET entity_key=(SELECT current.playlist_key FROM released.playlists old JOIN sources source ON source.source_key=home_entries.source_key JOIN playlists current ON current.object_id=old.object_id AND (current.source_key=source.source_key OR current.source_key IS NULL) WHERE old.playlist_key=home_entries.entity_key LIMIT 1) WHERE entity_kind='playlist'")
             .execute(target).await?;
+        }
+    }
+    {
+        let mut writer = database.writer().await?;
+        normalize_stored_artwork(writer.as_mut().ok_or(LibraryError::WriterUnavailable)?).await?;
     }
     source.close().await?;
     lookup.close().await?;
     database.close().await?;
-    if version >= 41 && !catalog.exists() {
-        Database::relocate(&pending_catalog, catalog).await?;
-    }
+    install(&pending, input, destination)?;
+    Ok(())
+}
+
+fn install(pending: &Path, input: &Path, destination: &Path) -> LibraryResult<()> {
     std::fs::OpenOptions::new()
         .write(true)
-        .open(&pending)?
+        .open(pending)?
         .sync_all()?;
     if input == destination {
         crate::db::preserve_store(input)?;
     }
-    std::fs::rename(&pending, destination)?;
+    std::fs::rename(pending, destination)?;
+    #[cfg(unix)]
+    if let Some(parent) = destination.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -365,10 +323,10 @@ async fn import_playlists(
             let old_source=integer(&row,"source_key").and_then(|key|sources.get(&key)).cloned();
             let authored=string(&row,"ownership").as_deref()==Some("user") || old_source.is_none()
                 || id.starts_with("rufin:playlist:") || old_source.as_deref()==Some("local:server:library");
-            let identity=crate::PlaylistIdentity {source_id:if authored {None}else{old_source.clone()},object_id:id,
-                name:if authored {string(&row,"name")}else{None},position:rank};
+            let identity=crate::PlaylistIdentity {source_owned:!authored,source_id:if authored {None}else{old_source.clone()},object_id:id,
+                name:string(&row,"name"),position:rank};
             let key=crate::playlists::write_playlist_identity(target,&identity).await?;
-            if authored {
+            {
                 let old_key=integer(&row,"playlist_key").ok_or_else(||LibraryError::InvalidStore("playlist key unreadable".into()))?;
                 let mut after=-1;
                 loop {
@@ -388,13 +346,14 @@ async fn import_playlists(
                         let text=|name:&str,track_name:&str| string(&entry,name).or_else(||track.as_ref().and_then(|track|string(track,track_name)));
                         let number=|name:&str| integer(&entry,name).or_else(||track.as_ref().and_then(|track|integer(track,name)));
                         let write=crate::PlaylistEntryWrite {
-                            object_id:string(&entry,"object_id").ok_or_else(||LibraryError::InvalidStore("occurrence ID unreadable".into()))?,media_uri:uri,
-                            title:text("title","title"),artist:text("artist","display_artist"),album:text("album","display_album"),
-                            album_display_artist:text("album_display_artist","album_display_artist"),snapshot_at:integer(&entry,"snapshot_at").unwrap_or(0),
-                            duration_millis:number("duration_millis"),disc_number:number("disc_number"),track_number:number("track_number"),year:number("year"),
-                            release_date:text("release_date","release_date"),source_format:text("source_format","source_format"),
-                            musicbrainz_recording_id:text("musicbrainz_recording_id","musicbrainz_recording_id"),
-                            musicbrainz_release_track_id:text("musicbrainz_release_track_id","musicbrainz_release_track_id"),position:after};
+                            object_id:string(&entry,"object_id").ok_or_else(||LibraryError::InvalidStore("occurrence ID unreadable".into()))?,
+                            track:crate::TrackReference{media_uri:uri,metadata:crate::TrackMetadata{
+                                title:text("title","title").unwrap_or_default(),artist:text("artist","display_artist").unwrap_or_default(),album:text("album","display_album").unwrap_or_default(),
+                                album_display_artist:text("album_display_artist","album_display_artist"),
+                                duration_millis:number("duration_millis").unwrap_or_default(),disc_number:number("disc_number").unwrap_or_default(),track_number:number("track_number").unwrap_or_default(),year:number("year"),
+                                release_date:text("release_date","release_date"),source_format:text("source_format","source_format"),
+                                musicbrainz_recording_id:text("musicbrainz_recording_id","musicbrainz_recording_id"),
+                                musicbrainz_release_track_id:text("musicbrainz_release_track_id","musicbrainz_release_track_id"),..Default::default()},artwork_binding:None},position:after};
                         crate::playlists::write_playlist_entry(target,key,&write).await
                     }.await;
                     imported(entry_result,"playlist occurrence")?;
@@ -429,6 +388,7 @@ async fn import_smart(
                 object.remove("source_id");
             }
             let record = crate::SmartPlaylistWrite {
+                artwork_binding: None,
                 artwork_bytes: None,
                 object_id: string(&row, "object_id")
                     .or_else(|| string(&row, "smart_playlist_id"))
@@ -528,7 +488,7 @@ async fn import_listens(
                 release_date:string(&row,"release_date"),source_format:string(&row,"source_format"),
                 musicbrainz_recording_id:string(&row,"musicbrainz_recording_id"),musicbrainz_release_track_id:string(&row,"musicbrainz_release_track_id"),
                 started_at:row.try_get("started_at")?,local_period:row.try_get("local_period")?,listened_millis:row.try_get("listened_millis")?,skipped:row.try_get("skipped")?};
-            let key=crate::activity::write_imported_listen(target,&listen,source_id.as_deref(),Some(old_key)).await?;
+            let (key,_)=crate::activity::write_listen(target,&listen,source_id.as_deref(),None,Some(old_key)).await?;
             if has_delivery {
                 let mut deliveries=sqlx::query("SELECT * FROM listen_outbox WHERE listen_key=?1").bind(old_key).fetch(&mut *lookup);
                 while let Some(delivery)=deliveries.try_next().await? {
@@ -653,24 +613,28 @@ async fn import_queue(
                 let number = |name: &str| {
                     integer(&row, name).or_else(|| integer(&row, &format!("fallback_{name}")))
                 };
-                let item = crate::QueueItem {
+                let item = crate::TrackReference {
                     media_uri: uri,
+                    artwork_binding:None,
+                    metadata:crate::TrackMetadata{
                     title: text("title").unwrap_or_default(),
                     artist: text("artist").unwrap_or_default(),
                     album: text("album").unwrap_or_default(),
                     album_display_artist: text("album_display_artist"),
-                    artwork_binding: None,
                     duration_millis: number("duration_millis").unwrap_or(0).max(0),
-                    disc_number: number("disc_number").filter(|value| *value >= 0),
-                    track_number: number("track_number").filter(|value| *value >= 0),
+                    disc_number: number("disc_number").unwrap_or_default().max(0),
+                    track_number: number("track_number").unwrap_or_default().max(0),
                     year: number("year"),
                     release_date: text("release_date"),
                     source_format: text("source_format"),
+                    audio_properties: Default::default(),
                     musicbrainz_recording_id: text("musicbrainz_recording_id").filter(|value| !value.is_empty()),
                     musicbrainz_release_track_id: text("musicbrainz_release_track_id").filter(|value| !value.is_empty()),
                     musicbrainz_album_id: text("musicbrainz_album_id").filter(|value| !value.is_empty()),
                     musicbrainz_release_group_id: text("musicbrainz_release_group_id").filter(|value| !value.is_empty()),
                     primary_artist_musicbrainz_id: text("primary_artist_musicbrainz_id").filter(|value| !value.is_empty()),
+                    ..Default::default()
+                    }
                 };
                 let provenance = match string(&row, "provenance_kind").as_deref() {
                     Some("context") => crate::QueueProvenance::Context {
@@ -694,9 +658,9 @@ async fn import_queue(
                     .ok_or_else(|| {
                         LibraryError::InvalidStore("Queue occurrence ID unreadable".into())
                     })?;
-                Ok(crate::QueueOccurrence {
+                Ok(crate::queue::LegacyQueueRow {
                     source_index:None,playlist_entry_id:None,
-                    occurrence: crate::OccurrenceId::new(id),
+                    occurrence: id,
                     item,
                     canonical_position: integer(&row,"position").filter(|position|*position>=0).ok_or_else(||LibraryError::InvalidStore("Queue position unreadable".into()))? as usize,
                     provenance,
@@ -732,5 +696,34 @@ async fn import_queue(
     }
     .await;
     imported(result, "Queue")?;
+    Ok(())
+}
+
+async fn normalize_stored_artwork(connection: &mut sqlx::SqliteConnection) -> LibraryResult<()> {
+    for table in ["tracks", "playlists", "smart_playlists"] {
+        let column = if table != "tracks" {
+            "artwork_binding"
+        } else {
+            "native_artwork"
+        };
+        let mut after = 0_i64;
+        loop {
+            let rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT rowid,{column} FROM {table} WHERE rowid>?1 AND json_type({column})='object' ORDER BY rowid LIMIT 128"))).bind(after).fetch_all(&mut *connection).await?;
+            if rows.is_empty() {
+                break;
+            }
+            for (key, binding) in rows {
+                after = key;
+                let normalized = crate::normalize_artwork_binding(&binding)?;
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "UPDATE {table} SET {column}=?1 WHERE rowid=?2"
+                )))
+                .bind(normalized)
+                .bind(key)
+                .execute(&mut *connection)
+                .await?;
+            }
+        }
+    }
     Ok(())
 }

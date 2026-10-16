@@ -1,10 +1,10 @@
 use gtk::{gio, glib, prelude::*, subclass::prelude::*};
-use library::{PlaylistEntryKey, PlaylistKey};
-use playback::QueuePlacement;
+use library::PlaylistKey;
+use rufin_core::playback::QueuePlacement;
 use std::{cell::RefCell, sync::Arc};
 pub(crate) type CollectionSelection = Box<
     dyn Fn(
-        &rufin_core::playback::PlaybackTarget,
+        &rufin_core::playback::PlayRequest,
         &gtk::Bitset,
     ) -> Option<crate::media_drag::CollectionTargets>,
 >;
@@ -233,7 +233,7 @@ impl PositionSelectionModel {
 
     pub(crate) fn collection_selection(
         &self,
-        target: &rufin_core::playback::PlaybackTarget,
+        target: &rufin_core::playback::PlayRequest,
         positions: &gtk::Bitset,
     ) -> Option<crate::media_drag::CollectionTargets> {
         if let Some(capture) = self.imp().collection_selection.borrow().as_ref() {
@@ -250,20 +250,25 @@ impl PositionSelectionModel {
 
 #[derive(Clone)]
 pub struct TrackSelectionSnapshot {
-    pub input: library::QueueInput,
+    pub input: library::TrackSelection,
     pub count: usize,
 }
 impl TrackSelectionSnapshot {
-    pub fn play(&self, queue: &playback::QueueHandle, placement: QueuePlacement, shuffled: bool) {
-        queue.play(
-            playback::PlayRequest::ordered(self.input.clone(), 0, placement, false)
+    pub fn play(
+        &self,
+        queue: &rufin_core::playback::PlaybackOwner,
+        placement: QueuePlacement,
+        shuffled: bool,
+    ) {
+        queue.play_selection(
+            rufin_core::playback::PlayRequest::ordered(self.input.clone(), 0, placement, false)
                 .shuffled(shuffled),
         );
     }
 
     pub async fn media_uris(&self, database: &library::Database) -> Result<Vec<String>, String> {
         database
-            .selected_track_uris(&self.input, &library::ReadCancellation::new())
+            .selected_track_uris(&self.input, None, &library::ReadCancellation::new())
             .await
             .map_err(|error| error.to_string())
     }
@@ -273,38 +278,25 @@ pub struct PlaylistEntrySelectionSnapshot {
     pub writable: bool,
     pub playlist: PlaylistKey,
     pub playlist_name: Arc<str>,
-    pub input: library::QueueInput,
+    pub input: library::TrackSelection,
     pub count: usize,
 }
 impl PlaylistEntrySelectionSnapshot {
     pub async fn media_uris(&self, database: &library::Database) -> Result<Vec<String>, String> {
-        self.resolve(database).await.map(|(_, uris)| uris)
-    }
-
-    pub async fn resolve(
-        &self,
-        database: &library::Database,
-    ) -> Result<(Vec<PlaylistEntryKey>, Vec<String>), String> {
-        let cancellation = library::ReadCancellation::new();
-        let keys = database
-            .selected_playlist_entries(&self.input, &cancellation)
+        database
+            .selected_track_uris(&self.input, None, &library::ReadCancellation::new())
             .await
-            .map_err(|error| error.to_string())?;
-        let mut media_uris = Vec::with_capacity(keys.len());
-        for entries in keys.chunks(256) {
-            media_uris.extend(
-                database
-                    .playlist_entry_media_uris(self.playlist, entries, &cancellation)
-                    .await
-                    .map_err(|error| error.to_string())?,
-            );
-        }
-        Ok((keys, media_uris))
+            .map_err(|error| error.to_string())
     }
 
-    pub fn play(&self, queue: &playback::QueueHandle, placement: QueuePlacement, shuffled: bool) {
-        queue.play(
-            playback::PlayRequest::ordered(self.input.clone(), 0, placement, false)
+    pub fn play(
+        &self,
+        queue: &rufin_core::playback::PlaybackOwner,
+        placement: QueuePlacement,
+        shuffled: bool,
+    ) {
+        queue.play_selection(
+            rufin_core::playback::PlayRequest::ordered(self.input.clone(), 0, placement, false)
                 .shuffled(shuffled),
         );
     }
@@ -360,4 +352,98 @@ mod tests {
             ["one", "three"]
         );
     }
+}
+
+pub fn collection_play_request(scope: library::TrackScope) -> rufin_core::playback::PlayRequest {
+    let context = match &scope {
+        library::TrackScope::Tracks(key) => format!("tracks:{key}"),
+        library::TrackScope::Objects { source, .. } => format!("objects:{source}"),
+        library::TrackScope::Album(key) => format!("album:{key}"),
+        library::TrackScope::Artist { key, album_artist } => format!(
+            "{}:{key}",
+            if *album_artist {
+                "album-artist"
+            } else {
+                "artist"
+            }
+        ),
+        library::TrackScope::Genre(key) => format!("genre:{key}"),
+        library::TrackScope::Mood(key) => format!("mood:{key}"),
+        library::TrackScope::Playlist(key) => format!("playlist:{key}"),
+        library::TrackScope::Smart { key, .. } => format!("smart-playlist:{key}"),
+        library::TrackScope::History { source } => format!("history:{source:?}"),
+    };
+    rufin_core::playback::PlayRequest::ordered(
+        library::CatalogQuery::tracks(scope).selection(),
+        0,
+        QueuePlacement::Now,
+        true,
+    )
+    .with_context(context.into())
+}
+
+pub fn track_play_request(key: library::TrackKey) -> rufin_core::playback::PlayRequest {
+    rufin_core::playback::PlayRequest::ordered(
+        library::CatalogQuery::keys(library::CatalogKind::Track, None, vec![key.raw()]).selection(),
+        0,
+        QueuePlacement::Now,
+        false,
+    )
+}
+
+pub fn smart_play_request(
+    key: library::SmartPlaylistKey,
+    selected: Option<&rufin_core::runtime::SelectedLibrary>,
+) -> rufin_core::playback::PlayRequest {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |value| value.as_secs() as i64);
+    let query = library::CatalogQuery {
+        folder: selected.and_then(|selected| selected.music_folder_key),
+        ..library::CatalogQuery::tracks(library::TrackScope::Smart {
+            key,
+            source: selected.map(|selected| selected.source_key),
+            now,
+        })
+    };
+    rufin_core::playback::PlayRequest::ordered(query.selection(), 0, QueuePlacement::Now, true)
+        .with_context(format!("smart-playlist:{key}").into())
+}
+
+pub fn album_play_request(row: &library::AlbumView) -> rufin_core::playback::PlayRequest {
+    rufin_core::playback::PlayRequest::ordered(
+        library::CatalogQuery::tracks(library::TrackScope::Album(row.album_key)).selection(),
+        0,
+        QueuePlacement::Now,
+        true,
+    )
+    .with_context(format!("album:{}", row.media_uri).into())
+}
+
+pub fn artist_play_request(
+    row: &library::ArtistView,
+    album_artist: bool,
+) -> rufin_core::playback::PlayRequest {
+    rufin_core::playback::PlayRequest::ordered(
+        library::CatalogQuery::tracks(library::TrackScope::Artist {
+            key: row.artist_key,
+            album_artist,
+        })
+        .selection(),
+        0,
+        QueuePlacement::Now,
+        true,
+    )
+    .with_context(
+        format!(
+            "{}:{}",
+            if album_artist {
+                "album-artist"
+            } else {
+                "artist"
+            },
+            row.media_uri
+        )
+        .into(),
+    )
 }

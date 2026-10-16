@@ -1,5 +1,7 @@
 package io.github.screwys.rufin.sources
 
+import io.github.screwys.rufin.shared.rufin_core.*
+
 import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.BackHandler
@@ -28,6 +30,7 @@ import kotlinx.coroutines.delay
 internal fun SourceSetupScreen(model: RufinConnection, onClose: () -> Unit, sourceId: String? = null, connectionsOnly: Boolean = false) {
     val setup = remember(model, sourceId) { model.sourceSetupSession(sourceId) }
     val form = setup.form
+    var mapping by remember { mutableStateOf(false) }
     var saved by remember(setup) { mutableStateOf(false) }
     LaunchedEffect(saved) {
         if (saved) { delay(2000); saved = false }
@@ -47,9 +50,11 @@ internal fun SourceSetupScreen(model: RufinConnection, onClose: () -> Unit, sour
         "emby" -> form.manualEmby && form.url.isNotBlank() || setup.authorized && setup.choices.isNotEmpty() || sourceId != null
         else -> setup.authorized || form.url.isNotBlank()
     }
+    if (mapping && sourceId != null) LocalAccessDialog(model, sourceId,
+        onDismiss = { mapping = false }, onSaved = { mapping = false })
     Scaffold(topBar = {
             TopAppBar(title = {
-                Text(setup.providers.firstOrNull { it.kind == form.kind }?.title ?: translate(
+                Text(setup.providers.firstOrNull { it.first == form.kind }?.second ?: translate(
                     if (sourceId != null) "Edit Source" else if (connectionsOnly) "File connection" else "Add Source"))
             }, navigationIcon = {
                 IconButton({ if (sourceId == null && form.kind != null) { setup.cancelAuthorization(); form.kind = null } else close() }) {
@@ -72,15 +77,20 @@ internal fun SourceSetupScreen(model: RufinConnection, onClose: () -> Unit, sour
         }
     }) { padding ->
         Column(Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding).imePadding()) {
-            if (setup.working) LinearProgressIndicator(Modifier.fillMaxWidth())
+            if (setup.working) {
+                LinearProgressIndicator(Modifier.fillMaxWidth())
+                model.sourceStatus?.let {
+                    Text(it, Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.bodySmall)
+                }
+            }
             setup.failure?.let { io.github.screwys.rufin.ui.ErrorNotice(it) }
             if (!setup.ready) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) { if (setup.failure == null) CircularProgressIndicator() }
             else if (form.kind == null) LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(16.dp)) {
                 item { SettingsGroup {
-                setup.providers.filter { !connectionsOnly || it.kind in setOf("webdav", "smb") }.forEach { provider ->
-                    SettingsRow(provider.title, leading = { SourceIcon(provider.kind, Modifier.size(24.dp)) },
+                setup.providers.filter { !connectionsOnly || it.first in setOf("webdav", "smb") }.forEach { provider ->
+                    SettingsRow(provider.second, leading = { SourceIcon(provider.first, Modifier.size(24.dp)) },
                         trailing = { RufinIcon("rufin-go-next-symbolic", null) }, modifier = Modifier.clickable {
-                            setup.selectProvider(provider.kind)
+                            setup.selectProvider(provider.first)
                             if (connectionsOnly) setup.form.integration = true
                         })
                 }
@@ -97,6 +107,11 @@ internal fun SourceSetupScreen(model: RufinConnection, onClose: () -> Unit, sour
                 }
             } else LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                if (sourceId != null && !form.integration && form.kind in setOf("jellyfin", "emby", "plex", "navidrome", "subsonic")) item {
+                    SettingsGroup { SettingsRow(translate("Local File Mapping"),
+                        trailing = { RufinIcon("rufin-go-next-symbolic", null) },
+                        modifier = Modifier.clickable(enabled = !setup.working) { mapping = true }) }
+                }
                 item { SourceTextField("Name", form.name, { form.name = it }, !setup.working) }
                 when (form.kind) {
                     "jellyfin", "emby" -> item { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {

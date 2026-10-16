@@ -32,7 +32,7 @@ pub enum OperationArtwork {
 }
 
 pub struct OperationFeedback {
-    pub subject: DownloadSubject,
+    pub title: String,
     pub artwork: OperationArtwork,
     pub item_count: usize,
     pub kind: OperationFeedbackKind,
@@ -110,13 +110,20 @@ impl DownloadsState {
         image.set_visible(false);
     }
     pub fn set_download_badge_visible(&self, image: &gtk::Image, downloaded: bool) {
-        image.set_visible(self.settings.current.borrow().show_downloaded_badges && downloaded);
+        image.set_visible(
+            self.settings
+                .current
+                .borrow()
+                .application
+                .show_downloaded_badges
+                && downloaded,
+        );
     }
     pub fn set_downloaded_badges_visible(self: &Rc<Self>, visible: bool) {
         if self
             .settings
             .set_app_setting("downloaded badge setting", visible, |settings| {
-                &mut settings.show_downloaded_badges
+                &mut settings.application.show_downloaded_badges
             })
             .is_some()
         {
@@ -151,7 +158,7 @@ pub fn media_artwork(
     media_uris: &[String],
     size: i32,
 ) -> gtk::Widget {
-    let projection = artwork.cover_group_projection_for_artwork(&[], size, size);
+    let projection = artwork.cover_group_projection_for_artwork(&[], size, size, true);
     let widget = projection.widget();
     let database = Arc::clone(database);
     let media_uris = media_uris.iter().take(4).cloned().collect::<Vec<_>>();
@@ -186,7 +193,7 @@ pub fn download_rule_artwork(
     rule: downloads::DownloadRule,
     size: i32,
 ) -> gtk::Widget {
-    let projection = artwork.cover_group_projection_for_artwork(&[], size, size);
+    let projection = artwork.cover_group_projection_for_artwork(&[], size, size, true);
     let widget = projection.widget();
     let database = Arc::clone(database);
     let task = runtime.spawn(async move {

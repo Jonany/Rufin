@@ -1,3 +1,4 @@
+use super::refresh::check_cancelled;
 use super::*;
 
 use crate::remote_http::{self, BodyLimit, RemoteHttpPolicy, RemoteTimeouts};
@@ -67,36 +68,55 @@ impl JellyfinEmbySource {
         )
     }
 
-    pub(crate) async fn stage_collection(
+    pub(super) async fn read_album(
         &self,
-        scan: &mut library::Scan,
-        collection: &crate::SourceCollection,
-    ) -> SourceResult<()> {
-        if let crate::SourceCollection::Album(album_id) = collection {
-            let raw = raw_item_id(album_id);
-            let mut url = self.item_url(raw)?;
-            url.query_pairs_mut()
-                .append_pair("UserId", &self.user_id)
-                .append_pair("Fields", ALBUM_FIELDS);
-            match self.get_json::<Value>(url).await {
-                Ok(item) => {
-                    let album = album_from_item(self.kind, &item);
-                    drop(item);
-                    if let Some(album) = album {
-                        stage_album(scan, album).await?;
-                    }
-                }
-                Err(error) => crate::source::optional_collection_error(error)?,
+        source_id: &str,
+        raw: &str,
+    ) -> SourceResult<Option<library::AlbumObservation>> {
+        let mut url = self.item_url(raw)?;
+        url.query_pairs_mut()
+            .append_pair("UserId", &self.user_id)
+            .append_pair("Fields", ALBUM_FIELDS);
+        match self.get_json::<Value>(url).await {
+            Ok(item) => Ok(album_from_item(self.kind, source_id, &item)?),
+            Err(error) => {
+                crate::source::optional_collection_error(error)?;
+                Ok(None)
             }
         }
-        self.stage_collection_contents(scan, collection).await
     }
 
-    pub(super) async fn stage_collection_contents(
+    pub(crate) async fn acquire_collection(
         &self,
-        scan: &mut library::Scan,
+        catalog: &mut library::Catalog<'_>,
         collection: &crate::SourceCollection,
+        header: Option<&Value>,
+        complete_membership: bool,
+        cancelled: &(dyn Fn() -> bool + Send + Sync),
     ) -> SourceResult<()> {
+        let database = catalog.database;
+        let source_id = catalog.source_id;
+        let stamp = catalog.observed;
+
+        let stamp = if complete_membership && stamp.is_none() {
+            Some(catalog.start_observation().await?)
+        } else {
+            stamp
+        };
+        if let crate::SourceCollection::Album(id) = collection {
+            let album = match header {
+                Some(item) => album_from_item(self.kind, source_id, item)?,
+                None => self.read_album(source_id, raw_item_id(id)).await?,
+            };
+            if let Some(album) = album {
+                let batch = library::CatalogBatch {
+                    albums: vec![album],
+                    ..Default::default()
+                };
+                check_cancelled(cancelled)?;
+                catalog.apply_catalog(&batch, true).await?;
+            }
+        }
         let mut pages = PageState::default();
         loop {
             let mut staged_albums = std::collections::HashSet::new();
@@ -136,73 +156,89 @@ impl JellyfinEmbySource {
                 field(&page, "TotalRecordCount"),
             )?;
             let mut tracks = Vec::new();
-            for item in items(&page["Items"]) {
-                if matches!(collection, crate::SourceCollection::Album(_)) || is_audio_item(item) {
-                    if let Some(album_id) = id(&item["AlbumId"]) {
-                        if staged_albums.insert(album_id.clone()) {
-                            let mut url = self.item_url(&album_id)?;
-                            url.query_pairs_mut()
-                                .append_pair("UserId", &self.user_id)
-                                .append_pair("Fields", ALBUM_FIELDS);
-                            match self.get_json::<Value>(url).await {
-                                Ok(item) => {
-                                    let album = album_from_item(self.kind, &item);
-                                    drop(item);
-                                    if let Some(album) = album {
-                                        stage_album(scan, album).await?;
-                                    }
+            let mut albums = Vec::new();
+            let result: SourceResult<()> = async {
+                for item in items(&page["Items"]) {
+                    if matches!(collection, crate::SourceCollection::Album(_))
+                        || is_audio_item(item)
+                    {
+                        if let Some(album_id) = id(&item["AlbumId"]) {
+                            if staged_albums.insert(album_id.clone()) {
+                                albums.extend(self.read_album(source_id, &album_id).await?);
+                            }
+                        }
+                        if let Some(mut track) = track_from_item(self.kind, source_id, item)? {
+                            if track.album_object_id.is_none() {
+                                if let crate::SourceCollection::Album(id) = collection {
+                                    track.album_object_id = Some(id.clone());
                                 }
-                                Err(error) => crate::source::optional_collection_error(error)?,
                             }
-                        }
-                    }
-                    if let Some(mut track) = track_from_item(self.kind, item) {
-                        if track.album_id.is_none() {
-                            if let crate::SourceCollection::Album(id) = collection {
-                                track.album_id = Some(id.clone());
+                            let owner =
+                                track.album_object_id.as_deref().unwrap_or(&track.object_id);
+                            if !album_folders.contains_key(owner) {
+                                album_folders.insert(
+                                    owner.to_string(),
+                                    self.item_folders(source_id, raw_item_id(owner)).await?,
+                                );
                             }
+                            track.folders = album_folders[owner].as_ref().map(|folders| {
+                                folders
+                                    .iter()
+                                    .map(|folder| folder.object_id.clone())
+                                    .collect()
+                            });
+                            tracks.push(track);
                         }
-                        let owner = track.album_id.as_deref().unwrap_or(&track.id);
-                        if !album_folders.contains_key(owner) {
-                            album_folders.insert(
-                                owner.to_string(),
-                                self.stage_item_folders(scan, raw_item_id(owner)).await?,
-                            );
+                    } else if item["Type"]
+                        .as_str()
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("MusicAlbum"))
+                    {
+                        if let Some(album) = album_from_item(self.kind, source_id, item)? {
+                            albums.push(album);
                         }
-                        tracks.push(track);
-                    }
-                } else if item["Type"]
-                    .as_str()
-                    .is_some_and(|kind| kind.eq_ignore_ascii_case("MusicAlbum"))
-                {
-                    if let Some(album) = album_from_item(self.kind, item) {
-                        stage_album(scan, album).await?;
                     }
                 }
+                Ok(())
             }
+            .await;
             drop(page);
-            scan.begin_batch().await?;
-            for track in tracks {
-                let owner = track.album_id.as_deref().unwrap_or(&track.id);
-                if let Some(folders) = &album_folders[owner] {
-                    scan.replace_track_folders(
-                        &track.id,
-                        &folders
-                            .iter()
-                            .map(|(id, position)| library::ScanLink::new(&track.id, id, *position))
-                            .collect::<Vec<_>>(),
-                    )
-                    .await?;
-                }
-                stage_track(scan, track).await?;
-            }
-            scan.finish_batch().await?;
+            let mut batch = library::CatalogBatch::default();
+            batch.albums = albums;
+            batch.folders.extend_from_slice(
+                &album_folders
+                    .into_values()
+                    .flatten()
+                    .flatten()
+                    .collect::<Vec<_>>(),
+            );
+            batch.tracks = tracks;
+            check_cancelled(cancelled)?;
+            catalog.apply_catalog(&batch, true).await?;
+            result?;
             if finished {
                 break;
             }
         }
-        if let crate::SourceCollection::Album(id) = collection {
-            scan.replace_album_membership(id).await?;
+        if complete_membership && let crate::SourceCollection::Album(id) = collection {
+            let mut after = None;
+            loop {
+                let missing = database
+                    .omitted_album_track_page(source_id, id, stamp.unwrap(), after.as_deref(), 100)
+                    .await?;
+                if missing.is_empty() {
+                    break;
+                }
+                after = missing.last().cloned();
+                let ids = missing
+                    .iter()
+                    .map(|id| raw_item_id(id).to_owned())
+                    .collect();
+                Box::pin(self.acquire_items(catalog, ids, Vec::new(), cancelled)).await?;
+            }
+            check_cancelled(cancelled)?;
+            catalog
+                .complete_album_observation(&id, stamp.unwrap())
+                .await?;
         }
         Ok(())
     }
@@ -297,69 +333,40 @@ impl JellyfinEmbySource {
 
     pub(crate) async fn live_search(
         &self,
-        source_id: &SourceId,
-        database: &library::Database,
+        source_id: &str,
         query: &str,
         limit: usize,
-    ) -> SourceResult<(library::SearchResults, Option<library::ScanOutcome>)> {
+    ) -> SourceResult<library::CatalogBatch> {
         if query.trim().is_empty() {
-            return Ok((library::SearchResults::default(), None));
+            return Ok(library::CatalogBatch::default());
         }
         let limit = limit.clamp(1, 100);
-        let (artists, albums, tracks) = tokio::join!(
+        let (artists, albums, songs) = tokio::join!(
             self.search_people(query, limit),
             self.search_items("MusicAlbum", ALBUM_FIELDS, query, limit),
-            self.search_items("Audio", TRACK_FIELDS, query, limit),
+            self.search_items("Audio", TRACK_FIELDS, query, limit)
         );
-        if artists.is_err() && albums.is_err() && tracks.is_err() {
-            return Err(tracks.err().expect("failed track search"));
+        if artists.is_err() && albums.is_err() && songs.is_err() {
+            return Err(songs.err().unwrap());
         }
-        let artists = artists.unwrap_or_default();
-        let albums = albums.unwrap_or_default();
-        let tracks = tracks.unwrap_or_default();
-        let mut scan = library::Scan::begin_items(database, source_id.as_str()).await?;
-        let source = scan
-            .existing_source()
-            .ok_or(SourceError::InvalidRequest("Search source is unavailable"))?;
-        scan.begin_batch().await?;
-        let mut artist_ids = Vec::new();
-        let mut album_ids = Vec::new();
-        let mut track_ids = Vec::new();
-        for artist in artists
-            .into_iter()
-            .filter_map(|item| artist_from_item(self.kind, &item))
-        {
-            artist_ids.push(artist.id.clone());
-            stage_artist(&mut scan, artist).await?;
-        }
-        for album in albums
-            .into_iter()
-            .filter_map(|item| album_from_item(self.kind, &item))
-        {
-            album_ids.push(album.id.clone());
-            stage_album(&mut scan, album).await?;
-        }
-        for track in tracks
-            .into_iter()
-            .filter_map(|item| track_from_item(self.kind, &item))
-        {
-            track_ids.push(track.id.clone());
-            stage_track(&mut scan, track).await?;
-        }
-        scan.finish_batch().await?;
-        let outcome = scan.finish().await?;
-        let rows = database
-            .search_rows_by_objects(
-                source,
-                None,
-                false,
-                &track_ids,
-                &album_ids,
-                &artist_ids,
-                &library::ReadCancellation::new(),
-            )
-            .await?;
-        Ok((rows, Some(outcome)))
+        Ok(library::CatalogBatch {
+            artists: artists
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|item| artist_from_item(self.kind, source_id, item).transpose())
+                .collect::<library::LibraryResult<_>>()?,
+            albums: albums
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|item| album_from_item(self.kind, source_id, item).transpose())
+                .collect::<library::LibraryResult<_>>()?,
+            tracks: songs
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|item| track_from_item(self.kind, source_id, item).transpose())
+                .collect::<library::LibraryResult<_>>()?,
+            ..Default::default()
+        })
     }
 
     async fn search_items(
@@ -389,7 +396,7 @@ impl JellyfinEmbySource {
     }
     async fn search_people(&self, query: &str, limit: usize) -> SourceResult<Vec<Value>> {
         let mut url = endpoint(&self.base_url, "Artists")?;
-        url.query_pairs_mut().append_pair("UserId",&self.user_id).append_pair("SearchTerm",query).append_pair("StartIndex","0").append_pair("Limit",&limit.to_string()).append_pair("Fields","ParentId,UserData,ItemCounts,ChildCount,AlbumCount,SongCount,ImageTags,ProviderIds,SortName");
+        url.query_pairs_mut().append_pair("UserId",&self.user_id).append_pair("SearchTerm",query).append_pair("StartIndex","0").append_pair("Limit",&limit.to_string()).append_pair("Fields","ParentId,UserData,ItemCounts,ChildCount,AlbumCount,SongCount,ImageTags,ImageBlurHashes,ProviderIds,SortName");
         let body: serde_json::Value = self.get_json(url).await?;
         Ok(body["Items"]
             .as_array()
@@ -402,10 +409,11 @@ impl JellyfinEmbySource {
 }
 
 impl JellyfinEmbySource {
-    pub(super) async fn stage_playlist_entries(
+    pub(super) async fn acquire_playlist_entries(
         &self,
-        scan: &mut library::Scan,
+        catalog: &mut library::Catalog<'_>,
         playlist_id: &str,
+        cancelled: &(dyn Fn() -> bool + Send + Sync),
     ) -> SourceResult<()> {
         let raw_playlist_id = raw_item_id(playlist_id);
         let mut pages = PageState::default();
@@ -425,17 +433,14 @@ impl JellyfinEmbySource {
             let count = items(&response["Items"]).len();
             let page_start = pages.offset();
             let finished = pages.advance(count, field(&response, "TotalRecordCount"))?;
-            scan.begin_batch().await?;
-            for (offset, item) in items(&response["Items"]).iter().enumerate() {
-                let Some((entry_id, track_id, position)) =
-                    playlist_entry(self.kind, item, page_start + offset)
-                else {
-                    continue;
-                };
-                scan.write_playlist_entry(playlist_id, &entry_id, &track_id, position)
-                    .await?;
-            }
-            scan.finish_batch().await?;
+            let entries: Vec<_> = items(&response["Items"])
+                .iter()
+                .filter_map(|item| playlist_entry(self.kind, item))
+                .collect();
+            check_cancelled(cancelled)?;
+            catalog
+                .write_source_playlist_page(&playlist_id, page_start, &entries, finished)
+                .await?;
             if finished {
                 return Ok(());
             }
@@ -443,18 +448,12 @@ impl JellyfinEmbySource {
     }
 }
 
-fn playlist_entry(
-    server: ServerKind,
-    item: &Value,
-    position: usize,
-) -> Option<(String, String, i64)> {
+fn playlist_entry(server: ServerKind, item: &Value) -> Option<library::PlaylistEntryObservation> {
     let track_id = id(&item["Id"])?;
-    let entry_id = id(&item["PlaylistItemId"])?;
-    Some((
-        entry_id,
-        server.object_id("track", &track_id),
-        position as i64,
-    ))
+    Some(library::PlaylistEntryObservation {
+        object_id: id(&item["PlaylistItemId"])?,
+        track_id: server.object_id("track", &track_id),
+    })
 }
 
 impl JellyfinEmbySource {
@@ -503,7 +502,7 @@ impl JellyfinEmbySource {
         }
     }
 
-    pub(crate) async fn create_playlist(
+    pub async fn create_playlist(
         &self,
         name: &str,
         tracks: &[String],
@@ -515,7 +514,7 @@ impl JellyfinEmbySource {
         }
     }
 
-    pub(crate) async fn update_playlist(
+    pub async fn update_playlist(
         &self,
         playlist: &str,
         name: Option<&str>,
@@ -541,7 +540,7 @@ impl JellyfinEmbySource {
         }
     }
 
-    pub(crate) async fn playlist_public(&self, playlist: &str) -> SourceResult<Option<bool>> {
+    pub async fn playlist_public(&self, playlist: &str) -> SourceResult<Option<bool>> {
         let raw = raw_item_id(playlist);
         match self.kind {
             ServerKind::Jellyfin => {
@@ -598,7 +597,7 @@ impl JellyfinEmbySource {
         }
     }
     pub(crate) async fn set_rating(&self, object_id: &str, rating: Option<u8>) -> SourceResult<()> {
-        // Emby's UserData write updates play state, not numeric ratings. The core
+        // Emby's UserData write changes play state, not numeric ratings. The core
         // already persists the user's stars locally before calling this method.
         if self.kind == ServerKind::Emby {
             return Ok(());
@@ -674,14 +673,14 @@ impl JellyfinEmbySource {
 }
 
 impl JellyfinEmbySource {
-    pub(crate) async fn delete_playlist(&self, playlist_id: &str) -> SourceResult<()> {
+    pub async fn delete_playlist(&self, playlist_id: &str) -> SourceResult<()> {
         let url = endpoint(
             &self.base_url,
             &format!("Items/{}", raw_item_id(playlist_id)),
         )?;
         self.send_unit(self.client.delete(url)).await
     }
-    pub(crate) async fn add_playlist_tracks(
+    pub async fn add_playlist_tracks(
         &self,
         playlist_id: &str,
         track_ids: &[String],
@@ -698,7 +697,7 @@ impl JellyfinEmbySource {
         }
         Ok(())
     }
-    pub(crate) async fn remove_playlist_entries(
+    pub async fn remove_playlist_entries(
         &self,
         playlist_id: &str,
         entry_ids: &[String],
@@ -714,7 +713,7 @@ impl JellyfinEmbySource {
         }
         Ok(())
     }
-    pub(crate) async fn move_playlist_entry(
+    pub async fn move_playlist_entry(
         &self,
         playlist_id: &str,
         entry_id: &str,
@@ -986,7 +985,7 @@ impl JellyfinEmbySource {
             .append_pair("Limit", &limit.to_string())
             .append_pair(
                 "Fields",
-                "ParentId,UserData,ItemCounts,ChildCount,AlbumCount,SongCount,ImageTags,ProviderIds,SortName",
+                "ParentId,UserData,ItemCounts,ChildCount,AlbumCount,SongCount,ImageTags,ImageBlurHashes,ProviderIds,SortName",
             );
 
         self.get_json::<Value>(url).await
@@ -1005,7 +1004,7 @@ impl JellyfinEmbySource {
             .append_pair("IncludeItemTypes", "Audio,MusicAlbum")
             .append_pair(
                 "Fields",
-                "UserData,ItemCounts,ChildCount,AlbumCount,SongCount,ImageTags",
+                "UserData,ItemCounts,ChildCount,AlbumCount,SongCount,ImageTags,ImageBlurHashes",
             )
             .append_pair("SortBy", "SortName");
 
@@ -1111,7 +1110,7 @@ impl PlaybackReportDto {
 #[cfg(test)]
 mod tests {
     use super::{playlist_entry, stream_descriptor};
-    use crate::jellyfin_emby::item::{album_from_item, stage_album, stage_track, track_from_item};
+    use crate::jellyfin_emby::item::{album_from_item, track_from_item};
     use crate::jellyfin_emby::{JellyfinEmbySource, JellyfinEmbySourceConfig};
     use serde_json::Value;
     use wiremock::matchers::{body_string, method, path, query_param};
@@ -1141,18 +1140,16 @@ mod tests {
                 .await;
             let result = JellyfinEmbySource::authenticate(
                 crate::SourceId::new("source"),
-                crate::JellyfinEmbySetupInput {
-                    kind: crate::ServerKind::Jellyfin,
-                    credentials: crate::CredentialHostInput {
-                        server_name: None,
-                        server_url: server.uri(),
-                        username: "listener".into(),
-                        password: "password".into(),
-                        trust_invalid_cert: false,
-                    },
-                    device_id: "device".into(),
-                    use_instant_mix: false,
+                crate::ServerKind::Jellyfin,
+                crate::CredentialInput {
+                    source_name: None,
+                    server_url: server.uri(),
+                    username: "listener".into(),
+                    secret: "password".into(),
+                    trust_invalid_cert: false,
                 },
+                false,
+                "device".into(),
             )
             .await;
             assert_eq!(result.is_ok(), succeeds);
@@ -1208,79 +1205,119 @@ mod tests {
             "device".into(),
         )
         .unwrap();
+        let owner = crate::Source::new(
+            crate::SourceId::new("source"),
+            crate::source::Implementation::JellyfinEmby(source),
+        );
+        let crate::source::Implementation::JellyfinEmby(source) = &owner.implementation else {
+            unreachable!()
+        };
+
         let root = tempfile::tempdir().unwrap();
         let database = library::Database::open(root.path().join("library.sqlite"))
             .await
             .unwrap();
-        let mut scan = library::Scan::begin(&database, "source", "Jellyfin", "jellyfin", None)
+        let (sender, mut updates) = tokio::sync::mpsc::unbounded_channel();
+        database.observe_catalog(move |_, update| {
+            let _ = sender.send(update);
+            std::future::ready(())
+        });
+        database
+            .reconcile_source(&library::SourceId::new("source"), "jellyfin", "Jellyfin")
             .await
             .unwrap();
-        stage_track(
-            &mut scan,
-            track_from_item(
+        let catalog_source_id = ("source").to_string();
+        let mut catalog = database.catalog(&catalog_source_id, None).await.unwrap();
+        catalog.start_observation().await.unwrap();
+
+        (async {
+            let mut batch = library::CatalogBatch::default();
+            let result = batch.tracks.extend_from_slice(&[(track_from_item(
                 crate::ServerKind::Jellyfin,
+                catalog_source_id.as_str(),
                 &serde_json::json!({"Id":"track","Name":"Track"}),
             )
-            .unwrap(),
-        )
+            .unwrap()
+            .unwrap())
+            .clone()]);
+            catalog.apply_catalog(&batch, true).await?;
+            Ok::<_, library::LibraryError>(result)
+        })
         .await
         .unwrap();
-        scan.write_playlist("jellyfin:playlist:list", "List", "list", "list", None)
-            .await
-            .unwrap();
+        (async {
+            let mut batch = library::CatalogBatch::default();
+            let result = batch.playlists.push(library::PlaylistObservation {
+                object_id: ("jellyfin:playlist:list").to_string(),
+                name: ("List").to_string(),
+                sort_text: ("list").to_string(),
+                ..Default::default()
+            });
+            catalog.apply_catalog(&batch, true).await?;
+            Ok::<_, library::LibraryError>(result)
+        })
+        .await
+        .unwrap();
         source
-            .stage_playlist_entries(&mut scan, "jellyfin:playlist:list")
+            .acquire_playlist_entries(&mut catalog, "jellyfin:playlist:list", &|| false)
             .await
             .unwrap();
-        let library::ScanOutcome::Changed(publication) = scan.finish().await.unwrap() else {
-            panic!("published playlist")
-        };
+        {
+            database
+                .publish_catalog_update(&catalog_source_id, catalog.changes().clone())
+                .await;
+            Ok::<_, crate::SourceError>(())
+        }
+        .unwrap();
+        let publication = updates.try_recv().expect("catalog update");
+        assert!(publication.metadata);
         let cancellation = library::ReadCancellation::new();
         let key = database
-            .playlist_key_by_object(publication.source, "jellyfin:playlist:list", &cancellation)
-            .await
-            .unwrap()
-            .unwrap();
-        let page = database
-            .playlist_detail_page(
-                key,
-                None,
-                library::PlaylistEntrySort::Position,
-                false,
-                library::RouteSeedWindow::top(),
+            .playlist_key_by_object(
+                database
+                    .source_identity_key(&library::SourceId::new(&catalog_source_id))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                "jellyfin:playlist:list",
                 &cancellation,
             )
             .await
             .unwrap()
             .unwrap();
+        let page = library::CatalogQuery::tracks(library::TrackScope::Playlist(key))
+            .page(&database, library::RouteSeedWindow::top(), &cancellation)
+            .await
+            .unwrap();
+        let library::CatalogRows::PlaylistEntries(entries) = page.rows else {
+            panic!("playlist entries")
+        };
         assert_eq!(
-            page.first_rows
-                .iter()
-                .map(|row| row.position)
-                .collect::<Vec<_>>(),
+            entries.iter().map(|row| row.position).collect::<Vec<_>>(),
             [0, 1]
         );
         assert_eq!(
             database
-                .source_playlist_entry_object_ids(
-                    publication.source,
+                .playlist_edit_entries(
                     key,
-                    &page
-                        .first_rows
-                        .iter()
-                        .map(|row| row.playlist_entry_key)
-                        .collect::<Vec<_>>(),
+                    &library::CatalogQuery::playlist_entries(
+                        entries
+                            .iter()
+                            .map(|row| row.playlist_entry_key)
+                            .collect::<Vec<_>>()
+                    )
+                    .selection(),
                     &cancellation
                 )
                 .await
-                .unwrap(),
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.object_id)
+                .collect::<Vec<_>>(),
             ["one", "two"]
         );
-        assert_eq!(page.first_rows[0].media_uri, page.first_rows[1].media_uri);
-        assert_ne!(
-            page.first_rows[0].playlist_entry_key,
-            page.first_rows[1].playlist_entry_key
-        );
+        assert_eq!(entries[0].track.media_uri, entries[1].track.media_uri);
+        assert_ne!(entries[0].playlist_entry_key, entries[1].playlist_entry_key);
     }
 
     #[test]
@@ -1297,17 +1334,12 @@ mod tests {
         .expect("playlist items");
         let entries = items
             .into_iter()
-            .enumerate()
-            .map(|(position, item)| {
-                playlist_entry(crate::ServerKind::Jellyfin, &item, position)
-                    .expect("complete entry")
-            })
+            .map(|item| playlist_entry(crate::ServerKind::Jellyfin, &item).expect("complete entry"))
             .collect::<Vec<_>>();
 
-        assert_eq!(entries[0].0, "entry-one");
-        assert_eq!(entries[1].0, "entry-two");
-        assert_eq!(entries[0].1, entries[1].1);
-        assert_eq!((entries[0].2, entries[1].2), (0, 1));
+        assert_eq!(entries[0].object_id, "entry-one");
+        assert_eq!(entries[1].object_id, "entry-two");
+        assert_eq!(entries[0].track_id, entries[1].track_id);
     }
 
     #[tokio::test]
@@ -1332,30 +1364,50 @@ mod tests {
             "device".into(),
         )
         .unwrap();
+        let owner = crate::Source::new(
+            crate::SourceId::new("song-search"),
+            crate::source::Implementation::JellyfinEmby(source),
+        );
+
         for cached in [false, true] {
             let root = tempfile::tempdir().unwrap();
             let database = library::Database::open(root.path().join("library.sqlite"))
                 .await
                 .unwrap();
             let source_id = crate::SourceId::new("song-search");
-            let mut scan =
-                library::Scan::begin(&database, source_id.as_str(), "Search", "search", None)
-                    .await
-                    .unwrap();
-            if cached {
-                stage_album(&mut scan, album_from_item(crate::ServerKind::Jellyfin, &serde_json::from_value(serde_json::json!({"Id":"album","Name":"Nonmatching album","Type":"MusicAlbum","ImageTags":{"Primary":"album-cover"}})).unwrap()).unwrap()).await.unwrap();
-            }
-            scan.finish().await.unwrap();
-            let (results, outcome) = source
-                .live_search(&source_id, &database, "Match", 10)
+            database
+                .reconcile_source(
+                    &library::SourceId::new(source_id.as_str()),
+                    "search",
+                    "Search",
+                )
                 .await
                 .unwrap();
-            assert!(matches!(outcome, Some(library::ScanOutcome::Changed(_))));
+            let catalog_source_id = (source_id.as_str()).to_string();
+            let mut catalog = database.catalog(&catalog_source_id, None).await.unwrap();
+            catalog.start_observation().await.unwrap();
+            if cached {
+                (async { let mut batch = library::CatalogBatch::default(); let result = batch.albums.extend_from_slice(&[(album_from_item(crate::ServerKind::Jellyfin, catalog_source_id.as_str(), &serde_json::from_value(serde_json::json!({"Id":"album","Name":"Nonmatching album","Type":"MusicAlbum","ImageTags":{"Primary":"album-cover"}})).unwrap()).unwrap().unwrap()).clone()]); catalog.apply_catalog(&batch, true).await?; Ok::<_,library::LibraryError>(result) }).await.unwrap();
+            }
+            {
+                database
+                    .publish_catalog_update(&catalog_source_id, catalog.changes().clone())
+                    .await;
+                Ok::<_, crate::SourceError>(())
+            }
+            .unwrap();
+            let (sender, mut updates) = tokio::sync::mpsc::unbounded_channel();
+            database.observe_catalog(move |_, update| {
+                let _ = sender.send(update);
+                std::future::ready(())
+            });
+            let results = owner.live_search(&database, "Match", 10).await.unwrap();
+            assert!(updates.try_recv().expect("catalog update").metadata);
             assert!(results.albums.is_empty());
             assert_eq!(results.tracks.len(), 1);
             let track = &results.tracks[0];
-            assert_eq!(track.album, "Nonmatching album");
-            assert_eq!(track.album_key.is_some(), cached);
+            assert_eq!(track.metadata.album, "Nonmatching album");
+            assert!(track.links.album_key.is_some());
             assert!(track.artwork_binding.is_some());
         }
     }
@@ -1371,7 +1423,7 @@ mod tests {
             }),
         ] {
             let item: Value = serde_json::from_value(item).expect("playlist item");
-            assert!(playlist_entry(crate::ServerKind::Jellyfin, &item, 0).is_none());
+            assert!(playlist_entry(crate::ServerKind::Jellyfin, &item).is_none());
         }
     }
 
@@ -1506,8 +1558,19 @@ mod tests {
             .and(query_param("IncludeItemTypes", "Audio"))
             .and(query_param("ParentId", "album"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "Items":[{"Id":"track","Name":"Track","RunTimeTicks":"420000000","ProductionYear":"2024"}]
+                "Items":[
+                    {"Id":"track","Name":"Track","RunTimeTicks":"420000000","ProductionYear":"2024"},
+                    {"Id":"second-track","Name":"Second Track","RunTimeTicks":"430000000","ProductionYear":"2024"}
+                ]
             }))).expect(1).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/Items/album/Ancestors"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"Id":"music","Name":"Music","CollectionType":"music"}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
         let source = JellyfinEmbySource::open(
             JellyfinEmbySourceConfig {
                 emby_connect: false,
@@ -1523,35 +1586,95 @@ mod tests {
             "device".into(),
         )
         .unwrap();
+        let owner = crate::Source::new(
+            crate::SourceId::new("source"),
+            crate::source::Implementation::JellyfinEmby(source),
+        );
+        let crate::source::Implementation::JellyfinEmby(source) = &owner.implementation else {
+            unreachable!()
+        };
+
         let root = tempfile::tempdir().unwrap();
         let database = library::Database::open(root.path().join("library.sqlite"))
             .await
             .unwrap();
-        let mut scan = library::Scan::begin(&database, "source", "Jellyfin", "jellyfin", None)
+        database
+            .reconcile_source(&library::SourceId::new("source"), "jellyfin", "Jellyfin")
             .await
             .unwrap();
+        let catalog_source_id = ("source").to_string();
+        let mut catalog = database.catalog(&catalog_source_id, None).await.unwrap();
+        catalog.start_observation().await.unwrap();
+
         source
-            .stage_collection(
-                &mut scan,
+            .acquire_collection(
+                &mut catalog,
                 &crate::SourceCollection::Album("jellyfin:album:album".into()),
+                None,
+                false,
+                &|| false,
             )
             .await
             .unwrap();
-        scan.finish().await.unwrap();
-        let track = database
-            .track_row_by_uri(
-                &library::source_entity_uri(
+        {
+            database
+                .publish_catalog_update(&catalog_source_id, catalog.changes().clone())
+                .await;
+            Ok::<_, crate::SourceError>(())
+        }
+        .unwrap();
+        let track = library::CatalogQuery::uris(
+            library::CatalogKind::Track,
+            vec![
+                (&library::source_entity_uri(
                     &crate::SourceId::new("source"),
                     "track",
                     "jellyfin:track:track",
-                ),
-                &library::ReadCancellation::new(),
+                ))
+                    .to_owned(),
+            ],
+        )
+        .rows(&database, 0, 256, &library::ReadCancellation::new())
+        .await
+        .map(|rows| match rows {
+            library::CatalogRows::Tracks(rows) => rows.into_iter().next(),
+            _ => unreachable!(),
+        })
+        .unwrap()
+        .expect("album track without repeated Type");
+        assert_eq!(track.metadata.duration_millis, 42_000);
+        assert_eq!(track.metadata.year, Some(2024));
+        let cancellation = library::ReadCancellation::new();
+        let source = database
+            .cached_source("source", &cancellation)
+            .await
+            .unwrap()
+            .unwrap()
+            .source;
+        let folder = database
+            .catalog_keys(
+                library::CatalogKind::Folder,
+                Some(source),
+                &["jellyfin:music-folder:music".into()],
+                &cancellation,
             )
             .await
             .unwrap()
-            .expect("album track without repeated Type");
-        assert_eq!(track.duration_millis, 42_000);
-        assert_eq!(track.year, Some(2024));
+            .into_iter()
+            .next()
+            .map(library::FolderKey::from_raw)
+            .expect("album music folder");
+        let mut query = library::CatalogQuery::tracks(library::TrackScope::Tracks(source));
+        query.folder = Some(folder);
+        let page = (query)
+            .page(&database, library::RouteSeedWindow::top(), &cancellation)
+            .await
+            .map(|page| match page.rows {
+                library::CatalogRows::Tracks(rows) => (page.count, page.first_row_position, rows),
+                _ => unreachable!(),
+            })
+            .unwrap();
+        assert_eq!(page.2.len(), 2, "both new tracks keep their music folder");
     }
 
     #[tokio::test]
@@ -1573,6 +1696,14 @@ mod tests {
                 "device".into(),
             )
             .unwrap();
+            let owner = crate::Source::new(
+                crate::SourceId::new("source"),
+                crate::source::Implementation::JellyfinEmby(source),
+            );
+            let crate::source::Implementation::JellyfinEmby(source) = &owner.implementation else {
+                unreachable!()
+            };
+
             let album = serde_json::json!({
                 "Id":"album", "Name":"Album", "Type":"MusicAlbum",
                 "AlbumArtists":[{"Id":"artist","Name":"Artist"}],
@@ -1590,47 +1721,108 @@ mod tests {
             let database = library::Database::open(root.path().join("library.sqlite"))
                 .await
                 .unwrap();
-            let mut scan = library::Scan::begin(&database, "source", "Server", "server", None)
+            let (sender, mut updates) = tokio::sync::mpsc::unbounded_channel();
+            database.observe_catalog(move |_, update| {
+                let _ = sender.send(update);
+                std::future::ready(())
+            });
+            database
+                .reconcile_source(&library::SourceId::new("source"), "server", "Server")
                 .await
                 .unwrap();
-            stage_album(&mut scan, album_from_item(kind, &album).unwrap())
-                .await
-                .unwrap();
-            stage_track(&mut scan, track_from_item(kind, &track).unwrap())
-                .await
-                .unwrap();
-            super::stage_artist(&mut scan, super::artist_from_item(kind, &serde_json::json!({
-                "Id":"artist","Name":"Artist","Type":"MusicArtist",
-                "ProviderIds":{"MusicBrainzArtist":"artist-mbid"},
-                "ImageTags":{"Primary":"artist-cover"},"UserData":{"IsFavorite":true,"Rating":8}
-            })).unwrap()).await.unwrap();
-            super::stage_genre(
-                &mut scan,
-                super::genre_from_item(
+            let catalog_source_id = ("source").to_string();
+            let mut catalog = database.catalog(&catalog_source_id, None).await.unwrap();
+            catalog.start_observation().await.unwrap();
+            (async {
+                let mut batch = library::CatalogBatch::default();
+                let result = batch.albums.extend_from_slice(&[(album_from_item(
                     kind,
+                    catalog_source_id.as_str(),
+                    &album,
+                )
+                .unwrap()
+                .unwrap())
+                .clone()]);
+                catalog.apply_catalog(&batch, true).await?;
+                Ok::<_, library::LibraryError>(result)
+            })
+            .await
+            .unwrap();
+            (async {
+                let mut batch = library::CatalogBatch::default();
+                let result = batch.tracks.extend_from_slice(&[(track_from_item(
+                    kind,
+                    catalog_source_id.as_str(),
+                    &track,
+                )
+                .unwrap()
+                .unwrap())
+                .clone()]);
+                catalog.apply_catalog(&batch, true).await?;
+                Ok::<_, library::LibraryError>(result)
+            })
+            .await
+            .unwrap();
+            (async {
+                let mut batch = library::CatalogBatch::default();
+                let result = batch.artists.extend_from_slice(&[(super::artist_from_item(
+                kind,
+                catalog_source_id.as_str(),
+                &serde_json::json!({
+                    "Id":"artist","Name":"Artist","Type":"MusicArtist",
+                    "ProviderIds":{"MusicBrainzArtist":"artist-mbid"},
+                    "ImageTags":{"Primary":"artist-cover"},"UserData":{"IsFavorite":true,"Rating":8}
+                }),
+            )
+            .unwrap()
+            .unwrap()).clone()]);
+                catalog.apply_catalog(&batch, true).await?;
+                Ok::<_, library::LibraryError>(result)
+            })
+            .await
+            .unwrap();
+            (async {
+                let mut batch = library::CatalogBatch::default();
+                let result = batch.genres.extend_from_slice(&[(super::genre_from_item(
+                    kind,
+                    catalog_source_id.as_str(),
                     &serde_json::json!({
                         "Id":"genre","Name":"Rock","ImageTags":{"Primary":"genre-cover"}
                     }),
                 )
-                .unwrap(),
-            )
+                .unwrap()
+                .unwrap())
+                .clone()]);
+                catalog.apply_catalog(&batch, true).await?;
+                Ok::<_, library::LibraryError>(result)
+            })
             .await
             .unwrap();
-            let initial = scan.finish().await.unwrap();
-            let library::ScanOutcome::Changed(publication) = initial else {
-                panic!("initial catalog");
-            };
+            {
+                database
+                    .publish_catalog_update(&catalog_source_id, catalog.changes().clone())
+                    .await;
+                Ok::<_, crate::SourceError>(())
+            }
+            .unwrap();
+            let publication = updates.try_recv().expect("catalog update");
+            assert!(publication.metadata);
             let uri = library::source_entity_uri(
                 &crate::SourceId::new("source"),
                 "track",
                 &kind.object_id("track", "track"),
             );
             let cancel = library::ReadCancellation::new();
-            let before = database
-                .track_row_by_uri(&uri, &cancel)
-                .await
-                .unwrap()
-                .unwrap();
+            let before =
+                library::CatalogQuery::uris(library::CatalogKind::Track, vec![(&uri).to_owned()])
+                    .rows(&database, 0, 256, &cancel)
+                    .await
+                    .map(|rows| match rows {
+                        library::CatalogRows::Tracks(rows) => rows.into_iter().next(),
+                        _ => unreachable!(),
+                    })
+                    .unwrap()
+                    .unwrap();
             for favorite in [false, true, true] {
                 server.reset().await;
                 let mut updated = track.clone();
@@ -1658,46 +1850,86 @@ mod tests {
                         .mount(&server)
                         .await;
                 }
-                let prior = database
-                    .track_row_by_uri(&uri, &cancel)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                let mut scan = library::Scan::begin_items(&database, "source")
-                    .await
-                    .unwrap();
+                let prior = library::CatalogQuery::uris(
+                    library::CatalogKind::Track,
+                    vec![(&uri).to_owned()],
+                )
+                .rows(&database, 0, 256, &cancel)
+                .await
+                .map(|rows| match rows {
+                    library::CatalogRows::Tracks(rows) => rows.into_iter().next(),
+                    _ => unreachable!(),
+                })
+                .unwrap()
+                .unwrap();
+                let catalog_source_id = ("source").to_string();
+                let mut catalog = database.catalog(&catalog_source_id, None).await.unwrap();
+
                 source
-                    .stage_items(&mut scan, vec!["track".into()], vec![])
+                    .acquire_items(&mut catalog, vec!["track".into()], vec![], &|| false)
                     .await
                     .unwrap();
-                let outcome = scan.finish().await.unwrap();
-                if prior.favorite == favorite {
+                {
+                    database
+                        .publish_catalog_update(&catalog_source_id, catalog.changes().clone())
+                        .await;
+                    Ok::<_, crate::SourceError>(())
+                }
+                .unwrap();
+                if prior.state.favorite == favorite && prior.state.play_count == 3 {
                     assert!(
-                        matches!(outcome, library::ScanOutcome::Identical(_)),
-                        "{kind:?}: {outcome:?}"
+                        !catalog.changes().changed(),
+                        "{kind:?}: {:?}",
+                        catalog.changes()
+                    );
+                    assert!(
+                        updates.try_recv().is_err(),
+                        "unchanged native data stays quiet"
                     );
                 } else {
-                    assert!(
-                        matches!(outcome, library::ScanOutcome::Changed(_)),
-                        "favorite must publish"
-                    );
+                    let update = updates.try_recv().expect("changed user data must publish");
+                    assert_eq!(update.metadata, prior.state.favorite != favorite);
+                    assert_eq!(update.activity, prior.state.play_count != 3);
                 }
-                let after = database
-                    .track_row_by_uri(&uri, &cancel)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(after.favorite, favorite);
+                let after = library::CatalogQuery::uris(
+                    library::CatalogKind::Track,
+                    vec![(&uri).to_owned()],
+                )
+                .rows(&database, 0, 256, &cancel)
+                .await
+                .map(|rows| match rows {
+                    library::CatalogRows::Tracks(rows) => rows.into_iter().next(),
+                    _ => unreachable!(),
+                })
+                .unwrap()
+                .unwrap();
+                assert_eq!(after.state.favorite, favorite);
+                assert_eq!(after.state.play_count, 3);
                 assert_eq!(after.artwork_binding, before.artwork_binding);
-                let artist_key = after.artists[0].artist_key;
-                let artist = database
-                    .artist_rows(publication.source, &[artist_key], false, None, &cancel)
-                    .await
-                    .unwrap()
-                    .pop()
-                    .unwrap();
-                assert!(artist.favorite);
-                assert_eq!(artist.musicbrainz_artist_id.as_deref(), Some("artist-mbid"));
+                let artist_key = after.links.artists[0].artist_key;
+                let artist = library::CatalogQuery::keys(
+                    library::CatalogKind::Artist,
+                    Some(
+                        database
+                            .source_identity_key(&library::SourceId::new(&catalog_source_id))
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                    ),
+                    vec![artist_key.raw()],
+                )
+                .rows(&database, 0, 1, &cancel)
+                .await
+                .unwrap();
+                let library::CatalogRows::Artists(mut artists) = artist else {
+                    unreachable!()
+                };
+                let artist = artists.pop().unwrap();
+                assert!(artist.state.favorite);
+                assert_eq!(
+                    artist.metadata.musicbrainz_artist_id.as_deref(),
+                    Some("artist-mbid")
+                );
             }
         }
     }
@@ -1752,40 +1984,63 @@ mod tests {
         let database = library::Database::open(directory.path().join("library.sqlite3"))
             .await
             .expect("Library database");
-        let mut scan =
-            library::Scan::begin(&database, "jellyfin:test", "Jellyfin", "jellyfin", None)
-                .await
-                .expect("initial Scan");
-        scan.begin_batch().await.expect("initial batch");
-        stage_album(
-            &mut scan,
-            album_from_item(
+        database
+            .reconcile_source(
+                &library::SourceId::new("jellyfin:test"),
+                "jellyfin",
+                "Jellyfin",
+            )
+            .await
+            .unwrap();
+        let catalog_source_id = ("jellyfin:test").to_string();
+        let mut catalog = database.catalog(&catalog_source_id, None).await.unwrap();
+        catalog.start_observation().await.unwrap();
+
+        (async {
+            let mut batch = library::CatalogBatch::default();
+            let result = batch.albums.extend_from_slice(&[(album_from_item(
                 crate::ServerKind::Jellyfin,
+                catalog_source_id.as_str(),
                 &serde_json::from_value(serde_json::json!({
                     "Id": "album-one", "Name": "Old Album", "Type": "MusicAlbum"
                 }))
                 .expect("old Album"),
             )
-            .unwrap(),
-        )
+            .unwrap()
+            .unwrap())
+            .clone()]);
+            catalog.apply_catalog(&batch, true).await?;
+            Ok::<_, library::LibraryError>(result)
+        })
         .await
         .expect("stage old Album");
-        stage_track(
-            &mut scan,
-            track_from_item(
+        (async {
+            let mut batch = library::CatalogBatch::default();
+            let result = batch.tracks.extend_from_slice(&[(track_from_item(
                 crate::ServerKind::Jellyfin,
+                catalog_source_id.as_str(),
                 &serde_json::from_value(serde_json::json!({
                     "Id": "track-one", "Name": "Old Track", "Type": "Audio",
                     "AlbumId": "album-one", "Album": "Old Album"
                 }))
                 .expect("old Track"),
             )
-            .unwrap(),
-        )
+            .unwrap()
+            .unwrap())
+            .clone()]);
+            catalog.apply_catalog(&batch, true).await?;
+            Ok::<_, library::LibraryError>(result)
+        })
         .await
         .expect("stage old Track");
-        scan.finish_batch().await.expect("finish initial batch");
-        scan.finish().await.expect("publish initial Scan");
+
+        {
+            database
+                .publish_catalog_update(&catalog_source_id, catalog.changes().clone())
+                .await;
+            Ok::<_, crate::SourceError>(())
+        }
+        .expect("publish initial Inventory");
 
         let source = crate::Source::new(
             crate::SourceId::new("jellyfin:test"),
@@ -1802,44 +2057,43 @@ mod tests {
             .expect("cached source")
             .expect("published source")
             .source;
-        let (_, _, albums) = database
-            .album_route_page(
-                source_key,
-                None,
-                false,
-                "Updated Album",
-                library::AlbumSort::Title,
-                false,
-                library::RouteSeedWindow::top(),
-                &cancellation,
-            )
-            .await
-            .expect("updated Album page");
-        assert_eq!(albums[0].title, "Updated Album");
+        let (_, _, albums) = library::CatalogQuery {
+            subject: library::CatalogSubject::Albums {
+                source: source_key,
+                sort: library::CatalogSort::Title,
+                inline_tracks: None,
+            },
+            folder: None,
+            filter: ("Updated Album").to_string(),
+            descending: false,
+            favorites_only: false,
+            downloaded_only: false,
+            activity: false,
+        }
+        .page(&database, library::RouteSeedWindow::top(), &cancellation)
+        .await
+        .map(|page| match page.rows {
+            library::CatalogRows::Albums(rows) => (page.count, page.first_row_position, rows),
+            _ => unreachable!(),
+        })
+        .expect("updated Album page");
+        assert_eq!(albums[0].metadata.title, "Updated Album");
 
         source
             .apply_items(&database, Vec::new(), vec!["track-one".to_string()])
             .await
             .expect("apply exact removal");
         assert!(
-            database
-                .query_track_route_page(
-                    &library::TrackQuery {
-                        source: source_key,
-                        collection: None,
-                        folder: None,
-                        downloaded_only: false,
-                        favorites_only: false
-                    },
-                    "",
-                    library::TrackSort::Title,
-                    false,
-                    library::RouteSeedWindow::top(),
-                    &cancellation
-                )
+            (library::CatalogQuery::tracks(library::TrackScope::Tracks(source_key)))
+                .page(&database, library::RouteSeedWindow::top(), &cancellation)
                 .await
+                .map(|page| match page.rows {
+                    library::CatalogRows::Tracks(rows) =>
+                        (page.count, page.first_row_position, rows),
+                    _ => unreachable!(),
+                })
                 .expect("Track page")
-                .first_rows
+                .2
                 .into_iter()
                 .map(|row| row.media_uri)
                 .collect::<Vec<_>>()

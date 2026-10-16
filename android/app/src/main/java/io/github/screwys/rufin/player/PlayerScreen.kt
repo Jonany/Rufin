@@ -1,5 +1,7 @@
 package io.github.screwys.rufin.player
 
+import io.github.screwys.rufin.ui.rememberArtwork
+import io.github.screwys.rufin.ui.PlayerArtwork
 import io.github.screwys.rufin.ui.Artwork
 import io.github.screwys.rufin.ui.RufinIcon
 import io.github.screwys.rufin.ui.MediaNavigationSheet
@@ -34,6 +36,7 @@ import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.layout
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.offset
@@ -48,9 +51,9 @@ import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.style.TextOverflow
-import io.github.screwys.rufin.core.AndroidRepeatMode
-import io.github.screwys.rufin.core.AndroidTransportState
-import io.github.screwys.rufin.core.AndroidPlaybackState
+import io.github.screwys.rufin.shared.library.QueueRepeatMode
+import io.github.screwys.rufin.shared.playback.TransportStatus
+import io.github.screwys.rufin.core.AndroidPlaybackUpdate
 import io.github.screwys.rufin.core.seekPreviewMatchesPosition
 import io.github.screwys.rufin.core.translate
 import io.github.screwys.rufin.core.trackCountText
@@ -71,13 +74,14 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.updateTransition
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.draw.drawBehind
 import kotlinx.coroutines.launch
 
 private enum class PlayerSurface { LYRICS, VISUALIZER }
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
-internal fun PlayerScreen(player: PlayerConnection, preferences: PreferencesConnection, onNavigate: (String, String, String?) -> Unit, onMore: () -> Unit, onClose: () -> Unit) {
+internal fun PlayerScreen(player: PlayerConnection, preferences: PreferencesConnection, onNavigate: (io.github.screwys.rufin.shared.rufin_core.Route, String, String?) -> Unit, onMore: () -> Unit, onClose: () -> Unit) {
     val reduceMotion = LocalReduceMotion.current
     val scope = rememberCoroutineScope()
     var surface by remember { mutableStateOf<PlayerSurface?>(null) }
@@ -86,14 +90,16 @@ internal fun PlayerScreen(player: PlayerConnection, preferences: PreferencesConn
     var configuration by remember { mutableStateOf<PlayerSettingsPage?>(null) }
     var navigation by remember { mutableStateOf<String?>(null) }
     val lyricsScroll = rememberLazyListState()
-    val application = preferences.applicationSettings
-    val lyricsEnabled = application?.optBoolean("fullscreen_lyrics_visible", true) != false
-    val currentLineEnabled = application?.optBoolean("fullscreen_current_lyrics_line_visible", true) != false
-    val visualizerEnabled = application?.optBoolean("fullscreen_visualizer_visible") == true
-    val combined = lyricsEnabled && visualizerEnabled && application?.optBoolean("right_panel_combined") == true
-    val background by animateColorAsState(
-        if (application?.optBoolean("fullscreen_dynamic_background") == true)
-            lerp(MaterialTheme.colorScheme.surface, player.artwork?.color ?: MaterialTheme.colorScheme.surface, .12f)
+    val application = player.settings
+    var artworkPixels by remember { mutableIntStateOf(0) }
+    val artwork = rememberArtwork(player.currentItem?.artworkBinding, player, artworkPixels)
+    val lyricsEnabled = application?.display?.fullscreenLyricsVisible != false
+    val currentLineEnabled = application?.display?.fullscreenCurrentLyricsLineVisible != false
+    val visualizerEnabled = application?.display?.fullscreenVisualizerVisible == true
+    val combined = lyricsEnabled && visualizerEnabled && application?.rightPanel?.combined == true
+    val background = animateColorAsState(
+        if (application?.display?.fullscreenDynamicBackground == true)
+            lerp(MaterialTheme.colorScheme.surface, artwork?.color ?: MaterialTheme.colorScheme.surface, .12f)
         else MaterialTheme.colorScheme.surface, tween(if (reduceMotion) 0 else 320), label = "fullPlayerColor")
     val verticalOffset = remember { Animatable(0f) }
     val trackOffset = remember { Animatable(0f) }
@@ -106,6 +112,7 @@ internal fun PlayerScreen(player: PlayerConnection, preferences: PreferencesConn
     DisposableEffect(player) { onDispose { player.visualizer(false) } }
     BackHandler { if (surface != null) surface = null else onClose() }
     Surface(Modifier.fillMaxSize().graphicsLayer { translationY = verticalOffset.value }
+        .drawBehind { drawRect(background.value) }
         .pointerInput(surface, threshold, reduceMotion) {
             if (surface != null) return@pointerInput
             var distance = 0f
@@ -128,13 +135,13 @@ internal fun PlayerScreen(player: PlayerConnection, preferences: PreferencesConn
                 distance += amount
                 scope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) { trackOffset.snapTo(distance) }
             }, onDragEnd = {
-                if (distance < -threshold && player.playback?.canNext == true) player.next()
-                else if (distance > threshold && player.playback?.canPrevious == true) player.previous()
+                if (distance < -threshold && player.playback?.queue?.canNext == true) player.next()
+                else if (distance > threshold && player.currentId != null) player.previous()
                 scope.launch { trackOffset.animateTo(0f, tween(if (reduceMotion) 0 else 180)) }
             }, onDragCancel = { scope.launch { trackOffset.animateTo(0f, tween(if (reduceMotion) 0 else 180)) } })
-        }, color = background, contentColor = MaterialTheme.colorScheme.onSurface) {
+        }, color = Color.Transparent, contentColor = MaterialTheme.colorScheme.onSurface) {
         Box(Modifier.fillMaxSize()) {
-            if (application?.optBoolean("fullscreen_background_image") == true) player.artwork?.let { artwork ->
+            if (application?.display?.fullscreenBackgroundImage == true) artwork?.let { artwork ->
                 Image(artwork.bitmap.asImageBitmap(), null, Modifier.matchParentSize().blur(48.dp).alpha(.12f), contentScale = ContentScale.Crop)
             }
             AnimatedContent(surface, Modifier.fillMaxSize(), transitionSpec = {
@@ -147,9 +154,9 @@ internal fun PlayerScreen(player: PlayerConnection, preferences: PreferencesConn
                         PlayerIconButton("rufin-go-down-symbolic", "Close", { if (visible == null) onClose() else surface = null })
                         if (visible == null) PlayerContext(player, Modifier.weight(1f).padding(horizontal = 8.dp))
                         else Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-                            Text(player.playback?.title.orEmpty(), maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            Text(player.currentItem?.metadata?.title.orEmpty(), maxLines = 1, overflow = TextOverflow.Ellipsis,
                                 style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                            Text(player.playback?.artist.orEmpty(), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
+                            Text(player.currentItem?.metadata?.artist.orEmpty(), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
                         }
                         if (visible == null) PlayerIconButton("rufin-view-more-symbolic", "More actions", onMore)
                         else if (visible == PlayerSurface.LYRICS) LyricsActions(player)
@@ -158,7 +165,7 @@ internal fun PlayerScreen(player: PlayerConnection, preferences: PreferencesConn
                     if (visible == null) {
                         BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
                             val viewportHeight = maxHeight
-                            val content: @Composable (Modifier) -> Unit = { MainPlayerArtwork(player, currentLineEnabled, it.clipToBounds().graphicsLayer { translationX = trackOffset.value }) }
+                            val content: @Composable (Modifier) -> Unit = { MainPlayerArtwork(player, artwork, currentLineEnabled, it.clipToBounds().graphicsLayer { translationX = trackOffset.value }) { artworkPixels = it } }
                             val controls: @Composable () -> Unit = {
                                 PlayerMetadata(player, Modifier.fillMaxWidth().padding(vertical = 12.dp)) { navigation = it }
                                 PlayerControls(player, Modifier.fillMaxWidth())
@@ -184,7 +191,7 @@ internal fun PlayerScreen(player: PlayerConnection, preferences: PreferencesConn
                         Box(Modifier.weight(1f).fillMaxWidth().padding(top = 8.dp, bottom = 20.dp)
                             .clipToBounds().graphicsLayer { translationX = trackOffset.value }) {
                             if (visible == PlayerSurface.VISUALIZER || combined) {
-                                val opacity = player.settings?.visualizer?.let { org.json.JSONObject(it).getJSONObject("appearance").getDouble("fullscreen_lyrics_opacity").toFloat() } ?: 1f
+                                val opacity = player.settings?.visualizer?.appearance?.fullscreenLyricsOpacity?.toFloat() ?: 1f
                                 VisualizerView(player, Modifier.matchParentSize(), if (combined) opacity else 1f)
                             }
                             if (visible == PlayerSurface.LYRICS) LyricsPanel(player, lyricsScroll)
@@ -212,13 +219,13 @@ internal fun PlayerScreen(player: PlayerConnection, preferences: PreferencesConn
 }
 
 @Composable
-private fun MainPlayerArtwork(player: PlayerConnection, showCurrentLine: Boolean, modifier: Modifier) {
+private fun MainPlayerArtwork(player: PlayerConnection, artwork: PlayerArtwork?, showCurrentLine: Boolean, modifier: Modifier, onArtworkSize: (Int) -> Unit) {
     val reduceMotion = LocalReduceMotion.current
     val hasLyrics = showCurrentLine && player.currentLyrics?.document?.lines?.isNotEmpty() == true
     val space by animateDpAsState(if (hasLyrics) 52.dp else 0.dp, tween(if (reduceMotion) 0 else 260), label = "lyricsPreviewSpace")
     Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
         BoxWithConstraints(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-            PlayerCover(player, Modifier.size(minOf(maxWidth, maxHeight)))
+            PlayerCover(player, artwork, Modifier.size(minOf(maxWidth, maxHeight)).onSizeChanged { onArtworkSize(maxOf(it.width, it.height)) })
         }
         Box(Modifier.fillMaxWidth().height(space), contentAlignment = Alignment.CenterStart) {
             if (showCurrentLine) CurrentLyricsPreview(player)
@@ -228,7 +235,7 @@ private fun MainPlayerArtwork(player: PlayerConnection, showCurrentLine: Boolean
 
 @Composable
 private fun PlayerContext(player: PlayerConnection, modifier: Modifier) {
-    val context by remember(player) { derivedStateOf { player.playback?.let { Triple(it.contextTitle, it.contextKind, it.contextCategory) } } }
+    val context by remember(player) { derivedStateOf { player.currentContext } }
     val title = context?.first ?: when (context?.second) {
         "manual" -> translate("Queue")
         "random" -> translate("Play random")
@@ -272,9 +279,13 @@ private fun PlayerFooterButton(icon: String, label: String, action: () -> Unit) 
 
 @OptIn(ExperimentalAnimationApi::class)
 @Composable
-private fun PlayerCover(player: PlayerConnection, modifier: Modifier) {
+private fun PlayerCover(player: PlayerConnection, artwork: PlayerArtwork?, modifier: Modifier) {
     val duration = if (LocalReduceMotion.current) 0 else 240
-    val cover = player.displayedArtworkIdentity to player.artwork
+    val binding = player.currentItem?.artworkBinding?.toList()
+    val identity = remember(player.bridge, binding) {
+        binding?.let { player.bridge?.artworkIdentity(it.toByteArray()) }
+    }
+    val cover = identity to artwork
     updateTransition(cover, label = "playerArtwork").Crossfade(modifier.aspectRatio(1f).clip(RoundedCornerShape(8.dp)),
         animationSpec = tween(if (duration == 0) 0 else 220), contentKey = { it.first }) { (_, artwork) ->
         Artwork(artwork, Modifier.fillMaxSize())
@@ -287,8 +298,8 @@ private fun PlayerMetadata(player: PlayerConnection, modifier: Modifier, onGoTo:
     val reduceMotion = LocalReduceMotion.current
     val metadata by remember(player) { derivedStateOf {
         player.playback?.let { state ->
-            val links = player.metadataLinks?.takeIf { it.mediaUri == state.mediaUri }
-            PlayerMetadataText(state.mediaUri, state.title, links?.artistText ?: state.artist, links?.albumText ?: state.album)
+            val links = player.metadataLinks?.takeIf { it.mediaUri == state.transport.current?.id?.mediaUri }
+            PlayerMetadataText(state.transport.current?.id?.mediaUri, player.currentItem?.metadata?.title.orEmpty(), links?.artistText ?: player.currentItem?.metadata?.artist.orEmpty(), links?.albumText ?: player.currentItem?.metadata?.album.orEmpty())
         }
     } }
     val current = metadata ?: return
@@ -308,7 +319,7 @@ private fun PlayerMetadata(player: PlayerConnection, modifier: Modifier, onGoTo:
             }
             val favorite by remember(player) { derivedStateOf {
                 val state = player.playback
-                state?.mediaUri?.let { player.projectedFavorite(it, state.favorite) } == true
+                state?.transport?.current?.id?.mediaUri?.let { player.projectedFavorite(it, player.favorite) } == true
             } }
             IconButton(player::favorite, Modifier.size(48.dp)) {
                 RufinIcon(if (favorite) "rufin-heart-filled-symbolic" else "rufin-heart-outline-symbolic",
@@ -332,25 +343,13 @@ private fun PlayerControls(player: PlayerConnection, modifier: Modifier) {
     }
 }
 
-private data class PlayerSourceFacts(val local: Boolean, val output: String?, val format: String?, val bits: UInt?, val sampleRate: UInt?)
-
 @Composable
 private fun PlayerSourceInfo(player: PlayerConnection) {
-    val facts by remember(player) { derivedStateOf { player.playback?.let {
-        PlayerSourceFacts(it.localOutput, it.outputName, it.sourceFormat, it.bitDepth, it.sampleRateHz)
-    } } }
-    val current = facts ?: return
-    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally)) {
-        Text(current.output ?: translate(if (current.local) "Local" else "Audio output"),
-            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        current.format?.let { Text(it.uppercase(java.util.Locale.ROOT),
-            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-        current.bits?.takeIf { it > 0U }?.let { Text("$it bit", style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant) }
-        current.sampleRate?.takeIf { it > 0U }?.let {
-            val rate = java.math.BigDecimal.valueOf(it.toDouble() / 1000.0).stripTrailingZeros().toPlainString()
-            Text("$rate kHz", style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant) }
+    val labels by remember(player) { derivedStateOf { player.sourceLabels } }
+    FlowRow(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally)) {
+        labels.forEach { label ->
+            Text(label, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
     }
 }
 
@@ -358,32 +357,32 @@ private fun PlayerSourceInfo(player: PlayerConnection) {
 @OptIn(ExperimentalMaterial3Api::class)
 private fun PlayerProgress(player: PlayerConnection) {
     val current = player.playback ?: return
-    var seeking by remember(current.occurrenceId, current.mediaRun) { mutableStateOf<Float?>(null) }
-    var dragging by remember(current.occurrenceId, current.mediaRun) { mutableStateOf(false) }
-    var committed by remember(current.occurrenceId, current.mediaRun) { mutableStateOf<AndroidPlaybackState?>(null) }
-    var position by remember(current.occurrenceId, current.mediaRun) { mutableStateOf(current.positionMillis) }
-    val playing = current.positionAdvancing
+    var seeking by remember(current.transport.current?.id) { mutableStateOf<Float?>(null) }
+    var dragging by remember(current.transport.current?.id) { mutableStateOf(false) }
+    var committed by remember(current.transport.current?.id) { mutableStateOf<AndroidPlaybackUpdate?>(null) }
+    var position by remember(current.transport.current?.id) { mutableStateOf(current.transport.positionMillis) }
+    val playing = (current.transport.state == TransportStatus.PLAYING)
     val interpolate = playing && !LocalReduceMotion.current
-    val duration = current.durationMillis.toFloat()
+    val duration = current.transport.durationMillis.toFloat()
     val translation = LocalTranslationRevision.current
     val positionLabel = remember(translation) { translate("Playback position") }
-    LaunchedEffect(player, current.occurrenceId, current.mediaRun, interpolate) {
+    LaunchedEffect(player, current.transport.current?.id, interpolate) {
         if (interpolate) while (true) {
             withFrameNanos { }
             position = player.positionNow()
         }
     }
-    LaunchedEffect(current.positionMillis, current.state, current.canSeek, current.error) {
+    LaunchedEffect(current.transport.positionMillis, current.transport.state, current.transport.canSeek, current.transport.error) {
         val target = seeking?.toLong()?.toULong() ?: return@LaunchedEffect
-        if (!dragging && (!current.canSeek || current.state == AndroidTransportState.FAILED ||
-            (current.positionMillis != committed?.positionMillis && seekPreviewMatchesPosition(target, current.positionMillis)))) {
-            position = current.positionMillis
+        if (!dragging && (!current.transport.canSeek || current.transport.state == TransportStatus.FAILED ||
+            (current.transport.positionMillis != committed?.transport?.positionMillis && seekPreviewMatchesPosition(target, current.transport.positionMillis)))) {
+            position = current.transport.positionMillis
             seeking = null
             committed = null
         }
     }
-    val displayedPosition = seeking?.toLong()?.toULong() ?: if (interpolate) position else current.positionMillis
-    val waveform = player.waveform?.takeIf { it.occurrenceId == current.occurrenceId }?.peaks.orEmpty()
+    val displayedPosition = seeking?.toLong()?.toULong() ?: if (interpolate) position else current.transport.positionMillis
+    val waveform = player.waveform?.takeIf { it.first == current.transport.current?.id }?.second.orEmpty()
     val activeWaveform = MaterialTheme.colorScheme.primary
     val inactiveWaveform = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.35f)
     val thumbWidth = if (waveform.isEmpty()) 14.dp else 2.dp
@@ -394,9 +393,9 @@ private fun PlayerProgress(player: PlayerConnection) {
                 committed = current
                 dragging = false
                 seeking?.let { player.seek(it.toLong().toULong()) }
-            }, valueRange = 0f..duration.coerceAtLeast(1f), enabled = current.canSeek && duration > 0f,
+            }, valueRange = 0f..duration.coerceAtLeast(1f), enabled = current.transport.canSeek && duration > 0f,
             thumb = {
-                val color = if (current.canSeek && duration > 0f) MaterialTheme.colorScheme.primary
+                val color = if (current.transport.canSeek && duration > 0f) MaterialTheme.colorScheme.primary
                     else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
                 Canvas(Modifier.width(thumbWidth).height(24.dp)) {
                     if (waveform.isEmpty()) drawCircle(color, radius = 7.dp.toPx(), center = center)
@@ -434,18 +433,18 @@ private fun PlayerProgress(player: PlayerConnection) {
             }.semantics { contentDescription = positionLabel })
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Text(playerTime(displayedPosition), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Text(playerTime(current.durationMillis), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(playerTime(current.transport.durationMillis), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
 
-private data class PlayerTransportState(val shuffle: Boolean, val repeat: AndroidRepeatMode,
+private data class PlayerTransportState(val shuffle: Boolean, val repeat: QueueRepeatMode,
     val desiredPlaying: Boolean, val canPrevious: Boolean, val canNext: Boolean)
 
 @Composable
 private fun PlayerTransport(player: PlayerConnection) {
     val transport by remember(player) { derivedStateOf {
-        player.playback?.let { PlayerTransportState(it.shuffle, it.repeat, it.desiredPlaying, it.canPrevious, it.canNext) }
+        player.playback?.let { PlayerTransportState(it.controls.shuffleEnabled, it.controls.repeatMode, it.transport.desiredPlaying, it.transport.current != null, it.queue.canNext) }
     } }
     val current = transport ?: return
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -465,16 +464,16 @@ private fun PlayerTransport(player: PlayerConnection) {
                 Modifier.size(48.dp), enabled = current.canNext, iconSize = 24.dp, glyph = true)
         }
         Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
-            PlayerIconButton(if (current.repeat == AndroidRepeatMode.ONE) "rufin-repeat-one-symbolic" else "rufin-repeat-symbolic",
-                when (current.repeat) { AndroidRepeatMode.ONE -> "Repeat one"; AndroidRepeatMode.ALL -> "Repeat all"; else -> "Repeat off" },
-                player::repeat, Modifier.size(48.dp), selected = current.repeat != AndroidRepeatMode.OFF, iconSize = 24.dp, glyph = true)
+            PlayerIconButton(if (current.repeat == QueueRepeatMode.ONE) "rufin-repeat-one-symbolic" else "rufin-repeat-symbolic",
+                when (current.repeat) { QueueRepeatMode.ONE -> "Repeat one"; QueueRepeatMode.ALL -> "Repeat all"; else -> "Repeat off" },
+                player::repeat, Modifier.size(48.dp), selected = current.repeat != QueueRepeatMode.OFF, iconSize = 24.dp, glyph = true)
         }
     }
 }
 
 @Composable
 private fun PlayerPlayPause(player: PlayerConnection) {
-    val playing by remember(player) { derivedStateOf { player.playback?.desiredPlaying == true } }
+    val playing by remember(player) { derivedStateOf { player.playback?.transport?.desiredPlaying == true } }
     FilledIconButton(player::togglePlayback, Modifier.size(64.dp), shape = CircleShape,
         colors = IconButtonDefaults.filledIconButtonColors(containerColor = MaterialTheme.colorScheme.onBackground.copy(alpha = .92f),
             contentColor = MaterialTheme.colorScheme.background)) {

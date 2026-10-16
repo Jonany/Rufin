@@ -8,6 +8,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum SidebarRouteItem {
     Home,
     Search,
@@ -51,11 +52,13 @@ impl SidebarRouteItem {
     }
 }
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct SidebarRouteItemSettings {
     pub item: SidebarRouteItem,
     pub visible: bool,
 }
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum SidebarPin {
     Album {
         source_id: SourceId,
@@ -109,6 +112,14 @@ impl Default for SidebarSettings {
     }
 }
 impl SidebarSettings {
+    pub fn pins_use_activity(&self) -> bool {
+        self.pins_visible
+            && self
+                .pins
+                .iter()
+                .any(|pin| matches!(pin, SidebarPin::SmartPlaylist { .. }))
+    }
+
     pub fn set_route_visible(&mut self, item: SidebarRouteItem, visible: bool) -> bool {
         let Some(stored) = self
             .route_items
