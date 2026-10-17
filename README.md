@@ -247,23 +247,11 @@ sudo pacman -S --needed \
 Forky (Testing) is currently required to get GTK 4.20 or newer. Trixie (Stable) only has 4.18.
 
 ```bash
-sudo apt install \
-    --no-install-recommends \
-    rustc \
-    cargo \
-    cmake \
-    ninja-build \
-    pkgconf \
-    just \
-    gettext \
-    libglib2.0-dev \
-    libgtk-4-dev \
-    libadwaita-1-dev \
-    gstreamer1.0-tools \
-    libgstreamer1.0-dev \
-    gstreamer1.0-plugins-bad \
-    libgstreamer-plugins-base1.0-dev \
-    libgstreamer-plugins-bad1.0-dev
+sudo apt install --no-install-recommends \
+    rustc cargo cmake ninja-build pkgconf just gettext \
+    libglib2.0-dev libgtk-4-dev libadwaita-1-dev gstreamer1.0-tools \
+    gstreamer1.0-plugins-bad libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
 ```
 
 **Fedora:**
